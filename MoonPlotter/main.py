@@ -6,8 +6,25 @@ import rasterio
 from rasterio.windows import Window
 import os
 import warnings
+import tkinter as tk
+from tkinter import simpledialog
 
-# Suppress warnings that happen if you select an area that is entirely "No Data"
+# Attempt to load GeoPandas for borders
+try:
+    import geopandas as gpd
+    import warnings as gpd_warnings
+
+    with gpd_warnings.catch_warnings():
+        gpd_warnings.simplefilter("ignore")
+        world_borders = gpd.read_file(
+            "https://naturalearth.s3.amazonaws.com/110m_cultural/ne_110m_admin_0_countries.zip")
+        state_borders = gpd.read_file(
+            "https://naturalearth.s3.amazonaws.com/110m_cultural/ne_110m_admin_1_states_provinces.zip")
+    HAS_GPD = True
+except ImportError:
+    HAS_GPD = False
+    print("\nNote: 'geopandas' not installed. Skipping country/state borders.")
+
 warnings.filterwarnings('ignore', r'All-NaN (slice|axis) encountered')
 Image.MAX_IMAGE_PIXELS = None
 
@@ -18,20 +35,18 @@ DATA_FILES = {
     'Moon': {
         'color': 'lroc_color_16bit_srgb_4k.tif',
         'dem': 'ldem_16.tif',
-        'multiplier_to_feet': 3280.84  # NASA float TIFF is in km
+        'multiplier_to_feet': 3280.84
     },
     'Earth': {
-        'color': 'earth_color.tif',
+        'color': 'earth_color2.tif',
         'dem': 'BE_dem_v2.tif',
-        'multiplier_to_feet': 3.28084  # Blue Earth is in meters
+        'multiplier_to_feet': 3.28084
     }
 }
 
 PAPER_SIZES = {
-    'A4_Landscape': (297, 210),
-    'A4_Portrait': (210, 297),
-    'Letter_Landscape': (11, 8.5),
-    'Letter_Portrait': (8.5, 11),
+    'A4_Landscape': (297, 210), 'A4_Portrait': (210, 297),
+    'Letter_Landscape': (11, 8.5), 'Letter_Portrait': (8.5, 11),
     'Square': (10, 10)
 }
 
@@ -51,10 +66,12 @@ last_drag_coords = None
 has_drawn = False
 interval_ft = 1000
 show_ocean = True
+show_borders = True
+border_artists = []
 
 
 # ==========================================
-# 2. DATA LOADING (LAZY ENGINE)
+# 2. DYNAMIC MAP ENGINE (SLIPPY MAP)
 # ==========================================
 def load_planet_data(planet):
     if planet in loaded_maps_cache:
@@ -63,30 +80,34 @@ def load_planet_data(planet):
     print(f"\nLoading data for {planet}...")
     files = DATA_FILES[planet]
 
+    color_src = None
+    base_img = None
+
     if not os.path.exists(files['color']):
-        print(f"  -> WARNING: '{files['color']}' not found. Using placeholder.")
-        color_img = np.zeros((1024, 2048, 3), dtype=np.uint8)
+        base_img = np.zeros((512, 1024, 3), dtype=np.uint8)
     else:
         if files['color'].endswith('.tif'):
-            with rasterio.open(files['color']) as src:
-                color_img = src.read().transpose(1, 2, 0)
-                if color_img.dtype == np.uint16:
-                    color_img = (color_img / 256).astype(np.uint8)
+            color_src = rasterio.open(files['color'])
+            print(f"  -> Generating low-res base layer for fluid panning...")
+            base_img = color_src.read(
+                out_shape=(color_src.count, 512, 1024),
+                resampling=rasterio.enums.Resampling.bilinear
+            ).transpose(1, 2, 0)
+            if base_img.dtype == np.uint16:
+                base_img = (base_img / 256).astype(np.uint8)
         else:
-            color_img = np.array(Image.open(files['color']))
+            base_img = np.array(Image.open(files['color']))
 
     if not os.path.exists(files['dem']):
-        print(f"  -> WARNING: '{files['dem']}' not found.")
         dem_src = None
     else:
         dem_src = rasterio.open(files['dem'])
-        print(f"  -> Connected to DEM: {dem_src.shape[1]}x{dem_src.shape[0]} pixels")
 
-    loaded_maps_cache[planet] = (color_img, dem_src)
-    return color_img, dem_src
+    loaded_maps_cache[planet] = (color_src, dem_src, base_img)
+    return color_src, dem_src, base_img
 
 
-current_color, current_dem_src = load_planet_data(active_planet)
+current_color_src, current_dem_src, current_color_base = load_planet_data(active_planet)
 
 # ==========================================
 # 3. GUI SETUP
@@ -97,22 +118,39 @@ fig = plt.figure(figsize=(16, 8))
 ax1 = fig.add_axes([0.05, 0.15, 0.4, 0.70])
 ax2 = fig.add_axes([0.55, 0.15, 0.4, 0.70])
 
-# Top Control Bar (Planet, Ocean, Draw, Clear, Rotate)
+# Control Bars
 ax_radio = fig.add_axes([0.05, 0.88, 0.08, 0.10])
 ax_toggle = fig.add_axes([0.15, 0.88, 0.15, 0.10])
-ax_draw_btn = fig.add_axes([0.31, 0.90, 0.06, 0.05])
-ax_clear_btn = fig.add_axes([0.38, 0.90, 0.06, 0.05])
-ax_rotate_btn = fig.add_axes([0.45, 0.90, 0.06, 0.05])
-
-# Bottom Control Bar (Slider & Text Box)
+ax_draw_btn = fig.add_axes([0.31, 0.90, 0.05, 0.05])
+ax_clear_btn = fig.add_axes([0.365, 0.90, 0.05, 0.05])
+ax_rotate_btn = fig.add_axes([0.42, 0.90, 0.05, 0.05])
+ax_export_btn = fig.add_axes([0.475, 0.90, 0.06, 0.05])
 ax_slider = fig.add_axes([0.25, 0.05, 0.4, 0.03])
 ax_text = fig.add_axes([0.78, 0.05, 0.08, 0.04])
 
 # Setup Left Panel
-img_display = ax1.imshow(current_color, extent=[-180, 180, -90, 90], origin='upper')
+img_base = ax1.imshow(current_color_base, extent=[-180, 180, -90, 90], origin='upper', zorder=0)
+img_highres = ax1.imshow(np.zeros((2, 2, 3), dtype=np.uint8), extent=[-180, 180, -90, 90], origin='upper', zorder=1)
+img_highres.set_visible(False)
+
 ax1.set_title(f"{active_planet} Visual Map (Scroll to Zoom, Draw to Select)", pad=10)
 ax1.set_xlabel("Longitude")
 ax1.set_ylabel("Latitude")
+
+
+def draw_borders():
+    global border_artists
+    for artist in border_artists: artist.remove()
+    border_artists = []
+
+    if HAS_GPD and active_planet == 'Earth' and show_borders:
+        before = len(ax1.collections)
+        world_borders.boundary.plot(ax=ax1, edgecolor='cyan', linewidth=0.6, alpha=0.5, zorder=2)
+        state_borders.boundary.plot(ax=ax1, edgecolor='cyan', linewidth=0.2, alpha=0.3, zorder=2)
+        border_artists = ax1.collections[before:]
+
+
+draw_borders()
 
 # Setup Right Panel
 ax2.set_box_aspect(PAPER_HEIGHT / PAPER_WIDTH)
@@ -123,43 +161,85 @@ ax2.set_yticks([])
 
 # Controls
 radio = RadioButtons(ax_radio, ('Earth', 'Moon'), active=0)
-ocean_toggle = CheckButtons(ax_toggle, ['Show Ocean Topo'], [True])
-
+top_toggles = CheckButtons(ax_toggle, ['Show Ocean Topo', 'Show Borders'], [True, True])
 btn_draw = Button(ax_draw_btn, 'Draw')
 btn_clear = Button(ax_clear_btn, 'Clear')
 btn_rotate = Button(ax_rotate_btn, 'Rotate')
-
+btn_export = Button(ax_export_btn, 'Export SVG')
 contour_slider = Slider(ax=ax_slider, label='Contour Interval (ft)', valmin=50, valmax=10000, valinit=interval_ft,
                         valstep=50)
 text_box = TextBox(ax_text, 'Exact ft: ', initial=str(interval_ft))
 
 
 # ==========================================
-# 4. INTERACTIVE LOGIC & MATH
+# 4. HIGH-RESOLUTION OVERLAY UPDATER
+# ==========================================
+def refresh_highres_map():
+    if current_color_src is None:
+        img_highres.set_visible(False)
+        return
+
+    xlim, ylim = ax1.get_xlim(), ax1.get_ylim()
+    lon_min, lon_max = max(-180, xlim[0]), min(180, xlim[1])
+    lat_min, lat_max = max(-90, ylim[0]), min(90, ylim[1])
+
+    h, w = current_color_src.height, current_color_src.width
+    px_x0 = int((lon_min + 180) / 360 * w)
+    px_x1 = int((lon_max + 180) / 360 * w)
+    px_y0 = int((90 - lat_max) / 180 * h)
+    px_y1 = int((90 - lat_min) / 180 * h)
+
+    px_x0, px_x1 = max(0, px_x0), min(w, px_x1)
+    px_y0, px_y1 = max(0, px_y0), min(h, px_y1)
+
+    win_w, win_h = px_x1 - px_x0, px_y1 - px_y0
+    if win_w <= 0 or win_h <= 0: return
+
+    max_px = 1500
+    scale = max(1.0, win_w / max_px, win_h / max_px)
+    out_w, out_h = int(win_w / scale), int(win_h / scale)
+
+    window = Window(col_off=px_x0, row_off=px_y0, width=win_w, height=win_h)
+    try:
+        highres_slice = current_color_src.read(
+            out_shape=(current_color_src.count, out_h, out_w),
+            resampling=rasterio.enums.Resampling.bilinear,
+            window=window
+        ).transpose(1, 2, 0)
+
+        if highres_slice.dtype == np.uint16:
+            highres_slice = (highres_slice / 256).astype(np.uint8)
+
+        img_highres.set_data(highres_slice)
+        img_highres.set_extent([lon_min, lon_max, lat_min, lat_max])
+        img_highres.set_visible(True)
+        fig.canvas.draw_idle()
+    except Exception:
+        pass
+
+
+fig.canvas.mpl_connect('button_release_event', lambda e: refresh_highres_map() if e.inaxes == ax1 else None)
+refresh_highres_map()
+
+
+# ==========================================
+# 5. INTERACTIVE LOGIC & MATH
 # ==========================================
 def get_contour_levels(dem_crop_raw, interval):
     multiplier = DATA_FILES[active_planet]['multiplier_to_feet']
-
     crop_feet = dem_crop_raw.astype(np.float32) * multiplier
     crop_feet[crop_feet < -100000] = np.nan
 
-    if np.isnan(crop_feet).all():
-        return [], crop_feet
-
-    min_elev = np.nanmin(crop_feet)
-    max_elev = np.nanmax(crop_feet)
+    if np.isnan(crop_feet).all(): return [], crop_feet
+    min_elev, max_elev = np.nanmin(crop_feet), np.nanmax(crop_feet)
 
     start_level = np.floor(min_elev / interval) * interval
     end_level = np.ceil(max_elev / interval) * interval
     levels = np.arange(start_level, end_level + interval, interval)
 
-    # NEW COASTLINE LOGIC: We no longer mask the map. We just filter the requested levels.
-    # This allows Matplotlib to interpolate perfectly from -10 to +10, creating a flawless 0 line.
     if active_planet == 'Earth' and not show_ocean:
         levels = [lvl for lvl in levels if lvl >= 0]
-        # Force a 0-level coastline if data goes above sea level but intervals skipped 0
-        if len(levels) == 0 and max_elev >= 0:
-            levels = [0]
+        if len(levels) == 0 and max_elev >= 0: levels = [0]
 
     if len(levels) > 300:
         print(f"Warning: {len(levels)} lines requested. Capping at 300 to protect RAM.")
@@ -168,7 +248,7 @@ def get_contour_levels(dem_crop_raw, interval):
 
     if len(levels) < 2:
         if len(levels) == 1:
-            levels = [levels[0], levels[0] + 0.001]  # Hack to allow 1 line without crashing
+            levels = [levels[0], levels[0] + 0.001]
         else:
             levels = [min_elev, max_elev] if min_elev != max_elev else []
 
@@ -177,30 +257,28 @@ def get_contour_levels(dem_crop_raw, interval):
 
 def redraw_contours():
     if current_dem_crop is None: return
-    ax2.clear()
+    ax2.clear();
     ax2.set_box_aspect(PAPER_HEIGHT / PAPER_WIDTH)
 
     orientation = "Landscape" if is_landscape else "Portrait"
-    ax2.set_title(f"{active_planet} ({orientation})\n{interval_ft} ft/line | Press 'e' to export")
-    ax2.set_xlabel("Longitude")
+    ax2.set_title(f"{active_planet} ({orientation})\n{interval_ft} ft/line")
     ax2.set_xticks([]);
     ax2.set_yticks([])
 
     levels, crop_feet = get_contour_levels(current_dem_crop, interval_ft)
 
     if len(levels) > 0:
-        ax2.contour(crop_feet, levels=levels, colors='black', linewidths=0.5,
-                    extent=current_data_extent, origin='upper')
+        ax2.contour(crop_feet, levels=levels, colors='black', linewidths=0.5, extent=current_data_extent,
+                    origin='upper')
     else:
-        ax2.text(0.5, 0.5, "No topography in this range\n(Or Ocean is hidden)",
-                 ha='center', va='center', transform=ax2.transAxes)
+        ax2.text(0.5, 0.5, "No topography in this range\n(Or Ocean is hidden)", ha='center', va='center',
+                 transform=ax2.transAxes)
 
     ax2.set_xlim(current_view_extent[0], current_view_extent[1])
     ax2.set_ylim(current_view_extent[2], current_view_extent[3])
     fig.canvas.draw_idle()
 
 
-# --- Buttons & Actions ---
 def process_selection(x1, x2, y1, y2):
     global current_dem_crop, current_data_extent, current_view_extent, has_drawn
     if current_dem_src is None: return
@@ -208,7 +286,6 @@ def process_selection(x1, x2, y1, y2):
     width, height = x2 - x1, y2 - y1
     if width == 0 or height == 0: return
 
-    # 1. Enforce Paper Aspect Ratio
     center_x, center_y = (x1 + x2) / 2, (y1 + y2) / 2
     pad_width, pad_height = (width, width / PAPER_ASPECT) if width / height > PAPER_ASPECT else (
     height * PAPER_ASPECT, height)
@@ -216,7 +293,6 @@ def process_selection(x1, x2, y1, y2):
     ey1, ey2 = center_y - pad_height / 2, center_y + pad_height / 2
     current_view_extent = [ex1, ex2, ey1, ey2]
 
-    # 2. Extract Data
     h, w = current_dem_src.shape
     px_x1, px_x2 = int((ex1 + 180) / 360 * w), int((ex2 + 180) / 360 * w)
     px_y1, px_y2 = int((90 - ey2) / 180 * h), int((90 - ey1) / 180 * h)
@@ -228,40 +304,36 @@ def process_selection(x1, x2, y1, y2):
     window = Window(col_off=px_x1_clip, row_off=px_y1_clip, width=(px_x2_clip - px_x1_clip),
                     height=(px_y2_clip - px_y1_clip))
     current_dem_crop = current_dem_src.read(1, window=window)
+    current_data_extent = [px_x1_clip / w * 360 - 180, px_x2_clip / w * 360 - 180, 90 - (px_y2_clip / h * 180),
+                           90 - (px_y1_clip / h * 180)]
 
-    current_data_extent = [
-        px_x1_clip / w * 360 - 180, px_x2_clip / w * 360 - 180,
-        90 - (px_y2_clip / h * 180), 90 - (px_y1_clip / h * 180)
-    ]
-
-    # Clear preview, but don't draw heavily yet
     has_drawn = False
-    ax2.clear()
-    ax2.set_box_aspect(PAPER_HEIGHT / PAPER_WIDTH)
+    ax2.clear();
+    ax2.set_box_aspect(PAPER_HEIGHT / PAPER_WIDTH);
     ax2.set_xticks([]);
     ax2.set_yticks([])
-    ax2.text(0.5, 0.5, "Selection updated.\nClick 'Draw' to render contours.",
-             ha='center', va='center', transform=ax2.transAxes)
+    ax2.text(0.5, 0.5, "Selection updated.\nClick 'Draw' to render contours.", ha='center', va='center',
+             transform=ax2.transAxes)
     fig.canvas.draw_idle()
 
 
 def draw_action(event):
     global has_drawn
-    has_drawn = True
+    has_drawn = True;
     redraw_contours()
 
 
 def clear_action(event=None):
     global current_dem_crop, last_drag_coords, has_drawn
-    current_dem_crop = None
-    last_drag_coords = None
+    current_dem_crop = None;
+    last_drag_coords = None;
     has_drawn = False
     try:
         selector.extents = (0, 0, 0, 0)
     except Exception:
         pass
-    ax2.clear()
-    ax2.set_box_aspect(PAPER_HEIGHT / PAPER_WIDTH)
+    ax2.clear();
+    ax2.set_box_aspect(PAPER_HEIGHT / PAPER_WIDTH);
     ax2.set_xticks([]);
     ax2.set_yticks([])
     ax2.text(0.5, 0.5, "Selection cleared.", ha='center', va='center', transform=ax2.transAxes)
@@ -273,22 +345,80 @@ def rotate_action(event):
     PAPER_WIDTH, PAPER_HEIGHT = PAPER_HEIGHT, PAPER_WIDTH
     PAPER_ASPECT = PAPER_WIDTH / PAPER_HEIGHT
     is_landscape = not is_landscape
-
     if last_drag_coords:
         process_selection(*last_drag_coords)
-        if has_drawn:
-            redraw_contours()
+        if has_drawn: redraw_contours()
     else:
-        ax2.set_box_aspect(PAPER_HEIGHT / PAPER_WIDTH)
+        ax2.set_box_aspect(PAPER_HEIGHT / PAPER_WIDTH);
         fig.canvas.draw_idle()
+
+
+def export_action(event):
+    if current_dem_crop is None or not has_drawn:
+        print("Please make a selection and click 'Draw' before exporting.")
+        return
+
+    # Use Tkinter to popup a native dialog
+    root = tk.Tk()
+    root.withdraw()  # Hide the main tk window
+
+    orientation_str = "landscape" if is_landscape else "portrait"
+    default_name = f"{active_planet.lower()}_{orientation_str}"
+
+    base_name = simpledialog.askstring("Export SVG", "Enter save name (without extension):", initialvalue=default_name)
+    root.destroy()
+
+    if not base_name:  # User hit cancel or closed the window
+        print("Export cancelled.")
+        return
+
+    # Construct filename and handle versions
+    file_prefix = f"{base_name}_{interval_ft}ft"
+    filename = f"{file_prefix}.svg"
+
+    version = 2
+    while os.path.exists(filename):
+        filename = f"{file_prefix}_v{version}.svg"
+        version += 1
+
+    print(f"\nGenerating {filename}...")
+
+    levels, crop_feet = get_contour_levels(current_dem_crop, interval_ft)
+    export_fig = plt.figure(figsize=(10, 10 / PAPER_ASPECT))
+    export_ax = export_fig.add_axes([0, 0, 1, 1]);
+    export_ax.axis('off')
+
+    if len(levels) > 0:
+        export_ax.contour(crop_feet, levels=levels, colors='black', linewidths=1, extent=current_data_extent,
+                          origin='upper')
+
+    export_ax.set_xlim(current_view_extent[0], current_view_extent[1])
+    export_ax.set_ylim(current_view_extent[2], current_view_extent[3])
+    export_fig.savefig(filename, format='svg')
+    plt.close(export_fig)
+    print(f"Success! Saved to your folder. Ready for plotting.")
 
 
 btn_draw.on_clicked(draw_action)
 btn_clear.on_clicked(clear_action)
 btn_rotate.on_clicked(rotate_action)
+btn_export.on_clicked(export_action)
 
 
-# --- Realtime value sync ---
+def toggle_features_action(label):
+    global show_ocean, show_borders
+    if label == 'Show Ocean Topo':
+        show_ocean = not show_ocean
+        if has_drawn: redraw_contours()
+    elif label == 'Show Borders':
+        show_borders = not show_borders
+        draw_borders();
+        fig.canvas.draw_idle()
+
+
+top_toggles.on_clicked(toggle_features_action)
+
+
 def update_from_slider(val):
     global interval_ft
     interval_ft = int(val)
@@ -314,30 +444,25 @@ contour_slider.on_changed(update_from_slider)
 text_box.on_submit(update_from_text)
 
 
-def toggle_ocean_action(label):
-    global show_ocean
-    show_ocean = not show_ocean
-    if has_drawn: redraw_contours()
-
-
-ocean_toggle.on_clicked(toggle_ocean_action)
-
-
 def switch_planet(label):
-    global active_planet, current_color, current_dem_src
+    global active_planet, current_color_src, current_dem_src, current_color_base
     active_planet = label
-    current_color, current_dem_src = load_planet_data(label)
-    img_display.set_data(current_color)
+    current_color_src, current_dem_src, current_color_base = load_planet_data(label)
+
+    img_base.set_data(current_color_base)
+    img_highres.set_visible(False)
     ax1.set_xlim(-180, 180);
     ax1.set_ylim(-90, 90)
     ax1.set_title(f"{active_planet} Visual Map (Scroll to Zoom, Draw to Select)", pad=10)
+
+    refresh_highres_map()
+    draw_borders()
     clear_action()
 
 
 radio.on_clicked(switch_planet)
 
 
-# --- Map Interactions ---
 def zoom_map(event):
     if event.inaxes != ax1: return
     base_scale = 1.2
@@ -351,6 +476,8 @@ def zoom_map(event):
                 cur_ylim[1] - cur_ylim[0])
     ax1.set_xlim([max(-180, xdata - new_width * (1 - relx)), min(180, xdata + new_width * relx)])
     ax1.set_ylim([max(-90, ydata - new_height * (1 - rely)), min(90, ydata + new_height * rely)])
+
+    refresh_highres_map()
     fig.canvas.draw_idle()
 
 
@@ -365,35 +492,6 @@ def on_select(eclick, erelease):
     process_selection(x1, x2, y1, y2)
 
 
-def on_key_press(event):
-    if event.key == 'e' and current_dem_crop is not None and has_drawn:
-        orientation_str = "Landscape" if is_landscape else "Portrait"
-        filename = f'{active_planet.lower()}_{orientation_str}_{interval_ft}ft_intervals.svg'
-        print(f"\nGenerating {filename}...")
-
-        levels, crop_feet = get_contour_levels(current_dem_crop, interval_ft)
-
-        export_fig = plt.figure(figsize=(10, 10 / PAPER_ASPECT))
-        export_ax = export_fig.add_axes([0, 0, 1, 1]);
-        export_ax.axis('off')
-
-        if len(levels) > 0:
-            export_ax.contour(crop_feet, levels=levels, colors='black', linewidths=1,
-                              extent=current_data_extent, origin='upper')
-
-        export_ax.set_xlim(current_view_extent[0], current_view_extent[1])
-        export_ax.set_ylim(current_view_extent[2], current_view_extent[3])
-        export_fig.savefig(filename, format='svg')
-        plt.close(export_fig)
-        print(f"Success! Saved to your folder. Ready for plotting.")
-
-
-# Removed restriction thresholds so you can draw tiny boxes
-selector = RectangleSelector(
-    ax1, on_select, useblit=True, button=[1],
-    spancoords='data', interactive=True,
-    props=dict(facecolor='red', edgecolor='red', alpha=0.3, fill=True)
-)
-
-fig.canvas.mpl_connect('key_press_event', on_key_press)
+selector = RectangleSelector(ax1, on_select, useblit=True, button=[1], spancoords='data', interactive=True,
+                             props=dict(facecolor='red', edgecolor='red', alpha=0.3, fill=True))
 plt.show()
