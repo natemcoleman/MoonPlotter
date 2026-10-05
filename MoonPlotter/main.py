@@ -44,15 +44,19 @@ DATA_FILES = {
     }
 }
 
+# ALL sizes must be strictly in millimeters for accurate physical SVG scaling
 PAPER_SIZES = {
-    'A4_Landscape': (297, 210), 'A4_Portrait': (210, 297),
-    'Letter_Landscape': (11, 8.5), 'Letter_Portrait': (8.5, 11),
-    'Square': (10, 10)
+    'Ender3_Safe_Area': (200.0, 200.0),  # 200x200mm safe plotting zone for Ender 3
+    'A4_Landscape': (297.0, 210.0),
+    'A4_Portrait': (210.0, 297.0),
+    'Letter_Landscape': (279.4, 215.9),
+    'Letter_Portrait': (215.9, 279.4)
 }
 
-CURRENT_PAPER = 'A4_Landscape'
-PAPER_WIDTH, PAPER_HEIGHT = PAPER_SIZES[CURRENT_PAPER]
-PAPER_ASPECT = PAPER_WIDTH / PAPER_HEIGHT
+# Set your target here!
+CURRENT_PAPER = 'Ender3_Safe_Area'
+PAPER_WIDTH_MM, PAPER_HEIGHT_MM = PAPER_SIZES[CURRENT_PAPER]
+PAPER_ASPECT = PAPER_WIDTH_MM / PAPER_HEIGHT_MM
 is_landscape = True
 
 active_planet = 'Earth'
@@ -65,9 +69,13 @@ current_view_extent = None
 last_drag_coords = None
 has_drawn = False
 interval_ft = 1000
+pen_mm = 0.5  # Default 0.5mm pen
 show_ocean = True
 show_borders = True
 border_artists = []
+
+# Conversion constant: 1 inch = 25.4 mm. 1 point = 1/72 inch.
+PT_PER_MM = 72.0 / 25.4
 
 
 # ==========================================
@@ -88,7 +96,6 @@ def load_planet_data(planet):
     else:
         if files['color'].endswith('.tif'):
             color_src = rasterio.open(files['color'])
-            print(f"  -> Generating low-res base layer for fluid panning...")
             base_img = color_src.read(
                 out_shape=(color_src.count, 512, 1024),
                 resampling=rasterio.enums.Resampling.bilinear
@@ -114,19 +121,23 @@ current_color_src, current_dem_src, current_color_base = load_planet_data(active
 # ==========================================
 fig = plt.figure(figsize=(16, 8))
 
-# Layout Areas
 ax1 = fig.add_axes([0.05, 0.15, 0.4, 0.70])
 ax2 = fig.add_axes([0.55, 0.15, 0.4, 0.70])
 
-# Control Bars
+# Top Control Bar
 ax_radio = fig.add_axes([0.05, 0.88, 0.08, 0.10])
 ax_toggle = fig.add_axes([0.15, 0.88, 0.15, 0.10])
 ax_draw_btn = fig.add_axes([0.31, 0.90, 0.05, 0.05])
 ax_clear_btn = fig.add_axes([0.365, 0.90, 0.05, 0.05])
 ax_rotate_btn = fig.add_axes([0.42, 0.90, 0.05, 0.05])
 ax_export_btn = fig.add_axes([0.475, 0.90, 0.06, 0.05])
-ax_slider = fig.add_axes([0.25, 0.05, 0.4, 0.03])
-ax_text = fig.add_axes([0.78, 0.05, 0.08, 0.04])
+
+# Bottom Control Bar (Interval AND Pen Thickness)
+ax_slider_int = fig.add_axes([0.12, 0.05, 0.25, 0.03])
+ax_text_int = fig.add_axes([0.38, 0.05, 0.06, 0.04])
+
+ax_slider_pen = fig.add_axes([0.60, 0.05, 0.25, 0.03])
+ax_text_pen = fig.add_axes([0.86, 0.05, 0.06, 0.04])
 
 # Setup Left Panel
 img_base = ax1.imshow(current_color_base, extent=[-180, 180, -90, 90], origin='upper', zorder=0)
@@ -153,7 +164,7 @@ def draw_borders():
 draw_borders()
 
 # Setup Right Panel
-ax2.set_box_aspect(PAPER_HEIGHT / PAPER_WIDTH)
+ax2.set_box_aspect(PAPER_HEIGHT_MM / PAPER_WIDTH_MM)
 ax2.set_title(f"Topo View Preview\nPress 'Draw' to render contours")
 ax2.set_xlabel("Longitude")
 ax2.set_xticks([]);
@@ -166,9 +177,12 @@ btn_draw = Button(ax_draw_btn, 'Draw')
 btn_clear = Button(ax_clear_btn, 'Clear')
 btn_rotate = Button(ax_rotate_btn, 'Rotate')
 btn_export = Button(ax_export_btn, 'Export SVG')
-contour_slider = Slider(ax=ax_slider, label='Contour Interval (ft)', valmin=50, valmax=10000, valinit=interval_ft,
-                        valstep=50)
-text_box = TextBox(ax_text, 'Exact ft: ', initial=str(interval_ft))
+
+slider_int = Slider(ax=ax_slider_int, label='Interval (ft) ', valmin=50, valmax=10000, valinit=interval_ft, valstep=50)
+text_int = TextBox(ax_text_int, 'ft: ', initial=str(interval_ft))
+
+slider_pen = Slider(ax=ax_slider_pen, label='Pen Width (mm) ', valmin=0.1, valmax=2.0, valinit=pen_mm, valstep=0.05)
+text_pen = TextBox(ax_text_pen, 'mm: ', initial=str(pen_mm))
 
 
 # ==========================================
@@ -258,17 +272,20 @@ def get_contour_levels(dem_crop_raw, interval):
 def redraw_contours():
     if current_dem_crop is None: return
     ax2.clear();
-    ax2.set_box_aspect(PAPER_HEIGHT / PAPER_WIDTH)
+    ax2.set_box_aspect(PAPER_HEIGHT_MM / PAPER_WIDTH_MM)
 
     orientation = "Landscape" if is_landscape else "Portrait"
-    ax2.set_title(f"{active_planet} ({orientation})\n{interval_ft} ft/line")
+    ax2.set_title(f"{active_planet} ({orientation})\n{interval_ft} ft/line | Pen: {pen_mm} mm")
     ax2.set_xticks([]);
     ax2.set_yticks([])
 
     levels, crop_feet = get_contour_levels(current_dem_crop, interval_ft)
 
+    # Calculate linewidth in points for Matplotlib
+    lw_points = pen_mm * PT_PER_MM
+
     if len(levels) > 0:
-        ax2.contour(crop_feet, levels=levels, colors='black', linewidths=0.5, extent=current_data_extent,
+        ax2.contour(crop_feet, levels=levels, colors='black', linewidths=lw_points, extent=current_data_extent,
                     origin='upper')
     else:
         ax2.text(0.5, 0.5, "No topography in this range\n(Or Ocean is hidden)", ha='center', va='center',
@@ -309,7 +326,7 @@ def process_selection(x1, x2, y1, y2):
 
     has_drawn = False
     ax2.clear();
-    ax2.set_box_aspect(PAPER_HEIGHT / PAPER_WIDTH);
+    ax2.set_box_aspect(PAPER_HEIGHT_MM / PAPER_WIDTH_MM);
     ax2.set_xticks([]);
     ax2.set_yticks([])
     ax2.text(0.5, 0.5, "Selection updated.\nClick 'Draw' to render contours.", ha='center', va='center',
@@ -333,7 +350,7 @@ def clear_action(event=None):
     except Exception:
         pass
     ax2.clear();
-    ax2.set_box_aspect(PAPER_HEIGHT / PAPER_WIDTH);
+    ax2.set_box_aspect(PAPER_HEIGHT_MM / PAPER_WIDTH_MM);
     ax2.set_xticks([]);
     ax2.set_yticks([])
     ax2.text(0.5, 0.5, "Selection cleared.", ha='center', va='center', transform=ax2.transAxes)
@@ -341,15 +358,15 @@ def clear_action(event=None):
 
 
 def rotate_action(event):
-    global PAPER_WIDTH, PAPER_HEIGHT, PAPER_ASPECT, is_landscape
-    PAPER_WIDTH, PAPER_HEIGHT = PAPER_HEIGHT, PAPER_WIDTH
-    PAPER_ASPECT = PAPER_WIDTH / PAPER_HEIGHT
+    global PAPER_WIDTH_MM, PAPER_HEIGHT_MM, PAPER_ASPECT, is_landscape
+    PAPER_WIDTH_MM, PAPER_HEIGHT_MM = PAPER_HEIGHT_MM, PAPER_WIDTH_MM
+    PAPER_ASPECT = PAPER_WIDTH_MM / PAPER_HEIGHT_MM
     is_landscape = not is_landscape
     if last_drag_coords:
         process_selection(*last_drag_coords)
         if has_drawn: redraw_contours()
     else:
-        ax2.set_box_aspect(PAPER_HEIGHT / PAPER_WIDTH);
+        ax2.set_box_aspect(PAPER_HEIGHT_MM / PAPER_WIDTH_MM);
         fig.canvas.draw_idle()
 
 
@@ -358,22 +375,19 @@ def export_action(event):
         print("Please make a selection and click 'Draw' before exporting.")
         return
 
-    # Use Tkinter to popup a native dialog
     root = tk.Tk()
-    root.withdraw()  # Hide the main tk window
-
+    root.withdraw()
     orientation_str = "landscape" if is_landscape else "portrait"
-    default_name = f"{active_planet.lower()}_{orientation_str}"
+    default_name = f"{active_planet.lower()}_{orientation_str}_{CURRENT_PAPER}"
 
     base_name = simpledialog.askstring("Export SVG", "Enter save name (without extension):", initialvalue=default_name)
     root.destroy()
 
-    if not base_name:  # User hit cancel or closed the window
+    if not base_name:
         print("Export cancelled.")
         return
 
-    # Construct filename and handle versions
-    file_prefix = f"{base_name}_{interval_ft}ft"
+    file_prefix = f"{base_name}_{interval_ft}ft_pen{pen_mm}mm"
     filename = f"{file_prefix}.svg"
 
     version = 2
@@ -381,22 +395,31 @@ def export_action(event):
         filename = f"{file_prefix}_v{version}.svg"
         version += 1
 
-    print(f"\nGenerating {filename}...")
+    print(f"\nGenerating {filename} with exact physical dimensions...")
 
     levels, crop_feet = get_contour_levels(current_dem_crop, interval_ft)
-    export_fig = plt.figure(figsize=(10, 10 / PAPER_ASPECT))
+
+    # Define exact physical size in inches for Matplotlib SVG Exporter
+    inches_w = PAPER_WIDTH_MM / 25.4
+    inches_h = PAPER_HEIGHT_MM / 25.4
+
+    export_fig = plt.figure(figsize=(inches_w, inches_h))
     export_ax = export_fig.add_axes([0, 0, 1, 1]);
     export_ax.axis('off')
 
+    lw_points = pen_mm * PT_PER_MM
+
     if len(levels) > 0:
-        export_ax.contour(crop_feet, levels=levels, colors='black', linewidths=1, extent=current_data_extent,
+        export_ax.contour(crop_feet, levels=levels, colors='black', linewidths=lw_points, extent=current_data_extent,
                           origin='upper')
 
     export_ax.set_xlim(current_view_extent[0], current_view_extent[1])
     export_ax.set_ylim(current_view_extent[2], current_view_extent[3])
+
     export_fig.savefig(filename, format='svg')
     plt.close(export_fig)
-    print(f"Success! Saved to your folder. Ready for plotting.")
+    print(f"Success! Saved to your folder.")
+    print(f"-> This SVG is exactly {PAPER_WIDTH_MM}mm x {PAPER_HEIGHT_MM}mm, ready for vpype.")
 
 
 btn_draw.on_clicked(draw_action)
@@ -419,29 +442,53 @@ def toggle_features_action(label):
 top_toggles.on_clicked(toggle_features_action)
 
 
-def update_from_slider(val):
+# Slider Syncing
+def update_from_slider_int(val):
     global interval_ft
     interval_ft = int(val)
-    text_box.set_val(str(interval_ft))
+    text_int.set_val(str(interval_ft))
     if has_drawn: redraw_contours()
 
 
-def update_from_text(text):
+def update_from_text_int(text):
     global interval_ft
     try:
         val = int(text)
         if val < 1: val = 1
         interval_ft = val
-        contour_slider.eventson = False
-        contour_slider.set_val(val)
-        contour_slider.eventson = True
+        slider_int.eventson = False;
+        slider_int.set_val(val);
+        slider_int.eventson = True
         if has_drawn: redraw_contours()
     except ValueError:
         pass
 
 
-contour_slider.on_changed(update_from_slider)
-text_box.on_submit(update_from_text)
+def update_from_slider_pen(val):
+    global pen_mm
+    pen_mm = float(val)
+    text_pen.set_val(f"{pen_mm:.2f}")
+    if has_drawn: redraw_contours()
+
+
+def update_from_text_pen(text):
+    global pen_mm
+    try:
+        val = float(text)
+        if val < 0.01: val = 0.01
+        pen_mm = val
+        slider_pen.eventson = False;
+        slider_pen.set_val(val);
+        slider_pen.eventson = True
+        if has_drawn: redraw_contours()
+    except ValueError:
+        pass
+
+
+slider_int.on_changed(update_from_slider_int)
+text_int.on_submit(update_from_text_int)
+slider_pen.on_changed(update_from_slider_pen)
+text_pen.on_submit(update_from_text_pen)
 
 
 def switch_planet(label):
