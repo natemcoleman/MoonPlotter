@@ -1,6 +1,8 @@
 import sys
 import os
 import tempfile
+import json
+import copy
 import numpy as np
 import rasterio
 from rasterio.windows import Window
@@ -13,7 +15,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QFileDialog, QMessageBox, QFrame, QButtonGroup,
                              QInputDialog, QColorDialog, QSlider, QScrollArea, QSpinBox)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QDoubleValidator, QIntValidator
+from PyQt6.QtGui import QDoubleValidator, QIntValidator, QShortcut, QKeySequence
 
 # Matplotlib Imports
 import matplotlib
@@ -22,6 +24,9 @@ matplotlib.use('QtAgg')
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from matplotlib.widgets import RectangleSelector
+from matplotlib.textpath import TextPath
+from matplotlib.transforms import Affine2D
+from matplotlib.collections import LineCollection
 
 import warnings
 
@@ -52,13 +57,12 @@ except ImportError:
     HAS_GPD = False
 
 # ==========================================
-# 1. CONFIGURATION
+# 1. CONFIGURATION & PERSISTENCE
 # ==========================================
 DATA_FILES = {
     'Earth': {'color': 'earth_color.tif', 'dem': 'BE_dem_v2.tif', 'multiplier': 3.28084},
     'Moon': {'color': 'lroc_color_16bit_srgb_4k.tif', 'dem': 'ldem_16.tif', 'multiplier': 3280.84}
 }
-
 PAPER_SIZES = {
     '100x100mm (Default)': (100.0, 100.0),
     'Ender3_Safe (200x200)': (200.0, 200.0),
@@ -66,14 +70,36 @@ PAPER_SIZES = {
     'Letter': (279.4, 215.9),
     'Custom (mm)': (150.0, 150.0)
 }
-
 PT_PER_MM = 72.0 / 25.4
 loaded_maps_cache = {}
 
+PENS_FILE = "plotter_pens.json"
+
+
+def load_pens():
+    if os.path.exists(PENS_FILE):
+        try:
+            with open(PENS_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            pass
+    return {
+        'base': {'id': 'base', 'name': 'Base Pen', 'color': '#000000', 'width': 0.3},
+        'pen_1': {'id': 'pen_1', 'name': 'Index Pen', 'color': '#000000', 'width': 0.6},
+        'cutter': {'id': 'cutter', 'name': 'Cutter Blade', 'color': '#0000FF', 'width': 0.1}
+    }
+
+
+def save_pens(pens):
+    try:
+        with open(PENS_FILE, 'w') as f:
+            json.dump(pens, f)
+    except:
+        pass
+
 
 def load_planet_data(planet):
-    if planet in loaded_maps_cache:
-        return loaded_maps_cache[planet]
+    if planet in loaded_maps_cache: return loaded_maps_cache[planet]
     files = DATA_FILES[planet]
     if not os.path.exists(files['color']):
         base_img = np.zeros((2048, 4096, 3), dtype=np.uint8)
@@ -84,8 +110,7 @@ def load_planet_data(planet):
                 new_w, new_h = int(src.width / scale), int(src.height / scale)
                 base_img = src.read(out_shape=(src.count, new_h, new_w),
                                     resampling=rasterio.enums.Resampling.bilinear).transpose(1, 2, 0)
-                if base_img.dtype == np.uint16:
-                    base_img = (base_img / 256).astype(np.uint8)
+                if base_img.dtype == np.uint16: base_img = (base_img / 256).astype(np.uint8)
         else:
             base_img = np.array(Image.open(files['color']))
 
@@ -113,7 +138,6 @@ class DataFetchWorker(QThread):
             dem_data = self.dem_src.read(1, window=window)
             h, w = self.dem_src.shape
             extent = [px_x1 / w * 360 - 180, px_x2 / w * 360 - 180, 90 - (px_y2 / h * 180), 90 - (px_y1 / h * 180)]
-
             mult = DATA_FILES[self.planet]['multiplier']
             crop_ft = dem_data * mult
             crop_ft[crop_ft < -100000] = np.nan
@@ -132,7 +156,6 @@ class PlotterApp(QMainWindow):
         self.setWindowTitle("Topo Plotter Studio - Cartographer Edition")
         self.resize(1600, 850)
 
-        # Base State
         self.active_planet = 'Earth'
         self.paper_name = '100x100mm (Default)'
         self.is_landscape = True
@@ -140,31 +163,45 @@ class PlotterApp(QMainWindow):
         self.show_borders = True
         self.interval_ft = 200
 
-        # Maps & Canvas State
         self.current_dem_src = None
         self.current_dem_crop = None
         self.current_data_extent = None
         self.current_view_extent = None
         self.last_drag_coords = None
         self.has_drawn = False
-        self.border_artists = []
+
         self.pan_active = False
+        self.prev_pan_active = False
 
         # Undo / Redo Stacks
         self.undo_stack = []
         self.redo_stack = []
 
-        # Pen Tool Data (Notice 'pen_1' color changed to black)
-        self.pens = {
-            'base': {'id': 'base', 'name': 'Base Pen', 'color': '#000000', 'width': 0.3},
-            'pen_1': {'id': 'pen_1', 'name': 'Index Pen', 'color': '#000000', 'width': 0.6},
-            'cutter': {'id': 'cutter', 'name': 'Cutter Blade', 'color': '#0000FF', 'width': 0.1}
-        }
+        # Cartography Data
+        self.pens = load_pens()
         self.active_pen_id = 'base'
-        self.interactive_lines = []
+        self.canvas_mode = 'paint'
+
+        self.dem_segments = []  # Auto-generated DEM paths
+        self.custom_items = []  # User drawn freehand & text
+        self.dem_collection = None  # Optimized Matplotlib collection
+
+        # Interactive drawing state
+        self.drawing_active = False
+        self.current_freehand = []
+        self.temp_draw_line = None
+
+        self.transform_target_idx = None
+        self.transform_start_state = None
 
         self.init_ui()
+        self.setup_hotkeys()
         self.switch_planet()
+
+    def setup_hotkeys(self):
+        QShortcut(QKeySequence("Ctrl+Z"), self).activated.connect(self.undo_action)
+        QShortcut(QKeySequence("Ctrl+Shift+Z"), self).activated.connect(self.redo_action)
+        QShortcut(QKeySequence("Ctrl+Y"), self).activated.connect(self.redo_action)
 
     def init_ui(self):
         main_widget = QWidget()
@@ -178,18 +215,14 @@ class PlotterApp(QMainWindow):
         vbox.setAlignment(Qt.AlignmentFlag.AlignTop)
 
         vbox.addWidget(QLabel("<b>Planet Source</b>"))
-        self.radio_earth = QRadioButton("Earth (Local TIF)")
-        self.radio_moon = QRadioButton("Moon (Local TIF)")
+        self.radio_earth = QRadioButton("Earth (Local)")
+        self.radio_moon = QRadioButton("Moon (Local)")
         self.radio_earth.setChecked(True)
         self.radio_earth.toggled.connect(self.switch_planet)
         h_planet = QHBoxLayout();
         h_planet.addWidget(self.radio_earth);
         h_planet.addWidget(self.radio_moon)
         vbox.addLayout(h_planet)
-
-        line1 = QFrame();
-        line1.setFrameShape(QFrame.Shape.HLine);
-        vbox.addWidget(line1)
 
         vbox.addWidget(QLabel("<b>Map Options</b>"))
         self.chk_ocean = QCheckBox("Plot Ocean/Crater Depths")
@@ -267,14 +300,12 @@ class PlotterApp(QMainWindow):
         self.spin_idx.setRange(2, 20)
         self.spin_idx.setValue(5)
         self.spin_idx.setFixedWidth(40)
-        h_idx.addWidget(self.chk_auto_index)
-        h_idx.addWidget(self.spin_idx)
+        h_idx.addWidget(self.chk_auto_index);
+        h_idx.addWidget(self.spin_idx);
         h_idx.addWidget(QLabel("intervals"))
         h_idx.addStretch()
-
-        # Connect Index updates to trigger live redraw
-        self.chk_auto_index.toggled.connect(lambda _: self.redraw_contours() if self.has_drawn else None)
-        self.spin_idx.valueChanged.connect(lambda _: self.redraw_contours() if self.has_drawn else None)
+        self.chk_auto_index.toggled.connect(self.trigger_recalc)
+        self.spin_idx.valueChanged.connect(self.trigger_recalc)
         vbox.addLayout(h_idx)
 
         vbox.addSpacing(10)
@@ -286,45 +317,49 @@ class PlotterApp(QMainWindow):
         self.btn_apply_adaptive = QPushButton("Use Suggested Interval")
         self.btn_apply_adaptive.setEnabled(False)
         self.btn_apply_adaptive.clicked.connect(self.apply_adaptive)
-        v_adapt.addWidget(self.lbl_adaptive)
+        v_adapt.addWidget(self.lbl_adaptive);
         v_adapt.addWidget(self.btn_apply_adaptive)
         vbox.addWidget(self.frame_adaptive)
 
-        # Actions
         vbox.addStretch()
         self.lbl_status = QLabel("Ready.")
         self.lbl_status.setStyleSheet("color: gray; font-style: italic;")
         vbox.addWidget(self.lbl_status)
 
         self.btn_draw = QPushButton("1. DRAW MAP")
-        self.btn_draw.setStyleSheet("background-color: #2E86C1; color: white; font-weight: bold; padding: 12px;")
+        self.btn_draw.setStyleSheet("background-color: #2E86C1; color: white; font-weight: bold; padding: 10px;")
         self.btn_draw.clicked.connect(self.draw_action)
         vbox.addWidget(self.btn_draw)
 
-        self.btn_export = QPushButton("2. EXPORT G-CODE")
-        self.btn_export.setStyleSheet("background-color: #28B463; color: white; font-weight: bold; padding: 12px;")
+        self.btn_export_svg = QPushButton("2. SAVE SVG (Editable)")
+        self.btn_export_svg.setStyleSheet("background-color: #8E44AD; color: white; font-weight: bold; padding: 10px;")
+        self.btn_export_svg.clicked.connect(self.export_svg_action)
+        vbox.addWidget(self.btn_export_svg)
+
+        self.btn_export = QPushButton("3. GENERATE G-CODE")
+        self.btn_export.setStyleSheet("background-color: #28B463; color: white; font-weight: bold; padding: 10px;")
         self.btn_export.clicked.connect(self.export_action)
         vbox.addWidget(self.btn_export)
 
-        # --- RIGHT PANELS: CANVASES & PAINT PALETTE ---
+        # --- RIGHT PANELS: CANVASES ---
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        # Map Container
-        map_widget = QWidget()
-        v_map = QVBoxLayout(map_widget)
+        # Color Map
+        map_widget = QWidget();
+        v_map = QVBoxLayout(map_widget);
         v_map.setContentsMargins(0, 0, 0, 0)
-        self.fig_map = Figure(figsize=(5, 5), dpi=100)
+        self.fig_map = Figure(figsize=(5, 5), dpi=100);
         self.ax_map = self.fig_map.add_subplot(111)
         self.canvas_map = FigureCanvas(self.fig_map)
         v_map.addWidget(self.canvas_map)
 
         h_toolbar = QHBoxLayout()
-        self.btn_home = QPushButton("🏠 Reset View")
+        self.btn_home = QPushButton("Reset View")
         self.btn_home.clicked.connect(self.reset_home_view)
-        self.btn_zoom_tool = QPushButton("🔍 Zoom Tool")
+        self.btn_zoom_tool = QPushButton("Zoom Map")
         self.btn_zoom_tool.setCheckable(True)
         self.btn_zoom_tool.toggled.connect(self.toggle_zoom_tool)
-        self.btn_clear_sel = QPushButton("❌ Clear Selection")
+        self.btn_clear_sel = QPushButton("Clear Map")
         self.btn_clear_sel.clicked.connect(self.clear_selection)
         h_toolbar.addWidget(self.btn_home);
         h_toolbar.addWidget(self.btn_zoom_tool)
@@ -335,32 +370,64 @@ class PlotterApp(QMainWindow):
         splitter.addWidget(map_widget)
 
         # Preview Container & Paint Palette
-        prev_widget = QWidget()
-        v_prev = QVBoxLayout(prev_widget)
+        prev_widget = QWidget();
+        v_prev = QVBoxLayout(prev_widget);
         v_prev.setContentsMargins(0, 0, 0, 0)
-
-        self.fig_prev = Figure(figsize=(5, 5), dpi=100)
+        self.fig_prev = Figure(figsize=(5, 5), dpi=100);
         self.ax_prev = self.fig_prev.add_subplot(111)
         self.canvas_prev = FigureCanvas(self.fig_prev)
         v_prev.addWidget(self.canvas_prev)
 
-        # Scrollable Vertical Paint Palette
+        # Preview Zoom Toolbar
+        h_prev_toolbar = QHBoxLayout()
+        self.btn_prev_home = QPushButton("Reset View")
+        self.btn_prev_home.clicked.connect(self.reset_prev_view)
+        self.btn_prev_zoom = QPushButton("Zoom Preview")
+        self.btn_prev_zoom.setCheckable(True)
+        self.btn_prev_zoom.toggled.connect(self.toggle_prev_zoom)
+        h_prev_toolbar.addWidget(self.btn_prev_home);
+        h_prev_toolbar.addWidget(self.btn_prev_zoom)
+        h_prev_toolbar.addWidget(QLabel("<i>(Scroll to zoom, Mid-click to pan)</i>"));
+        h_prev_toolbar.addStretch()
+        v_prev.addLayout(h_prev_toolbar)
+
+        # Tool Palette
         self.frame_palette = QFrame()
         self.frame_palette.setStyleSheet("background-color: #FDFEFE; border: 1px solid #D5D8DC; border-radius: 5px;")
         v_pal = QVBoxLayout(self.frame_palette)
         v_pal.setContentsMargins(8, 8, 8, 8)
 
-        # Top Tool Row (Undo / Redo / Add Pen)
+        # Top Tool Modes
+        h_modes = QHBoxLayout()
+        self.mode_group = QButtonGroup()
+        modes = [('paint', 'Paint'), ('draw', 'Draw Line'), ('text', 'Add Text'), ('transform', 'Move/Rotate Text')]
+        for mode, title in modes:
+            btn = QPushButton(title)
+            btn.setCheckable(True)
+            btn.setProperty("mode", mode)
+            if mode == 'paint':
+                btn.setChecked(True)
+            self.mode_group.addButton(btn)
+            h_modes.addWidget(btn)
+        self.mode_group.buttonClicked.connect(self.change_mode)
+        v_pal.addLayout(h_modes)
+
+        # Undo / Redo / Add Pen
         h_tools = QHBoxLayout()
-        self.btn_undo = QPushButton("↶ Undo")
+        btn_style = "background-color: #E5E7E9; color: black; font-weight: bold; padding: 4px; border-radius: 3px;"
+
+        self.btn_undo = QPushButton("Undo")
+        self.btn_undo.setStyleSheet(btn_style)
         self.btn_undo.setEnabled(False)
         self.btn_undo.clicked.connect(self.undo_action)
 
-        self.btn_redo = QPushButton("↷ Redo")
+        self.btn_redo = QPushButton("Redo")
+        self.btn_redo.setStyleSheet(btn_style)
         self.btn_redo.setEnabled(False)
         self.btn_redo.clicked.connect(self.redo_action)
 
-        self.btn_add_pen = QPushButton("➕ Add Pen")
+        self.btn_add_pen = QPushButton("Add Custom Pen")
+        self.btn_add_pen.setStyleSheet(btn_style)
         self.btn_add_pen.clicked.connect(self.add_custom_pen)
 
         h_tools.addWidget(self.btn_undo);
@@ -372,43 +439,116 @@ class PlotterApp(QMainWindow):
         # Vertical Scroll Area for Pens
         self.scroll_pens = QScrollArea()
         self.scroll_pens.setWidgetResizable(True)
-        self.scroll_pens.setFixedHeight(120)
+        self.scroll_pens.setFixedHeight(100)
         self.scroll_pens.setStyleSheet("border: None;")
-
         self.scroll_content = QWidget()
         self.v_palette_btns = QVBoxLayout(self.scroll_content)
         self.v_palette_btns.setAlignment(Qt.AlignmentFlag.AlignTop)
-
         self.pen_btn_group = QButtonGroup()
         self.pen_btn_group.buttonClicked.connect(self.on_palette_selected)
-
         self.scroll_pens.setWidget(self.scroll_content)
         v_pal.addWidget(self.scroll_pens)
 
         self.rebuild_palette_ui()
+        self.update_mode_button_styles()  # Apply initial blue highlight
         v_prev.addWidget(self.frame_palette)
 
         splitter.addWidget(prev_widget)
         main_layout.addWidget(left_panel)
         main_layout.addWidget(splitter)
 
-        # Selectors & Map Events
+        # Map Canvas Events
         self.selector = RectangleSelector(self.ax_map, self.on_select, useblit=True, button=[1], interactive=True,
                                           props=dict(facecolor='red', edgecolor='red', alpha=0.3, fill=True))
         self.zoom_selector = RectangleSelector(self.ax_map, self.on_zoom_select, useblit=True, button=[1],
                                                interactive=False,
                                                props=dict(facecolor='blue', edgecolor='blue', alpha=0.2, fill=True))
         self.canvas_map.mpl_connect('scroll_event', self.zoom_map)
-        self.canvas_map.mpl_connect('button_press_event', self.on_mouse_press)
-        self.canvas_map.mpl_connect('motion_notify_event', self.on_mouse_motion)
-        self.canvas_map.mpl_connect('button_release_event', self.on_mouse_release)
+        self.canvas_map.mpl_connect('button_press_event', self.on_mouse_press_map)
+        self.canvas_map.mpl_connect('motion_notify_event', self.on_mouse_motion_map)
+        self.canvas_map.mpl_connect('button_release_event', self.on_mouse_release_map)
 
-        # Interactive Preview Pick Event
-        self.canvas_prev.mpl_connect('pick_event', self.on_contour_pick)
+        # Preview Canvas Events
+        self.prev_zoom_selector = RectangleSelector(self.ax_prev, self.on_prev_zoom_select, useblit=True, button=[1],
+                                                    interactive=False,
+                                                    props=dict(facecolor='blue', edgecolor='blue', alpha=0.2,
+                                                               fill=True))
+        self.prev_zoom_selector.set_active(False)
+        self.canvas_prev.mpl_connect('button_press_event', self.on_prev_press)
+        self.canvas_prev.mpl_connect('motion_notify_event', self.on_prev_motion)
+        self.canvas_prev.mpl_connect('button_release_event', self.on_prev_release)
+        self.canvas_prev.mpl_connect('scroll_event', self.on_prev_scroll)
+        self.canvas_prev.mpl_connect('pick_event', self.on_prev_pick)
 
         self.update_paper_dims()
 
-    # --- PALETTE & UNDO LOGIC ---
+    # --- MODE & STATE LOGIC ---
+    def update_mode_button_styles(self):
+        for btn in self.mode_group.buttons():
+            if btn.isChecked():
+                btn.setStyleSheet(
+                    "background-color: #2E86C1; color: white; font-weight: bold; border-radius: 4px; padding: 6px;")
+            else:
+                btn.setStyleSheet("background-color: #E5E7E9; color: black; border-radius: 4px; padding: 6px;")
+
+    def change_mode(self, btn):
+        self.canvas_mode = btn.property("mode")
+        self.update_mode_button_styles()
+
+        # Disable prev zoom selector if changing modes
+        self.btn_prev_zoom.setChecked(False)
+        self.prev_zoom_selector.set_active(False)
+
+        if self.canvas_mode == 'text':
+            self.lbl_status.setText("Text Mode: Click on the preview map to place text.")
+        elif self.canvas_mode == 'draw':
+            self.lbl_status.setText("Draw Mode: Click and drag on the preview map to draw contours.")
+        elif self.canvas_mode == 'transform':
+            self.lbl_status.setText("Transform Mode: Click & Drag to move. Scroll to Rotate. Shift+Scroll to Scale.")
+        else:
+            self.lbl_status.setText(
+                "Paint Mode: Click a contour to change its pen (Shift+Click to change all at elevation).")
+
+    def push_undo_state(self):
+        state = {
+            'pens': [s['pen_id'] for s in self.dem_segments],
+            'custom': copy.deepcopy(self.custom_items)
+        }
+        self.undo_stack.append(state)
+        self.redo_stack.clear()
+        self.update_undo_redo_btns()
+
+    def update_undo_redo_btns(self):
+        self.btn_undo.setEnabled(len(self.undo_stack) > 0)
+        self.btn_redo.setEnabled(len(self.redo_stack) > 0)
+
+    def undo_action(self):
+        if not self.undo_stack: return
+        self.redo_stack.append({
+            'pens': [s['pen_id'] for s in self.dem_segments],
+            'custom': copy.deepcopy(self.custom_items)
+        })
+        state = self.undo_stack.pop()
+        self._apply_state(state)
+        self.update_undo_redo_btns()
+
+    def redo_action(self):
+        if not self.redo_stack: return
+        self.undo_stack.append({
+            'pens': [s['pen_id'] for s in self.dem_segments],
+            'custom': copy.deepcopy(self.custom_items)
+        })
+        state = self.redo_stack.pop()
+        self._apply_state(state)
+        self.update_undo_redo_btns()
+
+    def _apply_state(self, state):
+        for i, p_id in enumerate(state['pens']):
+            if i < len(self.dem_segments): self.dem_segments[i]['pen_id'] = p_id
+        self.custom_items = copy.deepcopy(state['custom'])
+        self.render_canvas()
+
+    # --- PEN PALETTE ---
     def rebuild_palette_ui(self):
         while self.v_palette_btns.count():
             item = self.v_palette_btns.takeAt(0)
@@ -420,8 +560,7 @@ class PlotterApp(QMainWindow):
             btn = QRadioButton(f"{pen['name']} ({pen['width']}mm)")
             btn.setStyleSheet(f"QRadioButton {{ color: {pen['color']}; font-weight: bold; padding: 4px; }}")
             btn.setProperty("pen_id", p_id)
-            if p_id == self.active_pen_id:
-                btn.setChecked(True)
+            if p_id == self.active_pen_id: btn.setChecked(True)
             self.pen_btn_group.addButton(btn)
             self.v_palette_btns.addWidget(btn)
 
@@ -431,15 +570,14 @@ class PlotterApp(QMainWindow):
     def add_custom_pen(self):
         name, ok1 = QInputDialog.getText(self, "New Pen", "Enter tool name:")
         if not ok1 or not name: return
-
         width, ok2 = QInputDialog.getDouble(self, "New Pen", "Enter line width (mm):", 0.5, 0.01, 5.0, 2)
         if not ok2: return
-
         color_dlg = QColorDialog.getColor(Qt.GlobalColor.black, self, "Select Preview Color")
         if not color_dlg.isValid(): return
 
         p_id = f"custom_{len(self.pens)}"
         self.pens[p_id] = {'id': p_id, 'name': name, 'width': width, 'color': color_dlg.name()}
+        save_pens(self.pens)
         self.rebuild_palette_ui()
 
     def update_base_pen(self, text):
@@ -450,14 +588,18 @@ class PlotterApp(QMainWindow):
                 self.slider_pen.blockSignals(True)
                 self.slider_pen.setValue(int(val * 100))
                 self.slider_pen.blockSignals(False)
-
+                save_pens(self.pens)
                 self.rebuild_palette_ui()
-                for obj in self.interactive_lines:
-                    if obj['pen_id'] == 'base':
-                        obj['line'].set_linewidth(val * PT_PER_MM)
-                self.canvas_prev.draw_idle()
+                self.render_canvas()
         except ValueError:
             pass
+
+    # --- MAP & DATA CALCULATION ---
+    def trigger_recalc(self):
+        if self.has_drawn:
+            self.push_undo_state()
+            self.calculate_dem_contours()
+            self.render_canvas()
 
     def update_interval(self, text):
         try:
@@ -467,74 +609,306 @@ class PlotterApp(QMainWindow):
                 self.slider_int.blockSignals(True)
                 self.slider_int.setValue(val)
                 self.slider_int.blockSignals(False)
-                # Live redraw on interval change
-                if self.has_drawn:
-                    self.redraw_contours()
+                self.trigger_recalc()
         except ValueError:
             pass
 
-    def update_undo_redo_btns(self):
-        self.btn_undo.setEnabled(len(self.undo_stack) > 0)
-        self.btn_redo.setEnabled(len(self.redo_stack) > 0)
+    def draw_action(self):
+        if not self.last_drag_coords or self.current_dem_src is None: return
+        self.btn_draw.setEnabled(False)
+        self.lbl_status.setText("Extracting DEM data... Please wait.")
+        self.worker = DataFetchWorker(self.active_planet, self.current_dem_src, self.pending_bounds)
+        self.worker.finished.connect(self.on_fetch_success)
+        self.worker.error.connect(self.on_fetch_error)
+        self.worker.start()
 
-    def _apply_pen_to_line(self, line_idx, pen_id):
-        obj = self.interactive_lines[line_idx]
-        obj['pen_id'] = pen_id
-        pen = self.pens[pen_id]
-        obj['line'].set_color(pen['color'])
-        obj['line'].set_linewidth(pen['width'] * PT_PER_MM)
-        obj['line'].set_zorder(10 if pen_id != 'base' else 1)
+    def on_fetch_success(self, dem_data, extent, min_e, max_e):
+        self.current_dem_crop = dem_data
+        self.current_data_extent = extent
+        relief = max_e - min_e
+        if relief > 0:
+            best_step = next((s for s in [10, 20, 50, 100, 200, 250, 500, 1000, 2000] if s >= relief / 35), 2000)
+            self.suggested_interval = best_step
+            self.lbl_adaptive.setText(
+                f"<b>Adaptive Guidance</b><br>Local Relief: {int(relief):,} ft<br>Suggested: {best_step} ft")
+            self.btn_apply_adaptive.setEnabled(True)
 
-    def undo_action(self):
-        if not self.undo_stack: return
-        changes = self.undo_stack.pop()
-        for change in changes:
-            self._apply_pen_to_line(change['idx'], change['old_pen'])
-        self.redo_stack.append(changes)
-        self.canvas_prev.draw_idle()
+        self.has_drawn = True
+        self.custom_items = []
+        self.undo_stack.clear();
+        self.redo_stack.clear();
         self.update_undo_redo_btns()
+        self.calculate_dem_contours()
+        self.reset_prev_view()
+        self.btn_draw.setEnabled(True)
+        self.lbl_status.setText("Render complete!")
 
-    def redo_action(self):
-        if not self.redo_stack: return
-        changes = self.redo_stack.pop()
-        for change in changes:
-            self._apply_pen_to_line(change['idx'], change['new_pen'])
-        self.undo_stack.append(changes)
+    def on_fetch_error(self, err_msg):
+        self.btn_draw.setEnabled(True);
+        QMessageBox.critical(self, "Read Error", err_msg)
+
+    def calculate_dem_contours(self):
+        self.dem_segments = []
+        if not self.has_drawn or self.current_dem_crop is None: return
+
+        mult = DATA_FILES[self.active_planet]['multiplier']
+        crop_ft = self.current_dem_crop * mult
+        if np.isnan(crop_ft).all(): return
+
+        min_e, max_e = np.nanmin(crop_ft), np.nanmax(crop_ft)
+        s_lvl = np.floor(min_e / self.interval_ft) * self.interval_ft
+        e_lvl = np.ceil(max_e / self.interval_ft) * self.interval_ft
+        levels = np.arange(s_lvl, e_lvl + self.interval_ft, self.interval_ft)
+        if self.active_planet == 'Earth' and not self.show_ocean:
+            levels = [l for l in levels if l >= 0]
+
+        if len(levels) == 0: return
+
+        fig_temp = Figure();
+        ax_temp = fig_temp.add_subplot(111)
+        cs = ax_temp.contour(crop_ft, levels=levels, extent=self.current_data_extent, origin='upper')
+
+        for lvl_idx, level in enumerate(cs.levels):
+            segs = cs.allsegs[lvl_idx]
+            is_index = False
+            if self.chk_auto_index.isChecked():
+                if round(level / self.interval_ft) % self.spin_idx.value() == 0:
+                    is_index = True
+
+            pen_id = 'pen_1' if is_index else 'base'
+            for seg in segs:
+                if len(seg) < 2: continue
+                self.dem_segments.append({
+                    'type': 'dem',
+                    'seg': seg,
+                    'level': level,
+                    'pen_id': pen_id
+                })
+
+    # --- HIGH PERFORMANCE RENDERER ---
+    def render_canvas(self):
+        # Save current zoom limits so redrawing doesn't snap the camera back out
+        xlim, ylim = self.ax_prev.get_xlim(), self.ax_prev.get_ylim()
+
+        self.ax_prev.clear();
+        self.ax_prev.set_xticks([]);
+        self.ax_prev.set_yticks([])
+        if not self.has_drawn: return
+
+        mid_lat = np.radians((self.current_view_extent[2] + self.current_view_extent[3]) / 2)
+        self.ax_prev.set_aspect(1 / np.cos(mid_lat))
+
+        # 1. Render DEM lines in bulk using LineCollection (Restores 60fps performance!)
+        if self.dem_segments:
+            segs = [item['seg'] for item in self.dem_segments]
+            colors = [self.pens[item['pen_id']]['color'] for item in self.dem_segments]
+            lws = [self.pens[item['pen_id']]['width'] * PT_PER_MM for item in self.dem_segments]
+
+            self.dem_collection = LineCollection(segs, colors=colors, linewidths=lws, picker=True, pickradius=5)
+            self.ax_prev.add_collection(self.dem_collection)
+
+        # 2. Render Custom Items
+        for idx, item in enumerate(self.custom_items):
+            pen = self.pens[item['pen_id']]
+            if item['type'] == 'line':
+                seg = np.array(item['points'])
+                line, = self.ax_prev.plot(seg[:, 0], seg[:, 1], color=pen['color'],
+                                          linewidth=pen['width'] * PT_PER_MM, picker=True, pickradius=5, zorder=15)
+                line.item_ref = ('custom', idx)
+            elif item['type'] == 'text':
+                tp = TextPath((0, 0), item['text'], size=1)
+                trans = Affine2D().scale(item['scale']).rotate_deg(item['rot']).translate(item['x'], item['y'])
+                polys = tp.transformed(trans).to_polygons()
+                for poly in polys:
+                    line, = self.ax_prev.plot(poly[:, 0], poly[:, 1], color=pen['color'],
+                                              linewidth=pen['width'] * PT_PER_MM, picker=True, pickradius=5, zorder=15)
+                    line.item_ref = ('custom', idx)
+
+        self.ax_prev.set_xlim(xlim);
+        self.ax_prev.set_ylim(ylim)
         self.canvas_prev.draw_idle()
-        self.update_undo_redo_btns()
 
-    # --- INTERACTIVE PAINTING (PICK EVENT) ---
-    def on_contour_pick(self, event):
-        if event.mouseevent.button != 1: return
-        if not self.interactive_lines: return
+    # --- PREVIEW ZOOM & PAN ---
+    def reset_prev_view(self):
+        if not self.has_drawn: return
+        self.ax_prev.set_xlim(self.current_view_extent[0], self.current_view_extent[1])
+        self.ax_prev.set_ylim(self.current_view_extent[2], self.current_view_extent[3])
+        self.canvas_prev.draw_idle()
 
-        picked_line = event.artist
-        target_level = None
+    def toggle_prev_zoom(self, checked):
+        if checked:
+            # Change mode visually so they know they are zooming
+            self.mode_group.setExclusive(False)
+            for btn in self.mode_group.buttons(): btn.setChecked(False)
+            self.mode_group.setExclusive(True)
+            self.update_mode_button_styles()
+            self.btn_prev_zoom.setStyleSheet("background-color: lightblue; font-weight: bold;")
+        else:
+            self.btn_prev_zoom.setStyleSheet("")
 
-        for obj in self.interactive_lines:
-            if obj['line'] == picked_line:
-                target_level = obj['level']
-                break
+        self.prev_zoom_selector.set_active(checked)
 
-        if target_level is not None:
+    def on_prev_zoom_select(self, eclick, erelease):
+        x1, x2 = sorted([eclick.xdata, erelease.xdata]);
+        y1, y2 = sorted([eclick.ydata, erelease.ydata])
+        self.ax_prev.set_xlim(x1, x2);
+        self.ax_prev.set_ylim(y1, y2);
+        self.canvas_prev.draw_idle()
+        self.btn_prev_zoom.setChecked(False)  # Auto-disable after zooming
+
+    # --- INTERACTIVE MOUSE CONTROLS (Preview Canvas) ---
+    def on_prev_press(self, event):
+        if event.inaxes != self.ax_prev: return
+
+        # Middle Click Pan
+        if event.button == 2:
+            self.prev_pan_active = True
+            self.prev_pan_start_x, self.prev_pan_start_y = event.x, event.y
+            self.prev_pan_xlim, self.prev_pan_ylim = self.ax_prev.get_xlim(), self.ax_prev.get_ylim()
+            return
+
+        if event.button != 1 or self.btn_prev_zoom.isChecked(): return
+
+        if self.canvas_mode == 'draw':
+            self.drawing_active = True
+            self.current_freehand = [(event.xdata, event.ydata)]
+            pen = self.pens[self.active_pen_id]
+            self.temp_draw_line, = self.ax_prev.plot([event.xdata], [event.ydata], color=pen['color'],
+                                                     lw=pen['width'] * PT_PER_MM, zorder=20)
+            self.canvas_prev.draw_idle()
+
+        elif self.canvas_mode == 'text':
+            text, ok = QInputDialog.getText(self, "Add Text", "Enter text to plot:")
+            if ok and text:
+                self.push_undo_state()
+                vp_width = self.current_view_extent[1] - self.current_view_extent[0]
+                init_scale = vp_width * 0.05
+                self.custom_items.append({
+                    'type': 'text', 'text': text, 'x': event.xdata, 'y': event.ydata,
+                    'rot': 0.0, 'scale': init_scale, 'pen_id': self.active_pen_id
+                })
+                self.render_canvas()
+
+        elif self.canvas_mode == 'transform':
+            min_dist = float('inf');
+            target = None
+            for idx, item in enumerate(self.custom_items):
+                if item['type'] == 'text':
+                    dx = event.xdata - item['x'];
+                    dy = event.ydata - item['y']
+                    dist = dx * dx + dy * dy
+                    if dist < min_dist: min_dist = dist; target = idx
+            if target is not None:
+                self.transform_target_idx = target
+                self.transform_start_state = copy.deepcopy(self.custom_items[target])
+
+    def on_prev_motion(self, event):
+        if event.inaxes != self.ax_prev: return
+
+        # Pan
+        if self.prev_pan_active:
+            inv = self.ax_prev.transData.inverted()
+            sx, sy = inv.transform((self.prev_pan_start_x, self.prev_pan_start_y))
+            ex, ey = inv.transform((event.x, event.y))
+            self.ax_prev.set_xlim(self.prev_pan_xlim[0] - (ex - sx), self.prev_pan_xlim[1] - (ex - sx))
+            self.ax_prev.set_ylim(self.prev_pan_ylim[0] - (ey - sy), self.prev_pan_ylim[1] - (ey - sy))
+            self.canvas_prev.draw_idle()
+            return
+
+        if self.canvas_mode == 'draw' and self.drawing_active:
+            self.current_freehand.append((event.xdata, event.ydata))
+            xs, ys = zip(*self.current_freehand)
+            self.temp_draw_line.set_data(xs, ys)
+            self.canvas_prev.draw_idle()
+
+        elif self.canvas_mode == 'transform' and self.transform_target_idx is not None:
+            item = self.custom_items[self.transform_target_idx]
+            item['x'] = event.xdata;
+            item['y'] = event.ydata
+            self.render_canvas()
+
+    def on_prev_release(self, event):
+        if event.button == 2: self.prev_pan_active = False; return
+        if event.button != 1: return
+
+        if self.canvas_mode == 'draw' and self.drawing_active:
+            self.drawing_active = False
+            if len(self.current_freehand) > 1:
+                self.push_undo_state()
+                self.custom_items.append(
+                    {'type': 'line', 'points': self.current_freehand, 'pen_id': self.active_pen_id})
+            if self.temp_draw_line:
+                self.temp_draw_line.remove();
+                self.temp_draw_line = None
+            self.render_canvas()
+
+        elif self.canvas_mode == 'transform' and self.transform_target_idx is not None:
+            start = self.transform_start_state;
+            cur = self.custom_items[self.transform_target_idx]
+            if start['x'] != cur['x'] or start['y'] != cur['y']:
+                self.custom_items[self.transform_target_idx] = start
+                self.push_undo_state()
+                self.custom_items[self.transform_target_idx] = cur
+            self.transform_target_idx = None;
+            self.transform_start_state = None
+
+    def on_prev_scroll(self, event):
+        if event.inaxes != self.ax_prev: return
+
+        if self.canvas_mode == 'transform':
+            min_dist = float('inf');
+            target = None
+            for idx, item in enumerate(self.custom_items):
+                if item['type'] == 'text':
+                    dx = event.xdata - item['x'];
+                    dy = event.ydata - item['y']
+                    if (dx * dx + dy * dy) < min_dist: min_dist = (dx * dx + dy * dy); target = idx
+            if target is not None:
+                self.push_undo_state()
+                item = self.custom_items[target]
+                if event.key == 'shift':
+                    item['scale'] *= (1.1 if event.step > 0 else 0.9)
+                else:
+                    item['rot'] += event.step * 5.0
+                self.render_canvas()
+            return
+
+        # Standard Scroll Zoom for preview canvas
+        scale = 1 / 1.2 if event.step > 0 else 1.2
+        cx, cy = self.ax_prev.get_xlim(), self.ax_prev.get_ylim()
+        x, y = event.xdata, event.ydata
+        if x is None or y is None: return
+        nw, nh = (cx[1] - cx[0]) * scale, (cy[1] - cy[0]) * scale
+        rx, ry = (cx[1] - x) / (cx[1] - cx[0]), (cy[1] - y) / (cy[1] - cy[0])
+        self.ax_prev.set_xlim([x - nw * (1 - rx), x + nw * rx])
+        self.ax_prev.set_ylim([y - nh * (1 - ry), y + nh * ry])
+        self.canvas_prev.draw_idle()
+
+    def on_prev_pick(self, event):
+        if event.mouseevent.button != 1 or self.canvas_mode != 'paint' or self.btn_prev_zoom.isChecked(): return
+
+        artist = event.artist
+
+        # Check if the optimized LineCollection was clicked
+        if hasattr(self, 'dem_collection') and artist == self.dem_collection:
+            idx = event.ind[0]
+            target_level = self.dem_segments[idx]['level']
             shift_held = event.mouseevent.key == 'shift'
-            changes = []
 
-            for i, obj in enumerate(self.interactive_lines):
-                if (shift_held and obj['level'] == target_level) or (not shift_held and obj['line'] == picked_line):
-                    if obj['pen_id'] != self.active_pen_id:
-                        changes.append({
-                            'idx': i,
-                            'old_pen': obj['pen_id'],
-                            'new_pen': self.active_pen_id
-                        })
-                        self._apply_pen_to_line(i, self.active_pen_id)
+            self.push_undo_state()
+            for i, item in enumerate(self.dem_segments):
+                if (shift_held and item['level'] == target_level) or (not shift_held and i == idx):
+                    item['pen_id'] = self.active_pen_id
+            self.render_canvas()
+            return
 
-            if changes:
-                self.undo_stack.append(changes)
-                self.redo_stack.clear()
-                self.update_undo_redo_btns()
-                self.canvas_prev.draw_idle()
+        # Check if a custom drawn item was clicked
+        if hasattr(artist, 'item_ref'):
+            group, idx = artist.item_ref
+            if group == 'custom':
+                self.push_undo_state()
+                self.custom_items[idx]['pen_id'] = self.active_pen_id
+                self.render_canvas()
 
     # --- MAP LOGIC (Panning & Zooming) ---
     def reset_home_view(self):
@@ -551,7 +925,8 @@ class PlotterApp(QMainWindow):
         self.ax_prev.set_yticks([])
         self.canvas_prev.draw_idle();
         self.canvas_map.draw_idle()
-        self.interactive_lines = []
+        self.custom_items = [];
+        self.dem_segments = []
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.update_undo_redo_btns()
@@ -562,20 +937,20 @@ class PlotterApp(QMainWindow):
         self.btn_zoom_tool.setStyleSheet("background-color: lightblue;" if checked else "")
 
     def on_zoom_select(self, eclick, erelease):
-        x1, x2 = sorted([eclick.xdata, erelease.xdata])
+        x1, x2 = sorted([eclick.xdata, erelease.xdata]);
         y1, y2 = sorted([eclick.ydata, erelease.ydata])
         self.ax_map.set_xlim(x1, x2);
         self.ax_map.set_ylim(y1, y2);
         self.canvas_map.draw_idle()
         self.btn_zoom_tool.setChecked(False)
 
-    def on_mouse_press(self, event):
+    def on_mouse_press_map(self, event):
         if event.button == 2:
             self.pan_active = True
             self.pan_start_x, self.pan_start_y = event.x, event.y
             self.pan_xlim, self.pan_ylim = self.ax_map.get_xlim(), self.ax_map.get_ylim()
 
-    def on_mouse_motion(self, event):
+    def on_mouse_motion_map(self, event):
         if self.pan_active and event.inaxes == self.ax_map:
             inv = self.ax_map.transData.inverted()
             sx, sy = inv.transform((self.pan_start_x, self.pan_start_y))
@@ -584,7 +959,7 @@ class PlotterApp(QMainWindow):
             self.ax_map.set_ylim(self.pan_ylim[0] - (ey - sy), self.pan_ylim[1] - (ey - sy))
             self.canvas_map.draw_idle()
 
-    def on_mouse_release(self, event):
+    def on_mouse_release_map(self, event):
         if event.button == 2: self.pan_active = False
 
     def update_paper_dims(self):
@@ -597,7 +972,6 @@ class PlotterApp(QMainWindow):
         else:
             self.widget_custom.setVisible(False)
             w, h = PAPER_SIZES[self.paper_name]
-
         self.pw, self.ph = (w, h) if self.is_landscape else (h, w)
         self.paper_aspect = self.pw / self.ph
         self.ax_prev.set_box_aspect(self.ph / self.pw)
@@ -616,23 +990,19 @@ class PlotterApp(QMainWindow):
         self.ax_map.clear()
         self.ax_map.imshow(base_img, extent=[-180, 180, -90, 90], origin='upper', zorder=0)
         self.ax_map.set_title(f"Select Region on {self.active_planet}")
-
         self.border_artists = []
         if self.show_borders and HAS_GPD and self.active_planet == 'Earth':
             b1 = world_borders.boundary.plot(ax=self.ax_map, edgecolor='cyan', linewidth=0.6, alpha=0.5, zorder=2)
             b2 = state_borders.boundary.plot(ax=self.ax_map, edgecolor='cyan', linewidth=0.2, alpha=0.3, zorder=2)
             self.border_artists.extend(b1.collections + b2.collections)
-
         self.clear_selection();
         self.reset_home_view()
 
     def toggle_ocean(self, checked):
-        self.show_ocean = checked
-        if self.has_drawn: self.redraw_contours()
+        self.show_ocean = checked; self.trigger_recalc()
 
     def toggle_borders(self, checked):
-        self.show_borders = checked
-        self.switch_planet()
+        self.show_borders = checked; self.switch_planet()
 
     def zoom_map(self, event):
         if event.inaxes != self.ax_map: return
@@ -647,11 +1017,10 @@ class PlotterApp(QMainWindow):
         self.canvas_map.draw_idle()
 
     def apply_adaptive(self):
-        if hasattr(self, 'suggested_interval'):
-            self.txt_int.setText(str(self.suggested_interval))
+        if hasattr(self, 'suggested_interval'): self.txt_int.setText(str(self.suggested_interval))
 
     def on_select(self, eclick, erelease):
-        x1, x2 = sorted([eclick.xdata, erelease.xdata])
+        x1, x2 = sorted([eclick.xdata, erelease.xdata]);
         y1, y2 = sorted([eclick.ydata, erelease.ydata])
         self.last_drag_coords = (x1, x2, y1, y2)
         self.process_selection(x1, x2, y1, y2)
@@ -660,7 +1029,6 @@ class PlotterApp(QMainWindow):
         if self.current_dem_src is None: return
         gw, gh = x2 - x1, y2 - y1
         if gw == 0 or gh == 0: return
-
         mid_lat = np.radians((y1 + y2) / 2)
         tw = gw * np.cos(mid_lat)
         ta = tw / gh
@@ -669,7 +1037,6 @@ class PlotterApp(QMainWindow):
             pad_geo_h, pad_geo_w = tw / self.paper_aspect, gw
         else:
             pad_geo_h, pad_geo_w = gh, (gh * self.paper_aspect) / np.cos(mid_lat)
-
         ex1, ex2 = cx - pad_geo_w / 2, cx + pad_geo_w / 2
         ey1, ey2 = cy - pad_geo_h / 2, cy + pad_geo_h / 2
         self.current_view_extent = [ex1, ex2, ey1, ey2]
@@ -677,11 +1044,9 @@ class PlotterApp(QMainWindow):
         h, w = self.current_dem_src.shape
         px_x1, px_x2 = int((ex1 + 180) / 360 * w), int((ex2 + 180) / 360 * w)
         px_y1, px_y2 = int((90 - ey2) / 180 * h), int((90 - ey1) / 180 * h)
-
         c_x1, c_x2 = max(0, px_x1), min(w, px_x2)
         c_y1, c_y2 = max(0, px_y1), min(h, px_y2)
         if c_x2 <= c_x1 or c_y2 <= c_y1: return
-
         self.pending_bounds = [c_x1, c_y1, c_x2, c_y2]
         self.has_drawn = False
         self.ax_prev.clear();
@@ -690,106 +1055,53 @@ class PlotterApp(QMainWindow):
         self.canvas_prev.draw_idle()
         self.lbl_status.setText("Selection captured. Click '1. DRAW MAP'.")
 
-    def draw_action(self):
-        if not self.last_drag_coords or self.current_dem_src is None: return
-        self.btn_draw.setEnabled(False)
-        self.lbl_status.setText("Extracting DEM data... Please wait.")
-        self.worker = DataFetchWorker(self.active_planet, self.current_dem_src, self.pending_bounds)
-        self.worker.finished.connect(self.on_fetch_success)
-        self.worker.error.connect(self.on_fetch_error)
-        self.worker.start()
+    # --- EXPORT PIPELINES ---
+    def export_svg_action(self):
+        if not self.has_drawn:
+            QMessageBox.warning(self, "Not Ready", "Draw a map first!")
+            return
+        orient = "landscape" if self.is_landscape else "portrait"
+        default_name = f"{self.active_planet.lower()}_{orient}_{int(self.pw)}x{int(self.ph)}.svg"
+        out_svg, _ = QFileDialog.getSaveFileName(self, "Save Editable SVG", default_name, "SVG Files (*.svg)")
+        if not out_svg: return
 
-    def on_fetch_success(self, dem_data, extent, min_e, max_e):
-        self.current_dem_crop = dem_data
-        self.current_data_extent = extent
+        self.lbl_status.setText("Generating Master SVG...")
+        QApplication.processEvents()
 
-        relief = max_e - min_e
-        if relief > 0:
-            raw_interval = relief / 35
-            nice_steps = [10, 20, 50, 100, 200, 250, 500, 1000, 2000]
-            best_step = next((s for s in nice_steps if s >= raw_interval), nice_steps[-1])
-            self.suggested_interval = best_step
-            self.lbl_adaptive.setText(
-                f"<b>Adaptive Guidance</b><br>Local Relief: {int(relief):,} ft<br>Suggested: {best_step} ft")
-            self.btn_apply_adaptive.setEnabled(True)
-
-        self.has_drawn = True
-        self.redraw_contours()
-        self.btn_draw.setEnabled(True)
-        self.lbl_status.setText("Render complete! Select a paint tool below to modify lines.")
-
-    def on_fetch_error(self, err_msg):
-        self.btn_draw.setEnabled(True);
-        self.lbl_status.setText("Error reading data.")
-        QMessageBox.critical(self, "Read Error", err_msg)
-
-    # --- THE RENDER ENGINE (Generates Auto-Index & Pickable Lines) ---
-    def redraw_contours(self):
-        if not self.has_drawn or self.current_dem_crop is None: return
-        self.ax_prev.clear();
-        self.ax_prev.set_xticks([]);
-        self.ax_prev.set_yticks([])
-        self.interactive_lines = []
-        self.undo_stack.clear();
-        self.redo_stack.clear();
-        self.update_undo_redo_btns()
-
-        mult = DATA_FILES[self.active_planet]['multiplier']
-        crop_ft = self.current_dem_crop * mult
-        if np.isnan(crop_ft).all(): return
-
-        min_e, max_e = np.nanmin(crop_ft), np.nanmax(crop_ft)
-
-        s_lvl = np.floor(min_e / self.interval_ft) * self.interval_ft
-        e_lvl = np.ceil(max_e / self.interval_ft) * self.interval_ft
-        levels = np.arange(s_lvl, e_lvl + self.interval_ft, self.interval_ft)
-        if self.active_planet == 'Earth' and not self.show_ocean:
-            levels = [l for l in levels if l >= 0]
-
-        if len(levels) == 0: return
-
-        # Invisible calculation with correct geographical orientation (origin='upper')
-        cs = self.ax_prev.contour(crop_ft, levels=levels, extent=self.current_data_extent, origin='upper', alpha=0)
-
+        export_fig = Figure(figsize=(self.pw / 25.4, self.ph / 25.4))
+        export_ax = export_fig.add_axes([0, 0, 1, 1]);
+        export_ax.axis('off')
         mid_lat = np.radians((self.current_view_extent[2] + self.current_view_extent[3]) / 2)
-        self.ax_prev.set_aspect(1 / np.cos(mid_lat))
+        export_ax.set_aspect(1 / np.cos(mid_lat))
+        export_ax.set_xlim(self.current_view_extent[0], self.current_view_extent[1])
+        export_ax.set_ylim(self.current_view_extent[2], self.current_view_extent[3])
 
-        for lvl_idx, level in enumerate(cs.levels):
-            segs = cs.allsegs[lvl_idx]
+        for p_id, pen in self.pens.items():
+            for item in self.dem_segments:
+                if item['pen_id'] == p_id:
+                    export_ax.plot(item['seg'][:, 0], item['seg'][:, 1], color=pen['color'],
+                                   linewidth=pen['width'] * PT_PER_MM)
+            for item in self.custom_items:
+                if item['pen_id'] == p_id:
+                    if item['type'] == 'line':
+                        seg = np.array(item['points'])
+                        export_ax.plot(seg[:, 0], seg[:, 1], color=pen['color'], linewidth=pen['width'] * PT_PER_MM)
+                    elif item['type'] == 'text':
+                        tp = TextPath((0, 0), item['text'], size=1)
+                        trans = Affine2D().scale(item['scale']).rotate_deg(item['rot']).translate(item['x'], item['y'])
+                        for poly in tp.transformed(trans).to_polygons():
+                            export_ax.plot(poly[:, 0], poly[:, 1], color=pen['color'],
+                                           linewidth=pen['width'] * PT_PER_MM)
 
-            # Auto-Index Logic
-            is_index = False
-            if self.chk_auto_index.isChecked():
-                interval_count = round(level / self.interval_ft)
-                if interval_count % self.spin_idx.value() == 0:
-                    is_index = True
+        export_fig.savefig(out_svg, format='svg')
+        self.lbl_status.setText("SVG Generated Successfully!")
+        QMessageBox.information(self, "Success", f"Master SVG saved to:\n{out_svg}")
 
-            pen_id = 'pen_1' if is_index else 'base'
-            active_pen = self.pens[pen_id]
-
-            for seg in segs:
-                if len(seg) < 2: continue
-                line, = self.ax_prev.plot(seg[:, 0], seg[:, 1], color=active_pen['color'],
-                                          linewidth=active_pen['width'] * PT_PER_MM,
-                                          picker=True, pickradius=5, zorder=10 if is_index else 1)
-
-                self.interactive_lines.append({
-                    'line': line,
-                    'seg_data': seg,
-                    'level': level,
-                    'pen_id': pen_id
-                })
-
-        self.ax_prev.set_xlim(self.current_view_extent[0], self.current_view_extent[1])
-        self.ax_prev.set_ylim(self.current_view_extent[2], self.current_view_extent[3])
-        self.canvas_prev.draw_idle()
-
-    # --- EXPORT PIPELINE ---
     def export_action(self):
         if not HAS_VPYPE:
             QMessageBox.critical(self, "Missing Library", "Please run: pip install vpype vpype-gcode")
             return
-        if not self.has_drawn or not self.interactive_lines:
+        if not self.has_drawn:
             QMessageBox.warning(self, "Not Ready", "Draw a map first!")
             return
 
@@ -810,35 +1122,43 @@ class PlotterApp(QMainWindow):
         export_ax.axis('off')
         mid_lat = np.radians((self.current_view_extent[2] + self.current_view_extent[3]) / 2)
         export_ax.set_aspect(1 / np.cos(mid_lat))
-        export_ax.set_xlim(self.current_view_extent[0], self.current_view_extent[1])
-        export_ax.set_ylim(self.current_view_extent[2], self.current_view_extent[3])
 
         layer_index = 1
         for p_id, pen in self.pens.items():
-            lines_for_pen = [obj for obj in self.interactive_lines if obj['pen_id'] == p_id]
-            if not lines_for_pen: continue
-
             export_ax.clear();
             export_ax.axis('off')
             export_ax.set_xlim(self.current_view_extent[0], self.current_view_extent[1])
             export_ax.set_ylim(self.current_view_extent[2], self.current_view_extent[3])
 
-            for obj in lines_for_pen:
-                seg = obj['seg_data']
-                export_ax.plot(seg[:, 0], seg[:, 1], color='black', linewidth=pen['width'] * PT_PER_MM)
+            has_data = False
+            for item in self.dem_segments:
+                if item['pen_id'] == p_id:
+                    export_ax.plot(item['seg'][:, 0], item['seg'][:, 1], color='black',
+                                   linewidth=pen['width'] * PT_PER_MM)
+                    has_data = True
 
-            t_file = os.path.join(temp_dir, f"temp_pen_{p_id}.svg")
-            export_fig.savefig(t_file, format='svg')
+            for item in self.custom_items:
+                if item['pen_id'] == p_id:
+                    if item['type'] == 'line':
+                        seg = np.array(item['points'])
+                        export_ax.plot(seg[:, 0], seg[:, 1], color='black', linewidth=pen['width'] * PT_PER_MM)
+                        has_data = True
+                    elif item['type'] == 'text':
+                        tp = TextPath((0, 0), item['text'], size=1)
+                        trans = Affine2D().scale(item['scale']).rotate_deg(item['rot']).translate(item['x'], item['y'])
+                        for poly in tp.transformed(trans).to_polygons():
+                            export_ax.plot(poly[:, 0], poly[:, 1], color='black', linewidth=pen['width'] * PT_PER_MM)
+                            has_data = True
 
-            cmd_parts.append(f'read "{t_file}" lmove all {layer_index}')
-            temp_files.append(t_file)
-            layer_index += 1
-
-        import matplotlib.pyplot as plt
-        plt.close(export_fig)
+            if has_data:
+                t_file = os.path.join(temp_dir, f"temp_pen_{p_id}.svg")
+                export_fig.savefig(t_file, format='svg')
+                cmd_parts.append(f'read "{t_file}" lmove all {layer_index}')
+                temp_files.append(t_file)
+                layer_index += 1
 
         cmd_parts.append('linesimplify -t 0.1mm linemerge -t 0.3mm linesort')
-        cmd_parts.append(f'gwrite --profile ender3 "{out_gcode}"')
+        cmd_parts.append(f'gwrite --profile gcodemm "{out_gcode}"')
 
         vpype_cmd = " ".join(cmd_parts)
 
