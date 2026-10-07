@@ -173,20 +173,17 @@ class PlotterApp(QMainWindow):
         self.pan_active = False
         self.prev_pan_active = False
 
-        # Undo / Redo Stacks
         self.undo_stack = []
         self.redo_stack = []
 
-        # Cartography Data
         self.pens = load_pens()
         self.active_pen_id = 'base'
         self.canvas_mode = 'paint'
 
-        self.dem_segments = []  # Auto-generated DEM paths
-        self.custom_items = []  # User drawn freehand & text
-        self.dem_collection = None  # Optimized Matplotlib collection
+        self.dem_segments = []
+        self.custom_items = []
+        self.dem_collection = None
 
-        # Interactive drawing state
         self.drawing_active = False
         self.current_freehand = []
         self.temp_draw_line = None
@@ -416,12 +413,12 @@ class PlotterApp(QMainWindow):
         h_tools = QHBoxLayout()
         btn_style = "background-color: #E5E7E9; color: black; font-weight: bold; padding: 4px; border-radius: 3px;"
 
-        self.btn_undo = QPushButton("Undo")
+        self.btn_undo = QPushButton("Undo (Ctrl+Z)")
         self.btn_undo.setStyleSheet(btn_style)
         self.btn_undo.setEnabled(False)
         self.btn_undo.clicked.connect(self.undo_action)
 
-        self.btn_redo = QPushButton("Redo")
+        self.btn_redo = QPushButton("Redo (Ctrl+Y)")
         self.btn_redo.setStyleSheet(btn_style)
         self.btn_redo.setEnabled(False)
         self.btn_redo.clicked.connect(self.redo_action)
@@ -495,7 +492,6 @@ class PlotterApp(QMainWindow):
         self.canvas_mode = btn.property("mode")
         self.update_mode_button_styles()
 
-        # Disable prev zoom selector if changing modes
         self.btn_prev_zoom.setChecked(False)
         self.prev_zoom_selector.set_active(False)
 
@@ -639,7 +635,12 @@ class PlotterApp(QMainWindow):
         self.redo_stack.clear();
         self.update_undo_redo_btns()
         self.calculate_dem_contours()
-        self.reset_prev_view()
+
+        # Force canvas to frame the fresh render bounds
+        self.ax_prev.set_xlim(0.0, 1.0)
+        self.ax_prev.set_ylim(0.0, 1.0)
+        self.render_canvas()
+
         self.btn_draw.setEnabled(True)
         self.lbl_status.setText("Render complete!")
 
@@ -687,8 +688,8 @@ class PlotterApp(QMainWindow):
 
     # --- HIGH PERFORMANCE RENDERER ---
     def render_canvas(self):
-        # Save current zoom limits so redrawing doesn't snap the camera back out
         xlim, ylim = self.ax_prev.get_xlim(), self.ax_prev.get_ylim()
+        is_fresh = (xlim == (0.0, 1.0) and ylim == (0.0, 1.0))
 
         self.ax_prev.clear();
         self.ax_prev.set_xticks([]);
@@ -698,7 +699,6 @@ class PlotterApp(QMainWindow):
         mid_lat = np.radians((self.current_view_extent[2] + self.current_view_extent[3]) / 2)
         self.ax_prev.set_aspect(1 / np.cos(mid_lat))
 
-        # 1. Render DEM lines in bulk using LineCollection (Restores 60fps performance!)
         if self.dem_segments:
             segs = [item['seg'] for item in self.dem_segments]
             colors = [self.pens[item['pen_id']]['color'] for item in self.dem_segments]
@@ -707,7 +707,6 @@ class PlotterApp(QMainWindow):
             self.dem_collection = LineCollection(segs, colors=colors, linewidths=lws, picker=True, pickradius=5)
             self.ax_prev.add_collection(self.dem_collection)
 
-        # 2. Render Custom Items
         for idx, item in enumerate(self.custom_items):
             pen = self.pens[item['pen_id']]
             if item['type'] == 'line':
@@ -724,8 +723,13 @@ class PlotterApp(QMainWindow):
                                               linewidth=pen['width'] * PT_PER_MM, picker=True, pickradius=5, zorder=15)
                     line.item_ref = ('custom', idx)
 
-        self.ax_prev.set_xlim(xlim);
-        self.ax_prev.set_ylim(ylim)
+        if is_fresh and self.current_view_extent:
+            self.ax_prev.set_xlim(self.current_view_extent[0], self.current_view_extent[1])
+            self.ax_prev.set_ylim(self.current_view_extent[2], self.current_view_extent[3])
+        else:
+            self.ax_prev.set_xlim(xlim);
+            self.ax_prev.set_ylim(ylim)
+
         self.canvas_prev.draw_idle()
 
     # --- PREVIEW ZOOM & PAN ---
@@ -737,15 +741,14 @@ class PlotterApp(QMainWindow):
 
     def toggle_prev_zoom(self, checked):
         if checked:
-            # Change mode visually so they know they are zooming
             self.mode_group.setExclusive(False)
             for btn in self.mode_group.buttons(): btn.setChecked(False)
             self.mode_group.setExclusive(True)
             self.update_mode_button_styles()
-            self.btn_prev_zoom.setStyleSheet("background-color: lightblue; font-weight: bold;")
+            self.btn_prev_zoom.setStyleSheet(
+                "background-color: lightblue; font-weight: bold; color: black; border-radius: 4px; padding: 6px;")
         else:
             self.btn_prev_zoom.setStyleSheet("")
-
         self.prev_zoom_selector.set_active(checked)
 
     def on_prev_zoom_select(self, eclick, erelease):
@@ -754,13 +757,13 @@ class PlotterApp(QMainWindow):
         self.ax_prev.set_xlim(x1, x2);
         self.ax_prev.set_ylim(y1, y2);
         self.canvas_prev.draw_idle()
-        self.btn_prev_zoom.setChecked(False)  # Auto-disable after zooming
+        self.btn_prev_zoom.setChecked(False)
 
-    # --- INTERACTIVE MOUSE CONTROLS (Preview Canvas) ---
+        # --- INTERACTIVE MOUSE CONTROLS (Preview Canvas) ---
+
     def on_prev_press(self, event):
         if event.inaxes != self.ax_prev: return
 
-        # Middle Click Pan
         if event.button == 2:
             self.prev_pan_active = True
             self.prev_pan_start_x, self.prev_pan_start_y = event.x, event.y
@@ -805,7 +808,6 @@ class PlotterApp(QMainWindow):
     def on_prev_motion(self, event):
         if event.inaxes != self.ax_prev: return
 
-        # Pan
         if self.prev_pan_active:
             inv = self.ax_prev.transData.inverted()
             sx, sy = inv.transform((self.prev_pan_start_x, self.prev_pan_start_y))
@@ -873,7 +875,6 @@ class PlotterApp(QMainWindow):
                 self.render_canvas()
             return
 
-        # Standard Scroll Zoom for preview canvas
         scale = 1 / 1.2 if event.step > 0 else 1.2
         cx, cy = self.ax_prev.get_xlim(), self.ax_prev.get_ylim()
         x, y = event.xdata, event.ydata
@@ -888,8 +889,6 @@ class PlotterApp(QMainWindow):
         if event.mouseevent.button != 1 or self.canvas_mode != 'paint' or self.btn_prev_zoom.isChecked(): return
 
         artist = event.artist
-
-        # Check if the optimized LineCollection was clicked
         if hasattr(self, 'dem_collection') and artist == self.dem_collection:
             idx = event.ind[0]
             target_level = self.dem_segments[idx]['level']
@@ -902,7 +901,6 @@ class PlotterApp(QMainWindow):
             self.render_canvas()
             return
 
-        # Check if a custom drawn item was clicked
         if hasattr(artist, 'item_ref'):
             group, idx = artist.item_ref
             if group == 'custom':
@@ -1094,6 +1092,8 @@ class PlotterApp(QMainWindow):
                                            linewidth=pen['width'] * PT_PER_MM)
 
         export_fig.savefig(out_svg, format='svg')
+        import matplotlib.pyplot as plt
+        plt.close(export_fig)
         self.lbl_status.setText("SVG Generated Successfully!")
         QMessageBox.information(self, "Success", f"Master SVG saved to:\n{out_svg}")
 
@@ -1109,6 +1109,9 @@ class PlotterApp(QMainWindow):
         default_name = f"{self.active_planet.lower()}_{orient}_{int(self.pw)}x{int(self.ph)}.gcode"
         out_gcode, _ = QFileDialog.getSaveFileName(self, "Generate G-Code", default_name, "G-Code Files (*.gcode)")
         if not out_gcode: return
+
+        # Swap backslashes to fix vpype path parsing bug on Windows
+        out_gcode = out_gcode.replace("\\", "/")
 
         self.lbl_status.setText("Processing Toolpaths with vpype...")
         QApplication.processEvents()
@@ -1151,11 +1154,20 @@ class PlotterApp(QMainWindow):
                             has_data = True
 
             if has_data:
-                t_file = os.path.join(temp_dir, f"temp_pen_{p_id}.svg")
+                # Forward slashes ensure Windows Temp \t and \n escape sequences don't crash vpype
+                t_file = os.path.join(temp_dir, f"temp_pen_{p_id}.svg").replace("\\", "/")
                 export_fig.savefig(t_file, format='svg')
                 cmd_parts.append(f'read "{t_file}" lmove all {layer_index}')
                 temp_files.append(t_file)
                 layer_index += 1
+
+        import matplotlib.pyplot as plt
+        plt.close(export_fig)
+
+        if not temp_files:
+            QMessageBox.warning(self, "No Data", "No contour lines or shapes to export!")
+            self.lbl_status.setText("Ready.")
+            return
 
         cmd_parts.append('linesimplify -t 0.1mm linemerge -t 0.3mm linesort')
         cmd_parts.append(f'gwrite --profile gcodemm "{out_gcode}"')
