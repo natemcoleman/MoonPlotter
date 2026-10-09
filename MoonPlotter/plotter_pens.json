@@ -1,1 +1,0 @@
-{"base": {"id": "base", "name": "Base Pen", "color": "#000000", "width": 0.3}, "pen_1": {"id": "pen_1", "name": "Index Pen", "color": "#000000", "width": 0.6}, "cutter": {"id": "cutter", "name": "Cutter Blade", "color": "#0000FF", "width": 0.1}, "custom_3": {"id": "custom_3", "name": "red", "width": 0.5, "color": "#aa0000"}}

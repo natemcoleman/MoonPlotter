@@ -84,8 +84,16 @@ def load_pens():
         except:
             pass
     return {
-        'base': {'id': 'base', 'name': 'Base Pen', 'color': '#000000', 'width': 0.3},
-        'pen_1': {'id': 'pen_1', 'name': 'Index Pen', 'color': '#000000', 'width': 0.6},
+        'base': {'id': 'base', 'name': 'Thin G2 Black', 'color': '#000000', 'width': 0.38},
+        'pen_1': {'id': 'pen_1', 'name': 'Thick G2 Black', 'color': '#000000', 'width': 0.7},
+
+        'blue_038': {'id': 'blue_038', 'name': 'Thin Blue G2 (0.38)', 'color': '#0000B2', 'width': 0.38},
+        'red_038': {'id': 'red_038', 'name': 'Thin Red G2 (0.38)', 'color': '#E32636', 'width': 0.38},
+
+        'pink_07': {'id': 'pink_07', 'name': 'Thick Pink G2 (0.7)', 'color': '#FF1493', 'width': 0.70},
+        'orange_07': {'id': 'orange_07', 'name': 'Thick Orange G2 (0.7)', 'color': '#FF6600', 'width': 0.70},
+        'cyan_07': {'id': 'cyan_07', 'name': 'Thick Cyan G2 (0.7)', 'color': '#00A3CC', 'width': 0.70},
+
         'cutter': {'id': 'cutter', 'name': 'Cutter Blade', 'color': '#0000FF', 'width': 0.1}
     }
 
@@ -687,6 +695,7 @@ class PlotterApp(QMainWindow):
                 })
 
     # --- HIGH PERFORMANCE RENDERER ---
+        # --- HIGH PERFORMANCE RENDERER ---
     def render_canvas(self):
         xlim, ylim = self.ax_prev.get_xlim(), self.ax_prev.get_ylim()
         is_fresh = (xlim == (0.0, 1.0) and ylim == (0.0, 1.0))
@@ -694,12 +703,13 @@ class PlotterApp(QMainWindow):
         self.ax_prev.clear();
         self.ax_prev.set_xticks([]);
         self.ax_prev.set_yticks([])
-        if not self.has_drawn: return
+        if not getattr(self, 'has_drawn', False): return
 
         mid_lat = np.radians((self.current_view_extent[2] + self.current_view_extent[3]) / 2)
         self.ax_prev.set_aspect(1 / np.cos(mid_lat))
 
-        if self.dem_segments:
+        # The LineCollection engine that prevents the lag
+        if getattr(self, 'dem_segments', []):
             segs = [item['seg'] for item in self.dem_segments]
             colors = [self.pens[item['pen_id']]['color'] for item in self.dem_segments]
             lws = [self.pens[item['pen_id']]['width'] * PT_PER_MM for item in self.dem_segments]
@@ -707,7 +717,7 @@ class PlotterApp(QMainWindow):
             self.dem_collection = LineCollection(segs, colors=colors, linewidths=lws, picker=True, pickradius=5)
             self.ax_prev.add_collection(self.dem_collection)
 
-        for idx, item in enumerate(self.custom_items):
+        for idx, item in enumerate(getattr(self, 'custom_items', [])):
             pen = self.pens[item['pen_id']]
             if item['type'] == 'line':
                 seg = np.array(item['points'])
@@ -720,7 +730,8 @@ class PlotterApp(QMainWindow):
                 polys = tp.transformed(trans).to_polygons()
                 for poly in polys:
                     line, = self.ax_prev.plot(poly[:, 0], poly[:, 1], color=pen['color'],
-                                              linewidth=pen['width'] * PT_PER_MM, picker=True, pickradius=5, zorder=15)
+                                              linewidth=pen['width'] * PT_PER_MM, picker=True, pickradius=5,
+                                              zorder=15)
                     line.item_ref = ('custom', idx)
 
         if is_fresh and self.current_view_extent:
@@ -1101,7 +1112,7 @@ class PlotterApp(QMainWindow):
         if not HAS_VPYPE:
             QMessageBox.critical(self, "Missing Library", "Please run: pip install vpype vpype-gcode")
             return
-        if not self.has_drawn:
+        if not getattr(self, 'has_drawn', False):
             QMessageBox.warning(self, "Not Ready", "Draw a map first!")
             return
 
@@ -1110,80 +1121,117 @@ class PlotterApp(QMainWindow):
         out_gcode, _ = QFileDialog.getSaveFileName(self, "Generate G-Code", default_name, "G-Code Files (*.gcode)")
         if not out_gcode: return
 
-        # Swap backslashes to fix vpype path parsing bug on Windows
         out_gcode = out_gcode.replace("\\", "/")
-
-        self.lbl_status.setText("Processing Toolpaths with vpype...")
+        self.lbl_status.setText("Optimizing Single-Pen Toolpaths... Please wait.")
         QApplication.processEvents()
 
         temp_dir = tempfile.gettempdir()
-        temp_files = []
-        cmd_parts = []
+        t_svg = os.path.join(temp_dir, "master_plot.svg").replace("\\", "/")
+        t_gcode = os.path.join(temp_dir, "raw_vpype.gcode").replace("\\", "/")
 
+        # --- 1. PLOT EVERYTHING TO A SINGLE SVG ---
         export_fig = Figure(figsize=(self.pw / 25.4, self.ph / 25.4))
         export_ax = export_fig.add_axes([0, 0, 1, 1]);
         export_ax.axis('off')
         mid_lat = np.radians((self.current_view_extent[2] + self.current_view_extent[3]) / 2)
         export_ax.set_aspect(1 / np.cos(mid_lat))
+        export_ax.set_xlim(self.current_view_extent[0], self.current_view_extent[1])
+        export_ax.set_ylim(self.current_view_extent[2], self.current_view_extent[3])
 
-        layer_index = 1
-        for p_id, pen in self.pens.items():
-            export_ax.clear();
-            export_ax.axis('off')
-            export_ax.set_xlim(self.current_view_extent[0], self.current_view_extent[1])
-            export_ax.set_ylim(self.current_view_extent[2], self.current_view_extent[3])
+        has_data = False
 
-            has_data = False
-            for item in self.dem_segments:
-                if item['pen_id'] == p_id:
-                    export_ax.plot(item['seg'][:, 0], item['seg'][:, 1], color='black',
-                                   linewidth=pen['width'] * PT_PER_MM)
+        # Draw DEM contours
+        for item in getattr(self, 'dem_segments', []):
+            export_ax.plot(item['seg'][:, 0], item['seg'][:, 1], color='black', linewidth=1)
+            has_data = True
+
+        # Draw custom drawn lines and text
+        for item in getattr(self, 'custom_items', []):
+            if item['type'] == 'line':
+                seg = np.array(item['points'])
+                export_ax.plot(seg[:, 0], seg[:, 1], color='black', linewidth=1)
+                has_data = True
+            elif item['type'] == 'text':
+                tp = TextPath((0, 0), item['text'], size=1)
+                trans = Affine2D().scale(item['scale']).rotate_deg(item['rot']).translate(item['x'], item['y'])
+                for poly in tp.transformed(trans).to_polygons():
+                    export_ax.plot(poly[:, 0], poly[:, 1], color='black', linewidth=1)
                     has_data = True
 
-            for item in self.custom_items:
-                if item['pen_id'] == p_id:
-                    if item['type'] == 'line':
-                        seg = np.array(item['points'])
-                        export_ax.plot(seg[:, 0], seg[:, 1], color='black', linewidth=pen['width'] * PT_PER_MM)
-                        has_data = True
-                    elif item['type'] == 'text':
-                        tp = TextPath((0, 0), item['text'], size=1)
-                        trans = Affine2D().scale(item['scale']).rotate_deg(item['rot']).translate(item['x'], item['y'])
-                        for poly in tp.transformed(trans).to_polygons():
-                            export_ax.plot(poly[:, 0], poly[:, 1], color='black', linewidth=pen['width'] * PT_PER_MM)
-                            has_data = True
-
-            if has_data:
-                # Forward slashes ensure Windows Temp \t and \n escape sequences don't crash vpype
-                t_file = os.path.join(temp_dir, f"temp_pen_{p_id}.svg").replace("\\", "/")
-                export_fig.savefig(t_file, format='svg')
-                cmd_parts.append(f'read "{t_file}" lmove all {layer_index}')
-                temp_files.append(t_file)
-                layer_index += 1
-
-        import matplotlib.pyplot as plt
-        plt.close(export_fig)
-
-        if not temp_files:
+        if not has_data:
+            import matplotlib.pyplot as plt
+            plt.close(export_fig)
             QMessageBox.warning(self, "No Data", "No contour lines or shapes to export!")
             self.lbl_status.setText("Ready.")
             return
 
-        cmd_parts.append('linesimplify -t 0.1mm linemerge -t 0.3mm linesort')
-        cmd_parts.append(f'gwrite --profile gcodemm "{out_gcode}"')
+        export_fig.savefig(t_svg, format='svg')
+        import matplotlib.pyplot as plt
+        plt.close(export_fig)
 
-        vpype_cmd = " ".join(cmd_parts)
+        # --- 2. OPTIMIZE PATHS WITH VPYPE ---
+        # Added: filter --min-length 2mm to destroy random dots and noise
+        try:
+            vpype_cmd = f'read "{t_svg}" linesimplify -t 0.1mm linemerge -t 0.3mm filter --min-length 2mm linesort gwrite --profile gcodemm "{t_gcode}"'
+            vpype_cli.execute(vpype_cmd)
+        except Exception as e:
+            QMessageBox.critical(self, "vpype Error", f"Optimization failed:\n{e}")
+            return
+
+        # --- 3. SURGICAL G-CODE REBUILD ---
+        master_gcode = [
+            "; --- START ROUTINE ---",
+            "G21",
+            "G90",
+            "G28",
+            "G92 X-50.0 Y-50.0 Z-4.0",
+            "G0 Z1.0 F1500",  # Changed to 1.0mm
+            "M400"
+        ]
+
+        with open(t_gcode, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line: continue
+
+                if line.startswith("G0 X") or line.startswith("G00 X"):
+                    # TRAVEL MOVE: Lift -> Wait -> Travel -> Wait -> Drop -> Wait
+                    master_gcode.extend([
+                        "G0 Z1.0 F1500",  # Changed to 1.0mm
+                        "M400",
+                        f"{line} F3000",
+                        "M400",
+                        "G1 Z0.0 F1000",
+                        "M400"
+                    ])
+                elif line.startswith("G1 X") or line.startswith("G01 X"):
+                    # DRAWING MOVE: Append the speed and execute
+                    master_gcode.append(f"{line} F1500")
+
+        # --- 4. END ROUTINE ---
+        master_gcode.extend([
+            "G0 Z1.0 F1500",  # Initial 1mm hop to unstick from the paper safely
+            "; --- END OF PLOT ---",
+            "G0 Z25.0 F1500",  # Still lifting to 25mm at the very end to clear clips when presenting
+            "G0 X0 Y0 F3000",
+            "M117 Plot Complete!",
+            "M84"
+        ])
 
         try:
-            vpype_cli.execute(vpype_cmd)
+            with open(out_gcode, "w") as f:
+                f.write("\n".join(master_gcode))
+
             self.lbl_status.setText("G-Code Generated Successfully!")
-            QMessageBox.information(self, "Success",
-                                    f"Optimized G-Code saved to:\n{out_gcode}\n\nLayers sequenced automatically by Pen.")
+            QMessageBox.information(self, "Success", f"Optimized Single-Pen G-Code saved to:\n{out_gcode}")
         except Exception as e:
-            QMessageBox.critical(self, "vpype Error", f"Failed to generate G-Code:\n{e}")
+            QMessageBox.critical(self, "Save Error", f"Failed to save G-Code:\n{e}")
         finally:
-            for t_file in temp_files:
-                if os.path.exists(t_file): os.remove(t_file)
+            try:
+                if os.path.exists(t_svg): os.remove(t_svg)
+                if os.path.exists(t_gcode): os.remove(t_gcode)
+            except:
+                pass
 
 
 if __name__ == '__main__':
