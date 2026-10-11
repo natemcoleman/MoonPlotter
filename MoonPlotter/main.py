@@ -8,6 +8,7 @@ import numpy as np
 import rasterio
 from rasterio.windows import Window
 from PIL import Image
+import platform
 
 # PyQt6 Imports
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
@@ -156,6 +157,9 @@ def load_planet_data(planet):
     # ==========================================
     # 2. BACKGROUND WORKER THREAD
     # ==========================================
+# ==========================================
+# 2. BACKGROUND WORKER THREAD
+# ==========================================
 class DataFetchWorker(QThread):
     finished = pyqtSignal(object, list, float, float)
     error = pyqtSignal(str)
@@ -168,17 +172,31 @@ class DataFetchWorker(QThread):
 
     def run(self):
         try:
+            from rasterio.transform import from_bounds as transform_from_bounds
+
             with rasterio.open(self.dem_path) as src:
                 lon_min, lon_max, lat_min, lat_max = self.geo_bounds
 
-                # Safely calculate the exact pixel window from the geographic coordinates
-                window = rasterio.windows.from_bounds(lon_min, lat_min, lon_max, lat_max, transform=src.transform)
+                # Check if this is one of our global equirectangular maps
+                global_dems = [DATA_FILES['Earth']['dem'], DATA_FILES['Moon']['dem'], DATA_FILES['Mars']['dem']]
+                is_global = self.dem_path in global_dems
 
-                # Read only that window, filling any out-of-bounds requested areas with NaN
+                if is_global:
+                    # Force a strict -180 to +180 geographic transform
+                    # This bypasses missing transforms or 0-360 Moon datasets
+                    active_transform = transform_from_bounds(-180, -90, 180, 90, src.width, src.height)
+                else:
+                    # Use the dataset's native transform (e.g., for Tahoe)
+                    active_transform = src.transform
+
+                # Safely calculate the exact pixel window
+                window = rasterio.windows.from_bounds(lon_min, lat_min, lon_max, lat_max, transform=active_transform)
+
+                # Read only that window, filling any out-of-bounds areas with NaN
                 dem_data = src.read(1, window=window, boundless=True, fill_value=np.nan).astype(np.float32)
 
                 # Get the exact geographic extent of this specific slice for matplotlib
-                win_bounds = rasterio.windows.bounds(window, src.transform)
+                win_bounds = rasterio.windows.bounds(window, active_transform)
                 extent = [win_bounds[0], win_bounds[2], win_bounds[1], win_bounds[3]]
 
             # Mask out GDAL NoData values before any math is done
@@ -195,7 +213,6 @@ class DataFetchWorker(QThread):
 
         except Exception as e:
             self.error.emit(str(e))
-
 
 # ==========================================
 # 3. MAIN PYQT6 GUI
@@ -971,7 +988,7 @@ class PlotterApp(QMainWindow):
                         try:
                             clipped = gpd.clip(gdf, view_box)
                             for geom in clipped.geometry:
-                                if geom.type == 'Polygon':
+                                if geom.geom_type == 'Polygon':
                                     self.dem_segments.append(
                                         {'type': 'border', 'seg': np.array(geom.exterior.coords), 'level': 0,
                                          'pen_id': 'pen_1'})
@@ -979,7 +996,7 @@ class PlotterApp(QMainWindow):
                                         self.dem_segments.append(
                                             {'type': 'border', 'seg': np.array(ring.coords), 'level': 0,
                                              'pen_id': 'pen_1'})
-                                elif geom.type == 'MultiPolygon':
+                                elif geom.geom_type == 'MultiPolygon':
                                     for poly in geom.geoms:
                                         self.dem_segments.append(
                                             {'type': 'border', 'seg': np.array(poly.exterior.coords), 'level': 0,
@@ -988,10 +1005,10 @@ class PlotterApp(QMainWindow):
                                             self.dem_segments.append(
                                                 {'type': 'border', 'seg': np.array(ring.coords), 'level': 0,
                                                  'pen_id': 'pen_1'})
-                                elif geom.type == 'LineString':
+                                elif geom.geom_type == 'LineString':
                                     self.dem_segments.append(
                                         {'type': 'border', 'seg': np.array(geom.coords), 'level': 0, 'pen_id': 'pen_1'})
-                                elif geom.type == 'MultiLineString':
+                                elif geom.geom_type == 'MultiLineString':
                                     for line in geom.geoms:
                                         self.dem_segments.append(
                                             {'type': 'border', 'seg': np.array(line.coords), 'level': 0,
@@ -1627,6 +1644,11 @@ class PlotterApp(QMainWindow):
 
 
 if __name__ == '__main__':
+    if platform.system() == 'Windows':
+        import ctypes
+
+        myappid = 'tps.cartographer.studio.1'  # Arbitrary unique ID string
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
     app = QApplication(sys.argv)
     app.setWindowIcon(QIcon("icon.jpg"))
     app.setStyle("Fusion")
