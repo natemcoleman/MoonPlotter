@@ -193,26 +193,28 @@ class DataFetchWorker(QThread):
                 else:
                     active_transform = src.transform
 
-                window = rasterio.windows.from_bounds(lon_min, lat_min, lon_max, lat_max, transform=active_transform)
-                dem_data = src.read(1, window=window, boundless=True, fill_value=np.nan).astype(np.float32)
+                def fetch_window(l_min, l_max):
+                    w = rasterio.windows.from_bounds(l_min, lat_min, l_max, lat_max, transform=active_transform)
+                    return src.read(1, window=w, boundless=True, fill_value=np.nan).astype(np.float32)
 
-                win_bounds = rasterio.windows.bounds(window, active_transform)
-                extent = [win_bounds[0], win_bounds[2], win_bounds[1], win_bounds[3]]
+                # Stitch the left and right array slices together if wrapped across dateline
+                if is_global and lon_min < -180:
+                    dem_data = np.hstack((fetch_window(lon_min + 360, 180), fetch_window(-180, lon_max)))
+                elif is_global and lon_max > 180:
+                    dem_data = np.hstack((fetch_window(lon_min, 180), fetch_window(-180, lon_max - 360)))
+                else:
+                    dem_data = fetch_window(lon_min, lon_max)
+
+                extent = [lon_min, lon_max, lat_min, lat_max]
 
             dem_data[dem_data < -100000] = np.nan
             mult = DATA_FILES[self.planet]['multiplier']
-            crop_ft = dem_data * mult
 
-            # --- DYNAMIC TAHOE MOUNTAIN ERASURE ---
             if self.planet == 'Earth' and "Tahoe" in self.selected_region:
-                if not np.isnan(crop_ft).all():
-                    # The absolute minimum value is the lake floor. Tahoe is ~1645 ft deep.
-                    min_bottom = np.nanmin(crop_ft)
-                    lake_surface = min_bottom + 1645.0
+                temp_ft = dem_data * mult
+                dem_data[temp_ft > 6226.0] = np.nan
 
-                    # Erase everything higher than 5ft above the surface
-                    dem_data[(dem_data * mult) > lake_surface + 5.0] = np.nan
-                    crop_ft = dem_data * mult  # Recalculate so min/max are correct
+            crop_ft = dem_data * mult
 
             if np.isnan(crop_ft).all():
                 self.finished.emit(dem_data, extent, 0.0, 0.0)
@@ -310,6 +312,15 @@ class PlotterApp(QMainWindow):
         self.chk_borders.setChecked(True)
         self.chk_borders.toggled.connect(self.toggle_borders)
 
+        self.chk_circle = QCheckBox("Circle Mode (Hemisphere)")
+        self.chk_circle.setChecked(False)
+        self.chk_circle.setStyleSheet("color: #D35400; font-weight: bold;")
+        self.chk_circle.toggled.connect(self.toggle_circle_mode)
+
+        self.chk_blue_water = QCheckBox("Use blue pen for underwater (<0m)")
+        self.chk_blue_water.setChecked(True)
+        self.chk_blue_water.toggled.connect(self.trigger_recalc)
+
         # New Mask/Border features
         self.chk_plot_borders = QCheckBox("Plot Borders (Index Pen)")
         self.chk_plot_borders.setChecked(True)
@@ -323,6 +334,8 @@ class PlotterApp(QMainWindow):
 
         vbox.addWidget(self.chk_ocean)
         vbox.addWidget(self.chk_borders)
+        vbox.addWidget(self.chk_circle)
+        vbox.addWidget(self.chk_blue_water)
         vbox.addWidget(self.chk_plot_borders)
         vbox.addWidget(self.chk_mask_text)
 
@@ -858,6 +871,7 @@ class PlotterApp(QMainWindow):
 
         selected_region = self.combo_region.currentText()
         is_tahoe = (self.active_planet == 'Earth' and "Tahoe" in selected_region)
+        is_circle = getattr(self, 'circle_mode_active', False)
         mult = DATA_FILES[self.active_planet]['multiplier']
 
         crop_ft = self.current_dem_crop.copy() * mult
@@ -881,8 +895,16 @@ class PlotterApp(QMainWindow):
             s_lvl = np.floor(min_e / self.interval_ft) * self.interval_ft
             e_lvl = np.ceil(max_e / self.interval_ft) * self.interval_ft
             levels = np.arange(s_lvl, e_lvl + self.interval_ft, self.interval_ft).tolist()
-            if self.active_planet == 'Earth' and not self.show_ocean:
-                levels = [l for l in levels if l >= 0]
+
+            # --- OCEAN THINNING LOGIC ---
+            if self.active_planet == 'Earth':
+                if not self.show_ocean:
+                    levels = [l for l in levels if l >= 0]
+                elif is_circle:
+                    # Oceans drop drastically. Thin out negative contours to perfectly match
+                    # the Index SpinBox multiplier (e.g., 5x sparser) so it doesn't turn into a blue blob.
+                    ocean_step = self.interval_ft * self.spin_idx.value()
+                    levels = [l for l in levels if l >= 0 or (l < 0 and l % ocean_step == 0)]
 
         if len(levels) == 0: return
         levels = np.unique(np.sort(levels))
@@ -911,18 +933,24 @@ class PlotterApp(QMainWindow):
             xs = (line_seg[:, 0] - mid_lon) * deg2rad * R_planet * cos_lat
             ys = (line_seg[:, 1] - mid_lat) * deg2rad * R_planet
             m_seg = np.column_stack((xs, ys))
-
             if simp_tol > 0:
                 ls = LineString(m_seg)
                 m_seg = np.array(ls.simplify(simp_tol, preserve_topology=True).coords)
-
             if chaikin_iters > 0 and len(m_seg) >= 3:
                 m_seg = chaikin_smooth(m_seg, chaikin_iters)
-
             out_seg = np.empty_like(m_seg)
             out_seg[:, 0] = mid_lon + m_seg[:, 0] / (deg2rad * R_planet * cos_lat)
             out_seg[:, 1] = mid_lat + m_seg[:, 1] / (deg2rad * R_planet)
             return out_seg
+
+        def ortho_project(coords):
+            c = np.array(coords)
+            lam = c[:, 0] * deg2rad
+            phi = c[:, 1] * deg2rad
+            lam0 = mid_lon * deg2rad
+            x = R_planet * np.cos(phi) * np.sin(lam - lam0)
+            y = R_planet * np.sin(phi)
+            return np.column_stack((x, y))
 
         mask_polygon = None
         if HAS_GPD and self.active_planet == 'Earth' and not is_tahoe and "None" not in selected_region:
@@ -948,11 +976,12 @@ class PlotterApp(QMainWindow):
             segs = cs.allsegs[lvl_idx]
             is_index = False
 
-            # Tahoe Index Logic: Count downwards from the surface
+            is_water = self.active_planet == 'Earth' and level < 0 and self.chk_blue_water.isChecked()
+
             if is_tahoe:
                 max_level = np.max(levels)
                 if level == max_level:
-                    is_index = True  # Always bold the shoreline
+                    is_index = True
                 elif self.chk_auto_index.isChecked() and round(
                         (max_level - level) / self.interval_ft) % self.spin_idx.value() == 0:
                     is_index = True
@@ -960,7 +989,11 @@ class PlotterApp(QMainWindow):
                 if self.chk_auto_index.isChecked() and round(level / self.interval_ft) % self.spin_idx.value() == 0:
                     is_index = True
 
-            pen_id = 'pen_1' if is_index else 'base'
+            if is_water:
+                pen_id = 'blue_038'
+            else:
+                pen_id = 'pen_1' if is_index else 'base'
+
             for seg in segs:
                 if len(seg) < 2: continue
                 smoothed_seg = generalize_line(seg)
@@ -985,55 +1018,72 @@ class PlotterApp(QMainWindow):
 
                     for v_line in valid_lines:
                         if len(v_line.coords) >= 2:
-                            self.dem_segments.append(
-                                {'type': 'dem', 'seg': np.array(v_line.coords), 'level': level, 'pen_id': pen_id})
+                            c = np.array(v_line.coords)
+                            if is_circle: c = ortho_project(c)
+                            self.dem_segments.append({'type': 'dem', 'seg': c, 'level': level, 'pen_id': pen_id})
                 else:
-                    self.dem_segments.append({'type': 'dem', 'seg': smoothed_seg, 'level': level, 'pen_id': pen_id})
+                    c = smoothed_seg
+                    if is_circle: c = ortho_project(c)
+                    self.dem_segments.append({'type': 'dem', 'seg': c, 'level': level, 'pen_id': pen_id})
 
-        # Render Geopolitical Borders
+                # Render Geopolitical Borders ONLY if checkbox is checked
         if self.chk_plot_borders.isChecked() and self.active_planet == 'Earth' and not is_tahoe:
+            def append_border(coords):
+                c = np.array(coords)
+
+                # If wrapped, shift border coordinates so they stitch perfectly with the contiguous map space
+                if self.current_data_extent[1] > 180:
+                    c[:, 0] = np.where(c[:, 0] < 0, c[:, 0] + 360, c[:, 0])
+                elif self.current_data_extent[0] < -180:
+                    c[:, 0] = np.where(c[:, 0] > 0, c[:, 0] - 360, c[:, 0])
+
+                if is_circle: c = ortho_project(c)
+                self.dem_segments.append({'type': 'border', 'seg': c, 'level': 0, 'pen_id': 'pen_1'})
+
             if mask_polygon and not mask_polygon.is_empty:
                 bound_geom = mask_polygon.boundary
                 if bound_geom.geom_type == 'LineString':
-                    self.dem_segments.append(
-                        {'type': 'border', 'seg': np.array(bound_geom.coords), 'level': 0, 'pen_id': 'pen_1'})
+                    append_border(bound_geom.coords)
                 elif bound_geom.geom_type == 'MultiLineString':
-                    for line in bound_geom.geoms:
-                        self.dem_segments.append(
-                            {'type': 'border', 'seg': np.array(line.coords), 'level': 0, 'pen_id': 'pen_1'})
-            elif HAS_GPD and "None" in selected_region:
-                view_box = shp_box(self.current_view_extent[0], self.current_view_extent[2],
-                                   self.current_view_extent[1], self.current_view_extent[3])
-                for gdf in [world_borders, state_borders]:
-                    try:
-                        clipped = gpd.clip(gdf, view_box)
-                        for geom in clipped.geometry:
-                            if geom.geom_type == 'Polygon':
-                                self.dem_segments.append(
-                                    {'type': 'border', 'seg': np.array(geom.exterior.coords), 'level': 0,
-                                     'pen_id': 'pen_1'})
-                                for ring in geom.interiors:
-                                    self.dem_segments.append(
-                                        {'type': 'border', 'seg': np.array(ring.coords), 'level': 0, 'pen_id': 'pen_1'})
-                            elif geom.geom_type == 'MultiPolygon':
-                                for poly in geom.geoms:
-                                    self.dem_segments.append(
-                                        {'type': 'border', 'seg': np.array(poly.exterior.coords), 'level': 0,
-                                         'pen_id': 'pen_1'})
-                                    for ring in poly.interiors:
-                                        self.dem_segments.append(
-                                            {'type': 'border', 'seg': np.array(ring.coords), 'level': 0,
-                                             'pen_id': 'pen_1'})
-                            elif geom.geom_type == 'LineString':
-                                self.dem_segments.append(
-                                    {'type': 'border', 'seg': np.array(geom.coords), 'level': 0, 'pen_id': 'pen_1'})
-                            elif geom.geom_type == 'MultiLineString':
-                                for line in geom.geoms:
-                                    self.dem_segments.append(
-                                        {'type': 'border', 'seg': np.array(line.coords), 'level': 0, 'pen_id': 'pen_1'})
-                    except Exception as e:
-                        print(f"Border clip skipped: {e}")
+                    for line in bound_geom.geoms: append_border(line.coords)
 
+            elif HAS_GPD and "None" in selected_region:
+                # Create dual clipping boxes if wrapped
+                view_boxes = []
+                if self.current_data_extent[0] < -180:
+                    view_boxes.append(shp_box(self.current_data_extent[0] + 360, -90, 180, 90))
+                    view_boxes.append(shp_box(-180, -90, self.current_data_extent[1], 90))
+                elif self.current_data_extent[1] > 180:
+                    view_boxes.append(shp_box(self.current_data_extent[0], -90, 180, 90))
+                    view_boxes.append(shp_box(-180, -90, self.current_data_extent[1] - 360, 90))
+                else:
+                    view_boxes.append(
+                        shp_box(self.current_data_extent[0], -90, self.current_data_extent[1], 90))
+
+                for v_box in view_boxes:
+                    for gdf in [world_borders, state_borders]:
+                        try:
+                            clipped = gpd.clip(gdf, v_box)
+                            for geom in clipped.geometry:
+                                if geom.geom_type == 'Polygon':
+                                    append_border(geom.exterior.coords)
+                                    for ring in geom.interiors: append_border(ring.coords)
+                                elif geom.geom_type == 'MultiPolygon':
+                                    for poly in geom.geoms:
+                                        append_border(poly.exterior.coords)
+                                        for ring in poly.interiors: append_border(ring.coords)
+                                elif geom.geom_type == 'LineString':
+                                    append_border(geom.coords)
+                                elif geom.geom_type == 'MultiLineString':
+                                    for line in geom.geoms: append_border(line.coords)
+                        except Exception:
+                            pass
+
+        # ALWAYS draw the physical Globe Outline when in Circle Mode
+        if is_circle:
+            theta = np.linspace(0, 2 * np.pi, 200)
+            globe_circle = np.column_stack((R_planet * np.cos(theta), R_planet * np.sin(theta)))
+            self.dem_segments.append({'type': 'border', 'seg': globe_circle, 'level': 0, 'pen_id': 'pen_1'})
     # --- HIGH PERFORMANCE RENDERER ---
     def render_canvas(self):
         xlim, ylim = self.ax_prev.get_xlim(), self.ax_prev.get_ylim()
@@ -1085,10 +1135,23 @@ class PlotterApp(QMainWindow):
                     line.item_ref = ('custom', idx)
 
         if is_fresh and self.current_view_extent:
-            self.ax_prev.set_xlim(self.current_view_extent[0], self.current_view_extent[1])
-            self.ax_prev.set_ylim(self.current_view_extent[2], self.current_view_extent[3])
+            if getattr(self, 'circle_mode_active', False):
+                if self.active_planet == 'Earth':
+                    R = 6371000.0
+                elif self.active_planet == 'Moon':
+                    R = 1737400.0
+                else:
+                    R = 3389500.0
+                self.ax_prev.set_xlim(-R * 1.05, R * 1.05)
+                self.ax_prev.set_ylim(-R * 1.05, R * 1.05)
+                self.ax_prev.set_aspect('equal')
+            else:
+                self.ax_prev.set_xlim(self.current_view_extent[0], self.current_view_extent[1])
+                self.ax_prev.set_ylim(self.current_view_extent[2], self.current_view_extent[3])
+                mid_lat = np.radians((self.current_view_extent[2] + self.current_view_extent[3]) / 2)
+                self.ax_prev.set_aspect(1 / np.cos(mid_lat))
         else:
-            self.ax_prev.set_xlim(xlim);
+            self.ax_prev.set_xlim(xlim)
             self.ax_prev.set_ylim(ylim)
         self.canvas_prev.draw_idle()
 
@@ -1265,21 +1328,47 @@ class PlotterApp(QMainWindow):
         self.canvas_map.draw_idle()
 
     def clear_selection(self):
-        self.last_drag_coords = None;
-        self.has_drawn = False;
-        self.selector.extents = (0, 0, 0, 0)
-        self.ax_prev.clear();
-        self.ax_prev.set_xticks([]);
+        self.last_drag_coords = None
+        self.has_drawn = False
+        # Push the red selector box completely out of bounds so it doesn't render at 0,0
+        self.selector.extents = (-200, -200, -100, -100)
+        self.ax_prev.clear()
+        self.ax_prev.set_xticks([])
         self.ax_prev.set_yticks([])
-        self.canvas_prev.draw_idle();
+        self.canvas_prev.draw_idle()
         self.canvas_map.draw_idle()
-        self.custom_items = [];
+        self.custom_items = []
         self.dem_segments = []
-        self.undo_stack.clear();
-        self.redo_stack.clear();
+        self.undo_stack.clear()
+        self.redo_stack.clear()
         self.update_undo_redo_btns()
 
+    def toggle_circle_mode(self, checked):
+        self.circle_mode_active = checked
+        if checked:
+            self.selector.set_active(False)
+            # Push the red selector box off-screen
+            self.selector.extents = (-200, -200, -100, -100)
+            self.zoom_selector.set_active(False)
+            self.canvas_map.setCursor(Qt.CursorShape.OpenHandCursor)
+
+            self.circle_center_lon = getattr(self, 'circle_center_lon', 0.0)
+            self.update_circle_patches()
+            self.ax_map.set_xlim(-180, 180)
+            self.ax_map.set_ylim(-90, 90)
+            self.has_drawn = False
+        else:
+            self.selector.set_active(True)
+            self.circle_patch_1.set_visible(False)
+            self.circle_patch_2.set_visible(False)
+            self.canvas_map.setCursor(Qt.CursorShape.ArrowCursor)
+            self.clear_selection()
+        self.canvas_map.draw_idle()
+
     def toggle_zoom_tool(self, checked):
+        if getattr(self, 'circle_mode_active', False):
+            self.btn_zoom_tool.setChecked(False)
+            return # Block the zoom tool in Circle Mode
         self.selector.set_active(not checked)
         self.zoom_selector.set_active(checked)
         self.btn_zoom_tool.setStyleSheet("background-color: lightblue;" if checked else "")
@@ -1297,6 +1386,23 @@ class PlotterApp(QMainWindow):
             self.pan_active = True
             self.pan_start_x, self.pan_start_y = event.x, event.y
             self.pan_xlim, self.pan_ylim = self.ax_map.get_xlim(), self.ax_map.get_ylim()
+        elif event.button == 1 and getattr(self, 'circle_mode_active', False) and event.inaxes == self.ax_map:
+            self.circle_dragging = True
+            self.circle_drag_start = event.xdata
+            self.circle_start_lon = getattr(self, 'circle_center_lon', 0.0)
+            self.canvas_map.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+            # --- BLITTING SETUP (Cache the heavy background map) ---
+            self.circle_patch_1.set_visible(False)
+            self.circle_patch_2.set_visible(False)
+            self.canvas_map.draw()  # Force a clean draw of just the map/borders
+            self.bg_cache = self.canvas_map.copy_from_bbox(self.ax_map.bbox)
+
+            self.circle_patch_1.set_visible(True)
+            self.circle_patch_2.set_visible(True)
+            self.ax_map.draw_artist(self.circle_patch_1)
+            self.ax_map.draw_artist(self.circle_patch_2)
+            self.canvas_map.blit(self.ax_map.bbox)
 
     def on_mouse_motion_map(self, event):
         if self.pan_active and event.inaxes == self.ax_map:
@@ -1306,9 +1412,28 @@ class PlotterApp(QMainWindow):
             self.ax_map.set_xlim(self.pan_xlim[0] - (ex - sx), self.pan_xlim[1] - (ex - sx))
             self.ax_map.set_ylim(self.pan_ylim[0] - (ey - sy), self.pan_ylim[1] - (ey - sy))
             self.canvas_map.draw_idle()
+        elif getattr(self, 'circle_dragging', False) and event.inaxes == self.ax_map:
+            dx = event.xdata - self.circle_drag_start
+            new_lon = (self.circle_start_lon + dx + 180) % 360 - 180
+            self.circle_center_lon = new_lon
+
+            # --- BLITTING UPDATE (Draw only the patches over the cache) ---
+            if hasattr(self, 'bg_cache'):
+                self.canvas_map.restore_region(self.bg_cache)
+                self.update_circle_patches()
+                if self.circle_patch_1.get_visible():
+                    self.ax_map.draw_artist(self.circle_patch_1)
+                if self.circle_patch_2.get_visible():
+                    self.ax_map.draw_artist(self.circle_patch_2)
+                self.canvas_map.blit(self.ax_map.bbox)
 
     def on_mouse_release_map(self, event):
-        if event.button == 2: self.pan_active = False
+        if event.button == 2:
+            self.pan_active = False
+        elif event.button == 1 and getattr(self, 'circle_mode_active', False):
+            self.circle_dragging = False
+            self.canvas_map.setCursor(Qt.CursorShape.OpenHandCursor)
+            self.canvas_map.draw_idle()  # Final sync draw to clean up
 
     def update_paper_dims(self):
         if self.paper_name == 'Custom (mm)':
@@ -1345,8 +1470,40 @@ class PlotterApp(QMainWindow):
             b1 = world_borders.boundary.plot(ax=self.ax_map, edgecolor='cyan', linewidth=0.6, alpha=0.5, zorder=2)
             b2 = state_borders.boundary.plot(ax=self.ax_map, edgecolor='cyan', linewidth=0.2, alpha=0.3, zorder=2)
             self.border_artists.extend(b1.collections + b2.collections)
-        self.clear_selection();
+
+        # Initialize two patches to visually handle dragging across the dateline
+        self.circle_patch_1 = patches.Rectangle((0, 0), 0, 0, facecolor='blue', alpha=0.2, edgecolor='blue',
+                                                linewidth=1.5, zorder=5)
+        self.circle_patch_2 = patches.Rectangle((0, 0), 0, 0, facecolor='blue', alpha=0.2, edgecolor='blue',
+                                                linewidth=1.5, zorder=5)
+        self.ax_map.add_patch(self.circle_patch_1)
+        self.ax_map.add_patch(self.circle_patch_2)
+
+        self.clear_selection()
+        if getattr(self, 'circle_mode_active', False):
+            self.update_circle_patches()
         self.reset_home_view()
+
+    def update_circle_patches(self):
+        lon = getattr(self, 'circle_center_lon', 0.0)
+        l_min, l_max = lon - 90, lon + 90
+
+        if l_min < -180:
+            self.circle_patch_1.set_bounds(l_min + 360, -90, -180 - l_min, 180)
+            self.circle_patch_2.set_bounds(-180, -90, l_max - (-180), 180)
+            self.circle_patch_1.set_visible(True)
+            self.circle_patch_2.set_visible(True)
+        elif l_max > 180:
+            self.circle_patch_1.set_bounds(l_min, -90, 180 - l_min, 180)
+            self.circle_patch_2.set_bounds(-180, -90, l_max - 180, 180)
+            self.circle_patch_1.set_visible(True)
+            self.circle_patch_2.set_visible(True)
+        else:
+            self.circle_patch_1.set_bounds(l_min, -90, 180, 180)
+            self.circle_patch_1.set_visible(True)
+            self.circle_patch_2.set_visible(False)
+
+        self.current_view_extent = [l_min, l_max, -90, 90]
 
     def toggle_ocean(self, checked):
         self.show_ocean = checked;
@@ -1420,10 +1577,25 @@ class PlotterApp(QMainWindow):
         export_fig = Figure(figsize=(self.pw / 25.4, self.ph / 25.4))
         export_ax = export_fig.add_axes([0, 0, 1, 1]);
         export_ax.axis('off')
-        mid_lat = np.radians((self.current_view_extent[2] + self.current_view_extent[3]) / 2)
-        export_ax.set_aspect(1 / np.cos(mid_lat))
-        export_ax.set_xlim(self.current_view_extent[0], self.current_view_extent[1])
-        export_ax.set_ylim(self.current_view_extent[2], self.current_view_extent[3])
+        # mid_lat = np.radians((self.current_view_extent[2] + self.current_view_extent[3]) / 2)
+        # export_ax.set_aspect(1 / np.cos(mid_lat))
+        # export_ax.set_xlim(self.current_view_extent[0], self.current_view_extent[1])
+        # export_ax.set_ylim(self.current_view_extent[2], self.current_view_extent[3])
+        if getattr(self, 'circle_mode_active', False):
+            if self.active_planet == 'Earth':
+                R_p = 6371000.0
+            elif self.active_planet == 'Moon':
+                R_p = 1737400.0
+            else:
+                R_p = 3389500.0
+            export_ax.set_aspect('equal')
+            export_ax.set_xlim(-R_p * 1.05, R_p * 1.05)
+            export_ax.set_ylim(-R_p * 1.05, R_p * 1.05)
+        else:
+            mid_lat = np.radians((self.current_view_extent[2] + self.current_view_extent[3]) / 2)
+            export_ax.set_aspect(1 / np.cos(mid_lat))
+            export_ax.set_xlim(self.current_view_extent[0], self.current_view_extent[1])
+            export_ax.set_ylim(self.current_view_extent[2], self.current_view_extent[3])
 
         # Prepare Text Subtraction Masks
         text_boxes = []
@@ -1534,10 +1706,25 @@ class PlotterApp(QMainWindow):
             export_fig = Figure(figsize=(self.pw / 25.4, self.ph / 25.4))
             export_ax = export_fig.add_axes([0, 0, 1, 1]);
             export_ax.axis('off')
-            mid_lat = np.radians((self.current_view_extent[2] + self.current_view_extent[3]) / 2)
-            export_ax.set_aspect(1 / np.cos(mid_lat))
-            export_ax.set_xlim(self.current_view_extent[0], self.current_view_extent[1])
-            export_ax.set_ylim(self.current_view_extent[2], self.current_view_extent[3])
+            # mid_lat = np.radians((self.current_view_extent[2] + self.current_view_extent[3]) / 2)
+            # export_ax.set_aspect(1 / np.cos(mid_lat))
+            # export_ax.set_xlim(self.current_view_extent[0], self.current_view_extent[1])
+            # export_ax.set_ylim(self.current_view_extent[2], self.current_view_extent[3])
+            if getattr(self, 'circle_mode_active', False):
+                if self.active_planet == 'Earth':
+                    R_p = 6371000.0
+                elif self.active_planet == 'Moon':
+                    R_p = 1737400.0
+                else:
+                    R_p = 3389500.0
+                export_ax.set_aspect('equal')
+                export_ax.set_xlim(-R_p * 1.05, R_p * 1.05)
+                export_ax.set_ylim(-R_p * 1.05, R_p * 1.05)
+            else:
+                mid_lat = np.radians((self.current_view_extent[2] + self.current_view_extent[3]) / 2)
+                export_ax.set_aspect(1 / np.cos(mid_lat))
+                export_ax.set_xlim(self.current_view_extent[0], self.current_view_extent[1])
+                export_ax.set_ylim(self.current_view_extent[2], self.current_view_extent[3])
 
             has_data = False
 
