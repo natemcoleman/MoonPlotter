@@ -33,8 +33,7 @@ import matplotlib.patches as patches
 
 # Math / Geometry Imports
 import scipy.ndimage
-from shapely.geometry import box as shp_box, LineString
-
+from shapely.geometry import box as shp_box, LineString, Polygon, MultiPolygon
 import warnings
 
 warnings.filterwarnings('ignore', r'All-NaN (slice|axis) encountered')
@@ -163,6 +162,12 @@ def load_planet_data(planet):
 # ==========================================
 # 2. BACKGROUND WORKER THREAD
 # ==========================================
+# ==========================================
+# 2. BACKGROUND WORKER THREAD
+# ==========================================
+# ==========================================
+# 2. BACKGROUND WORKER THREAD
+# ==========================================
 class DataFetchWorker(QThread):
     finished = pyqtSignal(object, list, float, float)
     error = pyqtSignal(str)
@@ -198,12 +203,16 @@ class DataFetchWorker(QThread):
             mult = DATA_FILES[self.planet]['multiplier']
             crop_ft = dem_data * mult
 
-            # ----------------------------------------------------
-            # Tahoe Masking: Erase land, normalize surface to 0
-            # ----------------------------------------------------
-            if self.planet == 'Earth' and self.selected_region == "Lake Tahoe (High-Res Bathymetry)":
-                crop_ft[crop_ft > 6226.0] = np.nan
-                crop_ft = crop_ft - 6226.0
+            # --- DYNAMIC TAHOE MOUNTAIN ERASURE ---
+            if self.planet == 'Earth' and "Tahoe" in self.selected_region:
+                if not np.isnan(crop_ft).all():
+                    # The absolute minimum value is the lake floor. Tahoe is ~1645 ft deep.
+                    min_bottom = np.nanmin(crop_ft)
+                    lake_surface = min_bottom + 1645.0
+
+                    # Erase everything higher than 5ft above the surface
+                    dem_data[(dem_data * mult) > lake_surface + 5.0] = np.nan
+                    crop_ft = dem_data * mult  # Recalculate so min/max are correct
 
             if np.isnan(crop_ft).all():
                 self.finished.emit(dem_data, extent, 0.0, 0.0)
@@ -220,7 +229,8 @@ class PlotterApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Topo Plotter Studio - Cartographer Edition")
-        self.resize(1650, 900)
+        self.setWindowIcon(QIcon("icon.jpg"))
+        self.resize(1200, 900)
 
         self.active_planet = 'Earth'
         self.paper_name = '100x100mm (Default)'
@@ -343,7 +353,8 @@ class PlotterApp(QMainWindow):
             self.combo_region.setCompleter(completer)
 
         # Trigger a delayed recalculation when a valid region is typed/selected
-        self.combo_region.currentTextChanged.connect(lambda t: self.recalc_timer.start(500))
+        # self.combo_region.currentTextChanged.connect(lambda t: self.recalc_timer.start(500))
+        self.combo_region.currentTextChanged.connect(self.on_region_changed)
         vbox.addWidget(self.combo_region)
         # -------------------------
 
@@ -632,6 +643,32 @@ class PlotterApp(QMainWindow):
 
         self.update_paper_dims()
 
+    def on_region_changed(self, text):
+        if "Tahoe" in text:
+            self.slider_int.blockSignals(True)
+            self.txt_int.blockSignals(True)
+            self.slider_int.setRange(25, 500)
+            self.slider_int.setSingleStep(25)
+            self.slider_int.setValue(75)
+            self.txt_int.setText("75")
+            self.interval_ft = 75
+            self.lbl_usgs_interval.setText("Interval: Tahoe Bathymetry (75 ft)")
+            self.slider_int.blockSignals(False)
+            self.txt_int.blockSignals(False)
+        else:
+            self.slider_int.blockSignals(True)
+            self.txt_int.blockSignals(True)
+            self.slider_int.setRange(50, 10000)
+            self.slider_int.setSingleStep(50)
+            val = max(50, self.interval_ft)
+            self.slider_int.setValue(val)
+            self.txt_int.setText(str(val))
+            self.lbl_usgs_interval.setText("Interval: Auto (USGS Scale)")
+            self.slider_int.blockSignals(False)
+            self.txt_int.blockSignals(False)
+
+        self.recalc_timer.start(500)
+
     # --- MODE & STATE LOGIC ---
     def apply_usgs_preset(self, simp, smooth):
         self.slider_simp.setValue(simp)
@@ -750,7 +787,7 @@ class PlotterApp(QMainWindow):
         dem_path = DATA_FILES[self.active_planet]['dem']
         selected_region = self.combo_region.currentText()
 
-        if self.active_planet == 'Earth' and selected_region == "Lake Tahoe (High-Res Bathymetry)":
+        if self.active_planet == 'Earth' and "Tahoe" in selected_region:
             dem_path = "tahoe2.tif"
 
         if not os.path.exists(dem_path):
@@ -758,7 +795,6 @@ class PlotterApp(QMainWindow):
             self.btn_draw.setEnabled(True)
             return
 
-        # Pass the selected_region into the worker
         self.worker = DataFetchWorker(self.active_planet, dem_path, self.current_view_extent, selected_region)
         self.worker.finished.connect(self.on_fetch_success)
         self.worker.error.connect(self.on_fetch_error)
@@ -769,8 +805,11 @@ class PlotterApp(QMainWindow):
         self.current_data_extent = extent
         relief = max_e - min_e
 
-        # USGS Dynamic Interval Selection
-        if relief > 0:
+        selected_region = self.combo_region.currentText()
+        is_tahoe = (self.active_planet == 'Earth' and "Tahoe" in selected_region)
+
+        # Bypass USGS interval override if Tahoe is selected
+        if relief > 0 and not is_tahoe:
             if relief < 200:
                 best_step = 5
             elif relief <= 725:
@@ -784,9 +823,8 @@ class PlotterApp(QMainWindow):
             elif relief <= 7100:
                 best_step = 100
             else:
-                # best_step = 120
-                best_step = 1000
-            best_step *= 1000
+                best_step = 120
+            best_step*=100
             self.interval_ft = best_step
             self.lbl_usgs_interval.setText(f"Interval: Auto USGS ({best_step} ft)")
 
@@ -799,12 +837,12 @@ class PlotterApp(QMainWindow):
 
         self.has_drawn = True
         self.custom_items = []
-        self.undo_stack.clear();
-        self.redo_stack.clear();
+        self.undo_stack.clear()
+        self.redo_stack.clear()
         self.update_undo_redo_btns()
         self.calculate_dem_contours()
 
-        self.ax_prev.set_xlim(0.0, 1.0);
+        self.ax_prev.set_xlim(0.0, 1.0)
         self.ax_prev.set_ylim(0.0, 1.0)
         self.render_canvas()
         self.btn_draw.setEnabled(True)
@@ -819,20 +857,14 @@ class PlotterApp(QMainWindow):
         if not self.has_drawn or self.current_dem_crop is None: return
 
         selected_region = self.combo_region.currentText()
+        is_tahoe = (self.active_planet == 'Earth' and "Tahoe" in selected_region)
         mult = DATA_FILES[self.active_planet]['multiplier']
 
         crop_ft = self.current_dem_crop.copy() * mult
 
-        # --- TAHOE SHORELINE ISOLATION & RELATIVE DEPTH ---
-        if self.active_planet == 'Earth' and selected_region == "Lake Tahoe (High-Res Bathymetry)":
-            crop_ft[crop_ft > 6226.0] = np.nan
-            crop_ft = crop_ft - 6226.0  # Set surface to 0, depths become relative negative values
-
         if np.isnan(crop_ft).all(): return
-
         valid_mask = ~np.isnan(crop_ft)
 
-        # 1. Raster-Level Gaussian Blur
         sigma = self.slider_blur.value() / 10.0
         if sigma > 0:
             safe_crop = np.where(valid_mask, crop_ft, np.nanmax(crop_ft))
@@ -840,39 +872,21 @@ class PlotterApp(QMainWindow):
             crop_ft = np.where(valid_mask, blurred, np.nan)
 
         min_e, max_e = np.nanmin(crop_ft), np.nanmax(crop_ft)
-        s_lvl = np.floor(min_e / self.interval_ft) * self.interval_ft
-        e_lvl = np.ceil(max_e / self.interval_ft) * self.interval_ft
-        levels = np.arange(s_lvl, e_lvl + self.interval_ft, self.interval_ft)
 
-        # Bypass Ocean filter for Tahoe since we want negative relative depths
-        if self.active_planet == 'Earth' and not self.show_ocean and selected_region != "Lake Tahoe (High-Res Bathymetry)":
-            levels = [l for l in levels if l >= 0]
+        if is_tahoe:
+            shoreline = min_e + 1645.0
+            levels = np.arange(shoreline, min_e, -self.interval_ft)
+            levels = np.sort(levels).tolist()
+        else:
+            s_lvl = np.floor(min_e / self.interval_ft) * self.interval_ft
+            e_lvl = np.ceil(max_e / self.interval_ft) * self.interval_ft
+            levels = np.arange(s_lvl, e_lvl + self.interval_ft, self.interval_ft).tolist()
+            if self.active_planet == 'Earth' and not self.show_ocean:
+                levels = [l for l in levels if l >= 0]
+
         if len(levels) == 0: return
+        levels = np.unique(np.sort(levels))
 
-        # --- SETUP POLYGON REGION MASK ---
-        mask_polygon = None
-        if HAS_GPD and self.active_planet == 'Earth' and selected_region not in ["None (Plot Full Selection)",
-                                                                                 "Lake Tahoe (High-Res Bathymetry)"]:
-            w_col = 'NAME' if 'NAME' in world_borders.columns else 'name' if 'name' in world_borders.columns else None
-            s_col = 'name' if 'name' in state_borders.columns else None
-
-            geom = None
-            if s_col and selected_region in state_borders[s_col].values:
-                geom = state_borders[state_borders[s_col] == selected_region].geometry.union_all()
-            elif w_col and selected_region in world_borders[w_col].values:
-                geom = world_borders[world_borders[w_col] == selected_region].geometry.union_all()
-
-            if geom:
-                view_box = shp_box(self.current_data_extent[0], self.current_data_extent[2],
-                                   self.current_data_extent[1], self.current_data_extent[3])
-                mask_polygon = geom.intersection(view_box)
-
-        # 2. Extract Base Vector Polylines
-        fig_temp = Figure();
-        ax_temp = fig_temp.add_subplot(111)
-        cs = ax_temp.contour(crop_ft, levels=levels, extent=self.current_data_extent, origin='upper')
-
-        # 3. Preparation for Metric Projection
         if self.active_planet == 'Earth':
             R_planet = 6371000.0
         elif self.active_planet == 'Moon':
@@ -910,19 +924,47 @@ class PlotterApp(QMainWindow):
             out_seg[:, 1] = mid_lat + m_seg[:, 1] / (deg2rad * R_planet)
             return out_seg
 
+        mask_polygon = None
+        if HAS_GPD and self.active_planet == 'Earth' and not is_tahoe and "None" not in selected_region:
+            w_col = 'NAME' if 'NAME' in world_borders.columns else 'name' if 'name' in world_borders.columns else None
+            s_col = 'name' if 'name' in state_borders.columns else None
+
+            geom = None
+            if s_col and selected_region in state_borders[s_col].values:
+                geom = state_borders[state_borders[s_col] == selected_region].geometry.union_all()
+            elif w_col and selected_region in world_borders[w_col].values:
+                geom = world_borders[world_borders[w_col] == selected_region].geometry.union_all()
+
+            if geom:
+                view_box = shp_box(self.current_data_extent[0], self.current_data_extent[2],
+                                   self.current_data_extent[1], self.current_data_extent[3])
+                mask_polygon = geom.intersection(view_box)
+
+        fig_temp = Figure();
+        ax_temp = fig_temp.add_subplot(111)
+        cs = ax_temp.contour(crop_ft, levels=levels, extent=self.current_data_extent, origin='upper')
+
         for lvl_idx, level in enumerate(cs.levels):
             segs = cs.allsegs[lvl_idx]
             is_index = False
-            if self.chk_auto_index.isChecked() and round(level / self.interval_ft) % self.spin_idx.value() == 0:
-                is_index = True
+
+            # Tahoe Index Logic: Count downwards from the surface
+            if is_tahoe:
+                max_level = np.max(levels)
+                if level == max_level:
+                    is_index = True  # Always bold the shoreline
+                elif self.chk_auto_index.isChecked() and round(
+                        (max_level - level) / self.interval_ft) % self.spin_idx.value() == 0:
+                    is_index = True
+            else:
+                if self.chk_auto_index.isChecked() and round(level / self.interval_ft) % self.spin_idx.value() == 0:
+                    is_index = True
 
             pen_id = 'pen_1' if is_index else 'base'
             for seg in segs:
                 if len(seg) < 2: continue
-
                 smoothed_seg = generalize_line(seg)
 
-                # --- REGION CLIPPING ---
                 if mask_polygon and not mask_polygon.is_empty:
                     line_geom = LineString(smoothed_seg)
                     clipped = line_geom.intersection(mask_polygon)
@@ -948,66 +990,49 @@ class PlotterApp(QMainWindow):
                 else:
                     self.dem_segments.append({'type': 'dem', 'seg': smoothed_seg, 'level': level, 'pen_id': pen_id})
 
-        # 4. Extract Reference Borders (Index Pen)
-        if self.chk_plot_borders.isChecked() and self.active_planet == 'Earth':
-
-            # 4A. Trace the Shoreline for Lake Tahoe
-            if selected_region == "Lake Tahoe (High-Res Bathymetry)":
-                fig_mask = Figure();
-                ax_mask = fig_mask.add_subplot(111)
-                cs_mask = ax_mask.contour(valid_mask.astype(float), levels=[0.5], extent=self.current_data_extent,
-                                          origin='upper')
-                for segs in cs_mask.allsegs:
-                    for seg in segs:
-                        if len(seg) < 2: continue
-                        smoothed_seg = generalize_line(seg)
-                        self.dem_segments.append({'type': 'border', 'seg': smoothed_seg, 'level': 0, 'pen_id': 'pen_1'})
-
-            # 4B. Trace State / Country Borders
-            elif HAS_GPD:
-                if mask_polygon and not mask_polygon.is_empty:
-                    bound_geom = mask_polygon.boundary
-                    if bound_geom.geom_type == 'LineString':
+        # Render Geopolitical Borders
+        if self.chk_plot_borders.isChecked() and self.active_planet == 'Earth' and not is_tahoe:
+            if mask_polygon and not mask_polygon.is_empty:
+                bound_geom = mask_polygon.boundary
+                if bound_geom.geom_type == 'LineString':
+                    self.dem_segments.append(
+                        {'type': 'border', 'seg': np.array(bound_geom.coords), 'level': 0, 'pen_id': 'pen_1'})
+                elif bound_geom.geom_type == 'MultiLineString':
+                    for line in bound_geom.geoms:
                         self.dem_segments.append(
-                            {'type': 'border', 'seg': np.array(bound_geom.coords), 'level': 0, 'pen_id': 'pen_1'})
-                    elif bound_geom.geom_type == 'MultiLineString':
-                        for line in bound_geom.geoms:
-                            self.dem_segments.append(
-                                {'type': 'border', 'seg': np.array(line.coords), 'level': 0, 'pen_id': 'pen_1'})
-                else:
-                    view_box = shp_box(self.current_view_extent[0], self.current_view_extent[2],
-                                       self.current_view_extent[1], self.current_view_extent[3])
-                    for gdf in [world_borders, state_borders]:
-                        try:
-                            clipped = gpd.clip(gdf, view_box)
-                            for geom in clipped.geometry:
-                                if geom.geom_type == 'Polygon':
+                            {'type': 'border', 'seg': np.array(line.coords), 'level': 0, 'pen_id': 'pen_1'})
+            elif HAS_GPD and "None" in selected_region:
+                view_box = shp_box(self.current_view_extent[0], self.current_view_extent[2],
+                                   self.current_view_extent[1], self.current_view_extent[3])
+                for gdf in [world_borders, state_borders]:
+                    try:
+                        clipped = gpd.clip(gdf, view_box)
+                        for geom in clipped.geometry:
+                            if geom.geom_type == 'Polygon':
+                                self.dem_segments.append(
+                                    {'type': 'border', 'seg': np.array(geom.exterior.coords), 'level': 0,
+                                     'pen_id': 'pen_1'})
+                                for ring in geom.interiors:
                                     self.dem_segments.append(
-                                        {'type': 'border', 'seg': np.array(geom.exterior.coords), 'level': 0,
+                                        {'type': 'border', 'seg': np.array(ring.coords), 'level': 0, 'pen_id': 'pen_1'})
+                            elif geom.geom_type == 'MultiPolygon':
+                                for poly in geom.geoms:
+                                    self.dem_segments.append(
+                                        {'type': 'border', 'seg': np.array(poly.exterior.coords), 'level': 0,
                                          'pen_id': 'pen_1'})
-                                    for ring in geom.interiors:
+                                    for ring in poly.interiors:
                                         self.dem_segments.append(
                                             {'type': 'border', 'seg': np.array(ring.coords), 'level': 0,
                                              'pen_id': 'pen_1'})
-                                elif geom.geom_type == 'MultiPolygon':
-                                    for poly in geom.geoms:
-                                        self.dem_segments.append(
-                                            {'type': 'border', 'seg': np.array(poly.exterior.coords), 'level': 0,
-                                             'pen_id': 'pen_1'})
-                                        for ring in poly.interiors:
-                                            self.dem_segments.append(
-                                                {'type': 'border', 'seg': np.array(ring.coords), 'level': 0,
-                                                 'pen_id': 'pen_1'})
-                                elif geom.geom_type == 'LineString':
+                            elif geom.geom_type == 'LineString':
+                                self.dem_segments.append(
+                                    {'type': 'border', 'seg': np.array(geom.coords), 'level': 0, 'pen_id': 'pen_1'})
+                            elif geom.geom_type == 'MultiLineString':
+                                for line in geom.geoms:
                                     self.dem_segments.append(
-                                        {'type': 'border', 'seg': np.array(geom.coords), 'level': 0, 'pen_id': 'pen_1'})
-                                elif geom.geom_type == 'MultiLineString':
-                                    for line in geom.geoms:
-                                        self.dem_segments.append(
-                                            {'type': 'border', 'seg': np.array(line.coords), 'level': 0,
-                                             'pen_id': 'pen_1'})
-                        except Exception as e:
-                            print(f"Border clip skipped: {e}")
+                                        {'type': 'border', 'seg': np.array(line.coords), 'level': 0, 'pen_id': 'pen_1'})
+                    except Exception as e:
+                        print(f"Border clip skipped: {e}")
 
     # --- HIGH PERFORMANCE RENDERER ---
     def render_canvas(self):
@@ -1640,7 +1665,6 @@ class PlotterApp(QMainWindow):
 if __name__ == '__main__':
     if platform.system() == 'Windows':
         import ctypes
-
         myappid = 'tps.cartographer.studio.1'  # Arbitrary unique ID string
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
     app = QApplication(sys.argv)
