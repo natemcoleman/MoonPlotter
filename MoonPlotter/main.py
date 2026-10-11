@@ -160,15 +160,19 @@ def load_planet_data(planet):
 # ==========================================
 # 2. BACKGROUND WORKER THREAD
 # ==========================================
+# ==========================================
+# 2. BACKGROUND WORKER THREAD
+# ==========================================
 class DataFetchWorker(QThread):
     finished = pyqtSignal(object, list, float, float)
     error = pyqtSignal(str)
 
-    def __init__(self, planet, dem_path, geo_bounds):
+    def __init__(self, planet, dem_path, geo_bounds, selected_region):
         super().__init__()
         self.planet = planet
         self.dem_path = dem_path
         self.geo_bounds = geo_bounds
+        self.selected_region = selected_region
 
     def run(self):
         try:
@@ -176,40 +180,35 @@ class DataFetchWorker(QThread):
 
             with rasterio.open(self.dem_path) as src:
                 lon_min, lon_max, lat_min, lat_max = self.geo_bounds
-
-                # Check if this is one of our global equirectangular maps
                 global_dems = [DATA_FILES['Earth']['dem'], DATA_FILES['Moon']['dem'], DATA_FILES['Mars']['dem']]
                 is_global = self.dem_path in global_dems
 
                 if is_global:
-                    # Force a strict -180 to +180 geographic transform
-                    # This bypasses missing transforms or 0-360 Moon datasets
                     active_transform = transform_from_bounds(-180, -90, 180, 90, src.width, src.height)
                 else:
-                    # Use the dataset's native transform (e.g., for Tahoe)
                     active_transform = src.transform
 
-                # Safely calculate the exact pixel window
                 window = rasterio.windows.from_bounds(lon_min, lat_min, lon_max, lat_max, transform=active_transform)
-
-                # Read only that window, filling any out-of-bounds areas with NaN
                 dem_data = src.read(1, window=window, boundless=True, fill_value=np.nan).astype(np.float32)
 
-                # Get the exact geographic extent of this specific slice for matplotlib
                 win_bounds = rasterio.windows.bounds(window, active_transform)
                 extent = [win_bounds[0], win_bounds[2], win_bounds[1], win_bounds[3]]
 
-            # Mask out GDAL NoData values before any math is done
             dem_data[dem_data < -100000] = np.nan
-
             mult = DATA_FILES[self.planet]['multiplier']
             crop_ft = dem_data * mult
 
-            # Safely calculate max/min relief
+            # ----------------------------------------------------
+            # Tahoe Masking: Erase land, normalize surface to 0
+            # ----------------------------------------------------
+            if self.planet == 'Earth' and self.selected_region == "Lake Tahoe (High-Res Bathymetry)":
+                crop_ft[crop_ft > 6226.0] = np.nan
+                crop_ft = crop_ft - 6226.0
+
             if np.isnan(crop_ft).all():
-                self.finished.emit(crop_ft, extent, 0.0, 0.0)
+                self.finished.emit(dem_data, extent, 0.0, 0.0)
             else:
-                self.finished.emit(crop_ft, extent, float(np.nanmin(crop_ft)), float(np.nanmax(crop_ft)))
+                self.finished.emit(dem_data, extent, float(np.nanmin(crop_ft)), float(np.nanmax(crop_ft)))
 
         except Exception as e:
             self.error.emit(str(e))
@@ -748,11 +747,9 @@ class PlotterApp(QMainWindow):
         self.btn_draw.setEnabled(False)
         self.lbl_status.setText("Extracting DEM data... Please wait.")
 
-        # Default to the global DEM
         dem_path = DATA_FILES[self.active_planet]['dem']
         selected_region = self.combo_region.currentText()
 
-        # Swap to local high-res dataset if selected
         if self.active_planet == 'Earth' and selected_region == "Lake Tahoe (High-Res Bathymetry)":
             dem_path = "tahoe2.tif"
 
@@ -761,8 +758,8 @@ class PlotterApp(QMainWindow):
             self.btn_draw.setEnabled(True)
             return
 
-        # Pass the path and the geographic bounds directly to the worker
-        self.worker = DataFetchWorker(self.active_planet, dem_path, self.current_view_extent)
+        # Pass the selected_region into the worker
+        self.worker = DataFetchWorker(self.active_planet, dem_path, self.current_view_extent, selected_region)
         self.worker.finished.connect(self.on_fetch_success)
         self.worker.error.connect(self.on_fetch_error)
         self.worker.start()
@@ -824,23 +821,20 @@ class PlotterApp(QMainWindow):
         selected_region = self.combo_region.currentText()
         mult = DATA_FILES[self.active_planet]['multiplier']
 
-        # Use .copy() so we don't permanently alter the original array in memory during slider drags
         crop_ft = self.current_dem_crop.copy() * mult
 
-        # --- TAHOE SHORELINE ISOLATION ---
+        # --- TAHOE SHORELINE ISOLATION & RELATIVE DEPTH ---
         if self.active_planet == 'Earth' and selected_region == "Lake Tahoe (High-Res Bathymetry)":
-            # Tahoe's surface is ~6225 ft. This turns any surrounding land mountains into NaN.
             crop_ft[crop_ft > 6226.0] = np.nan
+            crop_ft = crop_ft - 6226.0  # Set surface to 0, depths become relative negative values
 
         if np.isnan(crop_ft).all(): return
 
-        # Capture the footprint of the valid data (the lake surface) before blurring
         valid_mask = ~np.isnan(crop_ft)
 
-        # 1. Raster-Level Gaussian Blur (with NaN protection)
+        # 1. Raster-Level Gaussian Blur
         sigma = self.slider_blur.value() / 10.0
         if sigma > 0:
-            # Replace NaNs with the surface elevation so the edges don't artificially deepen during the blur
             safe_crop = np.where(valid_mask, crop_ft, np.nanmax(crop_ft))
             blurred = scipy.ndimage.gaussian_filter(safe_crop, sigma=sigma, mode='nearest')
             crop_ft = np.where(valid_mask, blurred, np.nan)
@@ -850,7 +844,8 @@ class PlotterApp(QMainWindow):
         e_lvl = np.ceil(max_e / self.interval_ft) * self.interval_ft
         levels = np.arange(s_lvl, e_lvl + self.interval_ft, self.interval_ft)
 
-        if self.active_planet == 'Earth' and not self.show_ocean:
+        # Bypass Ocean filter for Tahoe since we want negative relative depths
+        if self.active_planet == 'Earth' and not self.show_ocean and selected_region != "Lake Tahoe (High-Res Bathymetry)":
             levels = [l for l in levels if l >= 0]
         if len(levels) == 0: return
 
@@ -863,9 +858,9 @@ class PlotterApp(QMainWindow):
 
             geom = None
             if s_col and selected_region in state_borders[s_col].values:
-                geom = state_borders[state_borders[s_col] == selected_region].geometry.unary_union
+                geom = state_borders[state_borders[s_col] == selected_region].geometry.union_all()
             elif w_col and selected_region in world_borders[w_col].values:
-                geom = world_borders[world_borders[w_col] == selected_region].geometry.unary_union
+                geom = world_borders[world_borders[w_col] == selected_region].geometry.union_all()
 
             if geom:
                 view_box = shp_box(self.current_data_extent[0], self.current_data_extent[2],
@@ -878,13 +873,13 @@ class PlotterApp(QMainWindow):
         cs = ax_temp.contour(crop_ft, levels=levels, extent=self.current_data_extent, origin='upper')
 
         # 3. Preparation for Metric Projection
-        # R_planet = 6371000.0 if self.active_planet == 'Earth' else 1737400.0
         if self.active_planet == 'Earth':
             R_planet = 6371000.0
         elif self.active_planet == 'Moon':
             R_planet = 1737400.0
         elif self.active_planet == 'Mars':
             R_planet = 3389500.0
+
         mid_lat = np.radians((self.current_data_extent[2] + self.current_data_extent[3]) / 2)
         mid_lon = (self.current_data_extent[0] + self.current_data_extent[1]) / 2
         cos_lat = np.cos(mid_lat)
@@ -898,7 +893,6 @@ class PlotterApp(QMainWindow):
         if smooth_val > 40.0: chaikin_iters = 2
         if smooth_val > 150.0: chaikin_iters = 3
 
-        # HELPER: Apply USGS generalization parameters to any line segment
         def generalize_line(line_seg):
             xs = (line_seg[:, 0] - mid_lon) * deg2rad * R_planet * cos_lat
             ys = (line_seg[:, 1] - mid_lat) * deg2rad * R_planet
@@ -961,7 +955,6 @@ class PlotterApp(QMainWindow):
             if selected_region == "Lake Tahoe (High-Res Bathymetry)":
                 fig_mask = Figure();
                 ax_mask = fig_mask.add_subplot(111)
-                # Find the boundary of the valid data mask
                 cs_mask = ax_mask.contour(valid_mask.astype(float), levels=[0.5], extent=self.current_data_extent,
                                           origin='upper')
                 for segs in cs_mask.allsegs:
@@ -1015,6 +1008,7 @@ class PlotterApp(QMainWindow):
                                              'pen_id': 'pen_1'})
                         except Exception as e:
                             print(f"Border clip skipped: {e}")
+
     # --- HIGH PERFORMANCE RENDERER ---
     def render_canvas(self):
         xlim, ylim = self.ax_prev.get_xlim(), self.ax_prev.get_ylim()
