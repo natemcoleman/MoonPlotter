@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QLineEdit, QPushButton,
                              QRadioButton, QCheckBox, QComboBox, QSplitter,
                              QFileDialog, QMessageBox, QFrame, QButtonGroup,
-                             QInputDialog, QColorDialog, QSlider, QScrollArea, QSpinBox, QCompleter)
+                             QInputDialog, QColorDialog, QSlider, QScrollArea, QSpinBox, QCompleter, QProgressBar)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QDoubleValidator, QIntValidator, QShortcut, QKeySequence, QIcon
 
@@ -35,8 +35,10 @@ import matplotlib.patches as patches
 import scipy.ndimage
 from shapely.geometry import box as shp_box, LineString, Polygon, MultiPolygon
 import warnings
+from rasterio.errors import NotGeoreferencedWarning
 
 warnings.filterwarnings('ignore', r'All-NaN (slice|axis) encountered')
+warnings.filterwarnings('ignore', category=NotGeoreferencedWarning)
 Image.MAX_IMAGE_PIXELS = None
 
 # Attempt to load vpype
@@ -311,6 +313,10 @@ class PlotterApp(QMainWindow):
         self.chk_borders = QCheckBox("Show Reference Borders")
         self.chk_borders.setChecked(True)
         self.chk_borders.toggled.connect(self.toggle_borders)
+        self.chk_apollo = QCheckBox("Show Apollo Landing Sites")
+        self.chk_apollo.setChecked(False)
+        self.chk_apollo.setStyleSheet("color: #8E44AD; font-weight: bold;")
+        self.chk_apollo.toggled.connect(self.toggle_apollo)
 
         self.chk_circle = QCheckBox("Circle Mode (Hemisphere)")
         self.chk_circle.setChecked(False)
@@ -334,6 +340,7 @@ class PlotterApp(QMainWindow):
 
         vbox.addWidget(self.chk_ocean)
         vbox.addWidget(self.chk_borders)
+        vbox.addWidget(self.chk_apollo)
         vbox.addWidget(self.chk_circle)
         vbox.addWidget(self.chk_blue_water)
         vbox.addWidget(self.chk_plot_borders)
@@ -426,8 +433,8 @@ class PlotterApp(QMainWindow):
         self.chk_auto_index = QCheckBox("Auto-Index lines every")
         self.chk_auto_index.setChecked(True)
         self.spin_idx = QSpinBox()
-        self.spin_idx.setRange(2, 20)
-        self.spin_idx.setValue(5)
+        self.spin_idx.setRange(2, 100)
+        self.spin_idx.setValue(10)
         self.spin_idx.setFixedWidth(40)
         h_idx.addWidget(self.chk_auto_index);
         h_idx.addWidget(self.spin_idx);
@@ -497,6 +504,11 @@ class PlotterApp(QMainWindow):
         vbox.addLayout(h_smooth)
 
         vbox.addStretch()
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 0)  # Indeterminate loading animation
+        self.progress_bar.setVisible(False)
+        vbox.addWidget(self.progress_bar)
+
         self.lbl_status = QLabel("Ready.")
         self.lbl_status.setStyleSheet("color: gray; font-style: italic;")
         vbox.addWidget(self.lbl_status)
@@ -775,10 +787,33 @@ class PlotterApp(QMainWindow):
 
     # --- MAP & DATA CALCULATION ---
     def trigger_recalc(self):
+        # Prevent recursive freezing by locking the thread while it calculates
+        if getattr(self, 'is_calculating', False):
+            self.recalc_pending = True
+            return
+
         if self.has_drawn:
+            self.is_calculating = True
+
+            # Turn on loading UI and force render
+            self.progress_bar.setVisible(True)
+            self.lbl_status.setText("Recalculating contours...")
+            QApplication.processEvents()
+
             self.push_undo_state()
             self.calculate_dem_contours()
             self.render_canvas()
+
+            # Turn off loading UI
+            self.progress_bar.setVisible(False)
+            self.lbl_status.setText("Ready.")
+
+            self.is_calculating = False
+
+            # If the user dragged the slider WHILE it was calculating, run it one more time at the end
+            if getattr(self, 'recalc_pending', False):
+                self.recalc_pending = False
+                self.recalc_timer.start(100)
 
     def update_interval(self, text):
         try:
@@ -795,22 +830,26 @@ class PlotterApp(QMainWindow):
     def draw_action(self):
         if not self.current_view_extent: return
         self.btn_draw.setEnabled(False)
+
+        self.progress_bar.setVisible(True)
         self.lbl_status.setText("Extracting DEM data... Please wait.")
+        QApplication.processEvents()
 
         dem_path = DATA_FILES[self.active_planet]['dem']
         selected_region = self.combo_region.currentText()
-
         if self.active_planet == 'Earth' and "Tahoe" in selected_region:
             dem_path = "tahoe2.tif"
 
         if not os.path.exists(dem_path):
             QMessageBox.critical(self, "Missing File", f"Cannot find {dem_path}")
             self.btn_draw.setEnabled(True)
+            self.progress_bar.setVisible(False)
+            self.lbl_status.setText("Ready.")
             return
 
         self.worker = DataFetchWorker(self.active_planet, dem_path, self.current_view_extent, selected_region)
         self.worker.finished.connect(self.on_fetch_success)
-        self.worker.error.connect(self.on_fetch_error)
+        self.worker.error.connect(self.on_fetch_error)  # Make sure on_fetch_error turns off the progress bar too!
         self.worker.start()
 
     def on_fetch_success(self, dem_data, extent, min_e, max_e):
@@ -821,7 +860,6 @@ class PlotterApp(QMainWindow):
         selected_region = self.combo_region.currentText()
         is_tahoe = (self.active_planet == 'Earth' and "Tahoe" in selected_region)
 
-        # Bypass USGS interval override if Tahoe is selected
         if relief > 0 and not is_tahoe:
             if relief < 200:
                 best_step = 5
@@ -840,7 +878,6 @@ class PlotterApp(QMainWindow):
             best_step*=100
             self.interval_ft = best_step
             self.lbl_usgs_interval.setText(f"Interval: Auto USGS ({best_step} ft)")
-
             self.slider_int.blockSignals(True)
             self.txt_int.blockSignals(True)
             self.slider_int.setValue(best_step)
@@ -853,16 +890,23 @@ class PlotterApp(QMainWindow):
         self.undo_stack.clear()
         self.redo_stack.clear()
         self.update_undo_redo_btns()
-        self.calculate_dem_contours()
 
+        self.lbl_status.setText("Generating topographical vectors...")
+        QApplication.processEvents()
+
+        self.calculate_dem_contours()
         self.ax_prev.set_xlim(0.0, 1.0)
         self.ax_prev.set_ylim(0.0, 1.0)
         self.render_canvas()
+
         self.btn_draw.setEnabled(True)
+        self.progress_bar.setVisible(False)
         self.lbl_status.setText("Render complete!")
 
     def on_fetch_error(self, err_msg):
-        self.btn_draw.setEnabled(True);
+        self.btn_draw.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.lbl_status.setText("Ready.")
         QMessageBox.critical(self, "Read Error", err_msg)
 
     def calculate_dem_contours(self):
@@ -1078,6 +1122,29 @@ class PlotterApp(QMainWindow):
                                     for line in geom.geoms: append_border(line.coords)
                         except Exception:
                             pass
+        if hasattr(self, 'chk_apollo') and self.chk_apollo.isChecked() and self.active_planet == 'Moon':
+            apollo_sites = {
+                "Apollo 11": (0.67416, 23.47314), "Apollo 12": (-3.0128, -23.4219),
+                "Apollo 14": (-3.64589, -17.47194), "Apollo 15": (26.13239, 3.63330),
+                "Apollo 16": (-8.9734, 15.5011), "Apollo 17": (20.1911, 30.7723)
+            }
+            rad = 0.5  # Physical size of the X from center (0.5 degrees)
+            for name, (lat, lon) in apollo_sites.items():
+                c1 = np.array([[lon - rad, lat - rad], [lon + rad, lat + rad]])
+                c2 = np.array([[lon - rad, lat + rad], [lon + rad, lat - rad]])
+
+                if is_circle:
+                    lon_diff = (lon - mid_lon + 180) % 360 - 180
+                    # Only append to G-Code vectors if it's on the visible side of the sphere
+                    if abs(lon_diff) <= 90:
+                        self.dem_segments.append(
+                            {'type': 'border', 'seg': ortho_project(c1), 'level': 0, 'pen_id': 'red_038'})
+                        self.dem_segments.append(
+                            {'type': 'border', 'seg': ortho_project(c2), 'level': 0, 'pen_id': 'red_038'})
+                else:
+                    self.dem_segments.append({'type': 'border', 'seg': c1, 'level': 0, 'pen_id': 'red_038'})
+                    self.dem_segments.append({'type': 'border', 'seg': c2, 'level': 0, 'pen_id': 'red_038'})
+
 
         # ALWAYS draw the physical Globe Outline when in Circle Mode
         if is_circle:
@@ -1133,6 +1200,38 @@ class PlotterApp(QMainWindow):
                     line, = self.ax_prev.plot(poly[:, 0], poly[:, 1], color=pen['color'],
                                               linewidth=pen['width'] * PT_PER_MM, picker=True, pickradius=5, zorder=15)
                     line.item_ref = ('custom', idx)
+        # --- RENDER APOLLO SITES ---
+        if hasattr(self, 'chk_apollo') and self.chk_apollo.isChecked() and self.active_planet == 'Moon':
+            apollo_sites = {
+                "Apollo 11": (0.67416, 23.47314), "Apollo 12": (-3.0128, -23.4219),
+                "Apollo 14": (-3.64589, -17.47194), "Apollo 15": (26.13239, 3.63330),
+                "Apollo 16": (-8.9734, 15.5011), "Apollo 17": (20.1911, 30.7723)
+            }
+            is_circle = getattr(self, 'circle_mode_active', False)
+            R_planet = 1737400.0
+            deg2rad = np.pi / 180.0
+            mid_lon = (self.current_data_extent[0] + self.current_data_extent[
+                1]) / 2 if self.current_data_extent else 0
+
+            for name, (lat, lon) in apollo_sites.items():
+                if is_circle:
+                    lon_diff = (lon - mid_lon + 180) % 360 - 180
+                    # Only plot the landing site if it is on the visible hemisphere
+                    if abs(lon_diff) <= 90:
+                        lam = lon * deg2rad
+                        phi = lat * deg2rad
+                        lam0 = mid_lon * deg2rad
+                        x = R_planet * np.cos(phi) * np.sin(lam - lam0)
+                        y = R_planet * np.sin(phi)
+                        self.ax_prev.plot(x, y, marker='X', markersize=6, color='blue', zorder=20)
+                        # self.ax_prev.text(x + (R_planet * 0.03), y, name, color='red', fontsize=8,
+                        #                   fontweight='bold', zorder=20)
+                else:
+                    self.ax_prev.plot(lon, lat, marker='X', markersize=6, color='red', zorder=20)
+                    offset = (self.current_view_extent[1] - self.current_view_extent[
+                        0]) * 0.02 if self.current_view_extent else 2.0
+                    self.ax_prev.text(lon + offset, lat, name, color='red', fontsize=8, fontweight='bold',
+                                      zorder=20)
 
         if is_fresh and self.current_view_extent:
             if getattr(self, 'circle_mode_active', False):
@@ -1153,6 +1252,8 @@ class PlotterApp(QMainWindow):
         else:
             self.ax_prev.set_xlim(xlim)
             self.ax_prev.set_ylim(ylim)
+
+
         self.canvas_prev.draw_idle()
 
     # --- PREVIEW ZOOM & PAN ---
@@ -1465,13 +1566,37 @@ class PlotterApp(QMainWindow):
         self.ax_map.clear()
         self.ax_map.imshow(base_img, extent=[-180, 180, -90, 90], origin='upper', zorder=0)
         self.ax_map.set_title(f"Select Region on {self.active_planet}")
+
+        # 1. Preload Color Map Borders
         self.border_artists = []
-        if self.show_borders and HAS_GPD and self.active_planet == 'Earth':
+        if HAS_GPD and self.active_planet == 'Earth':
             b1 = world_borders.boundary.plot(ax=self.ax_map, edgecolor='cyan', linewidth=0.6, alpha=0.5, zorder=2)
             b2 = state_borders.boundary.plot(ax=self.ax_map, edgecolor='cyan', linewidth=0.2, alpha=0.3, zorder=2)
             self.border_artists.extend(b1.collections + b2.collections)
 
-        # Initialize two patches to visually handle dragging across the dateline
+        for artist in self.border_artists:
+            artist.set_visible(self.chk_borders.isChecked())
+
+        # 2. Preload Apollo Landing Sites
+        self.apollo_artists = []
+        if self.active_planet == 'Moon':
+            apollo_sites = {
+                "Apollo 11": (0.67416, 23.47314), "Apollo 12": (-3.0128, -23.4219),
+                "Apollo 14": (-3.64589, -17.47194), "Apollo 15": (26.13239, 3.63330),
+                "Apollo 16": (-8.9734, 15.5011), "Apollo 17": (20.1911, 30.7723)
+            }
+            for name, (lat, lon) in apollo_sites.items():
+                marker, = self.ax_map.plot(lon, lat, marker='X', markersize=6, color='yellow', markeredgecolor='black',
+                                           zorder=10)
+                # txt = self.ax_map.text(lon + 2.0, lat, name, color='yellow', fontsize=9, fontweight='bold', zorder=10,
+                #                        bbox=dict(boxstyle='round,pad=0.2', facecolor='black', alpha=0.5,
+                #                                  edgecolor='none'))
+                # self.apollo_artists.extend([marker, txt])
+                self.apollo_artists.append(marker)
+
+        for artist in getattr(self, 'apollo_artists', []):
+            artist.set_visible(hasattr(self, 'chk_apollo') and self.chk_apollo.isChecked())
+
         self.circle_patch_1 = patches.Rectangle((0, 0), 0, 0, facecolor='blue', alpha=0.2, edgecolor='blue',
                                                 linewidth=1.5, zorder=5)
         self.circle_patch_2 = patches.Rectangle((0, 0), 0, 0, facecolor='blue', alpha=0.2, edgecolor='blue',
@@ -1510,8 +1635,15 @@ class PlotterApp(QMainWindow):
         self.trigger_recalc()
 
     def toggle_borders(self, checked):
-        self.show_borders = checked;
-        self.switch_planet()
+        for artist in getattr(self, 'border_artists', []):
+            artist.set_visible(checked)
+        self.canvas_map.draw_idle()
+
+    def toggle_apollo(self, checked):
+        for artist in getattr(self, 'apollo_artists', []):
+            artist.set_visible(checked)
+        self.canvas_map.draw_idle()
+        self.render_canvas()  # Re-render Topo map to show/hide sites
 
     def zoom_map(self, event):
         if event.inaxes != self.ax_map: return
@@ -1704,12 +1836,10 @@ class PlotterApp(QMainWindow):
             t_gcode = os.path.join(temp_dir, f"temp_{p_id}.gcode").replace("\\", "/")
 
             export_fig = Figure(figsize=(self.pw / 25.4, self.ph / 25.4))
-            export_ax = export_fig.add_axes([0, 0, 1, 1]);
+            export_ax = export_fig.add_axes([0, 0, 1, 1])
             export_ax.axis('off')
-            # mid_lat = np.radians((self.current_view_extent[2] + self.current_view_extent[3]) / 2)
-            # export_ax.set_aspect(1 / np.cos(mid_lat))
-            # export_ax.set_xlim(self.current_view_extent[0], self.current_view_extent[1])
-            # export_ax.set_ylim(self.current_view_extent[2], self.current_view_extent[3])
+
+            # --- SVG PROJECTION BOUNDS ---
             if getattr(self, 'circle_mode_active', False):
                 if self.active_planet == 'Earth':
                     R_p = 6371000.0
@@ -1820,8 +1950,8 @@ class PlotterApp(QMainWindow):
                 "G0 Z1.0 F1500",  # Immediate 1mm vertical hop
                 "M400",  # Wait for physical lift to complete
                 "; --- END OF PLOT ---",
-                "G0 X0 Y0 F3000",  # Slide back to origin while hovering 1mm above the page
-                "G0 Z25.0 F1500",  # Final clearance lift to remove the page
+                "G0 X0 Y0 F3000",  # Slide back to origin
+                "G0 Z25.0 F1500",  # Final clearance lift
                 f"M117 {pen['name']} Complete!",
                 "M84"
             ])
@@ -1829,7 +1959,54 @@ class PlotterApp(QMainWindow):
             try:
                 with open(final_out_gcode, "w") as f:
                     f.write("\n".join(master_gcode))
-                exported_files.append(final_out_gcode)
+
+                # --- TIME ESTIMATION ALGORITHM ---
+                total_time_min = 0.0
+                # Coordinate tracker starts at the exact offset injected by G92 above
+                cx, cy, cz = -50.0, -50.0, -4.0
+                cf = 1500.0  # Default fallback feedrate
+
+                for line in master_gcode:
+                    line = line.split(';')[0].strip()  # Strip comments
+                    if not line: continue
+                    parts = line.split()
+                    cmd = parts[0]
+
+                    if cmd in ['G0', 'G00', 'G1', 'G01']:
+                        nx, ny, nz = cx, cy, cz
+                        for p in parts[1:]:
+                            if p.startswith('X'):
+                                nx = float(p[1:])
+                            elif p.startswith('Y'):
+                                ny = float(p[1:])
+                            elif p.startswith('Z'):
+                                nz = float(p[1:])
+                            elif p.startswith('F'):
+                                cf = float(p[1:])
+
+                        # Euclidean distance of this specific move in mm
+                        dist = np.sqrt((nx - cx) ** 2 + (ny - cy) ** 2 + (nz - cz) ** 2)
+
+                        if cf > 0:
+                            # Time in minutes = Distance (mm) / Feedrate (mm/min)
+                            total_time_min += dist / cf
+
+                        cx, cy, cz = nx, ny, nz
+
+                # Add a 15% penalty to account for physical motor acceleration/deceleration curves
+                total_time_min *= 1.15
+                h = int(total_time_min // 60)
+                m = int(total_time_min % 60)
+                s = int((total_time_min * 60) % 60)
+                time_str = f"{h}h {m}m {s}s" if h > 0 else f"{m}m {s}s"
+
+                exported_files.append({
+                    'path': final_out_gcode,
+                    'name': pen['name'],
+                    'time': time_str,
+                    'mins': total_time_min
+                })
+
             except Exception as e:
                 print(f"Error saving {final_out_gcode}: {e}")
 
@@ -1840,10 +2017,20 @@ class PlotterApp(QMainWindow):
                 pass
 
         if exported_files:
-            self.lbl_status.setText(f"Successfully generated {len(exported_files)} G-Code files!")
-            files_list_str = "\n".join([os.path.basename(f) for f in exported_files])
-            QMessageBox.information(self, "Success",
-                                    f"Generated {len(exported_files)} individual G-Code files:\n\n{files_list_str}")
+            total_mins = sum(f['mins'] for f in exported_files)
+            th = int(total_mins // 60)
+            tm = int(total_mins % 60)
+            ts = int((total_mins * 60) % 60)
+            total_time_str = f"{th}h {tm}m {ts}s" if th > 0 else f"{tm}m {ts}s"
+
+            self.lbl_status.setText(f"Successfully generated {len(exported_files)} files. (Est: {total_time_str})")
+
+            # Print the total time and a per-file breakdown
+            msg = f"Generated {len(exported_files)} G-Code files (Total Est. Time: {total_time_str}):\n\n"
+            for f in exported_files:
+                msg += f"• {os.path.basename(f['path'])}  ->  {f['time']}\n"
+
+            QMessageBox.information(self, "Success", msg)
         else:
             QMessageBox.warning(self, "No Data", "No vector elements found for any active pen!")
             self.lbl_status.setText("Ready.")
