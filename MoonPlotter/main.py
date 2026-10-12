@@ -433,7 +433,7 @@ class PlotterApp(QMainWindow):
         self.chk_auto_index = QCheckBox("Auto-Index lines every")
         self.chk_auto_index.setChecked(True)
         self.spin_idx = QSpinBox()
-        self.spin_idx.setRange(2, 100)
+        self.spin_idx.setRange(2, 1000)
         self.spin_idx.setValue(10)
         self.spin_idx.setFixedWidth(40)
         h_idx.addWidget(self.chk_auto_index);
