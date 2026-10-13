@@ -38,11 +38,28 @@ from workers import RenderWorker
 from hatch_engine import composite_ink_layers, STRATEGIES
 from theme import apply_theme, style_axes, SEPIA, ACCENT, TEXT, MUTED
 from ui_widgets import CollapsibleSection, LayerPanel, swatch_icon
+from sites import sites_for, CATEGORY_STYLE
+from contour_engine import auto_contour_interval
+from config import AUTO_CONTOUR_TARGET_LINES
 
 SEL_FILL = SEPIA        # selection rectangle on the source map
 SEL_EDGE = SEPIA
 ZOOM_FILL = ACCENT
-LAYER_LABELS = {'contours': 'Contours', 'borders': 'Borders & markers', 'annotations': 'Text & drawn lines'}
+LAYER_LABELS = {'contours': 'Contours', 'borders': 'Borders & outlines', 'sites': 'Points of interest',
+                'annotations': 'Text & drawn lines'}
+
+# Rough plotter model for the live time estimate (matches the G-code writer / estimator):
+DRAW_FEED = 1500.0      # mm/min (G1)
+TRAVEL_FEED = 3000.0    # mm/min (G0)
+PEN_UP_DOWN_MIN = 1.0 / 1500.0 + 1.0 / 1000.0   # 1 mm Z up at F1500 + 1 mm down at F1000, per stroke
+ACCEL_FACTOR = 1.15
+
+
+def fmt_minutes(m):
+    if m < 1:
+        return "< 1 min"
+    h, mm = int(m // 60), int(round(m % 60))
+    return f"{h}h {mm:02d}m" if h else f"{mm} min"
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -127,6 +144,10 @@ class PlotterApp(QMainWindow):
         self.pending_fresh = False
         self.interval_auto_done = False   # an auto interval has been picked for the current selection
         self.layer_visible = {}           # layer key -> bool (missing = visible)
+        self.selected_sites = {}          # planet -> set of site names to plot
+        self.site_artists = []            # (artist, site tuple) on the source map
+        self.site_annot = None
+        self.last_relief_ft = None
         self._visible_idx = []            # preview collection index -> dem_segments index
         self._workers = set()      # keeps QThread objects alive until they have fully exited
         self._render_token = 0     # bumped when the selection/planet changes; stale results are dropped
@@ -294,10 +315,20 @@ class PlotterApp(QMainWindow):
         self.chk_borders.setChecked(True)
         self.chk_borders.toggled.connect(self.toggle_borders)
         sec_src.add(self.chk_borders)
-        self.chk_apollo = QCheckBox("Apollo landing sites")
-        self.chk_apollo.setToolTip("Marks the six crewed landing sites on the map and plots red crosshairs.")
-        self.chk_apollo.toggled.connect(self.toggle_apollo)
-        sec_src.add(self.chk_apollo)
+        self.chk_sites = QCheckBox("Show points of interest")
+        self.chk_sites.setChecked(True)
+        self.chk_sites.setToolTip("Landing sites, mountains, craters and other good plot subjects.")
+        self.chk_sites.toggled.connect(self.toggle_sites)
+        sec_src.add(self.chk_sites)
+        self.chk_site_labels = QCheckBox("Label plotted sites")
+        self.chk_site_labels.setChecked(True)
+        self.chk_site_labels.toggled.connect(self.trigger_recalc)
+        sec_src.add(self.chk_site_labels)
+        self.lbl_sites_hint = QLabel("Hover a marker for details \u00b7 click to add it to the plot "
+                                     "(filled = plotted) \u00b7 double-click to frame the area")
+        self.lbl_sites_hint.setObjectName("hint")
+        self.lbl_sites_hint.setWordWrap(True)
+        sec_src.add(self.lbl_sites_hint)
         vbox.addWidget(sec_src)
 
         # ---------- PAPER ----------
@@ -351,6 +382,19 @@ class PlotterApp(QMainWindow):
         h_int.addWidget(self.txt_int)
         h_int.addWidget(QLabel("ft"))
         self.sec_contours.add(self._field("Interval override", self.widget_interval))
+
+        self.slider_density = QSlider(Qt.Orientation.Horizontal)
+        self.slider_density.setRange(-100, 100)
+        self.slider_density.setValue(0)
+        self.lbl_density_val = QLabel("\u00d71.0")
+        self.density_timer = QTimer()
+        self.density_timer.setSingleShot(True)
+        self.density_timer.timeout.connect(self.apply_contour_density)
+        self.slider_density.valueChanged.connect(
+            lambda v: (self.lbl_density_val.setText(f"\u00d7{2 ** (v / 50.0):.1f}"), self.density_timer.start(250)))
+        self.sec_contours.add(self._field(
+            "Contour density  (sparser \u2190 \u2192 denser)", self._slider_row(self.slider_density, self.lbl_density_val),
+            "Picks the nearest standard interval for this selection's relief."))
 
         self.widget_index = QWidget()
         h_idx = QHBoxLayout(self.widget_index)
@@ -528,6 +572,7 @@ class PlotterApp(QMainWindow):
 
         # ================= WORKSPACE =================
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setObjectName("workSplit")
         splitter.setChildrenCollapsible(False)
 
         # --- Source map card ---
@@ -574,7 +619,10 @@ class PlotterApp(QMainWindow):
         self.fig_prev = Figure(figsize=(5, 5), dpi=100)
         self.ax_prev = self.fig_prev.add_subplot(111)
         self.canvas_prev = FigureCanvas(self.fig_prev)
-        prev_col.addWidget(self.canvas_prev, 1)
+        prev_top = QWidget()
+        prev_top_l = QVBoxLayout(prev_top)
+        prev_top_l.setContentsMargins(0, 0, 0, 0)
+        prev_top_l.addWidget(self.canvas_prev, 1)
 
         h_prev_toolbar = QHBoxLayout()
         self.btn_prev_zoom = QPushButton("Zoom box")
@@ -588,13 +636,16 @@ class PlotterApp(QMainWindow):
         h_prev_toolbar.addWidget(self.btn_prev_zoom)
         h_prev_toolbar.addWidget(self.btn_prev_home)
         h_prev_toolbar.addWidget(hint_prev, 1)
-        prev_col.addLayout(h_prev_toolbar)
+        prev_top_l.addLayout(h_prev_toolbar)
 
         # Tool palette
         self.frame_palette = QWidget()
         v_pal = QVBoxLayout(self.frame_palette)
-        v_pal.setContentsMargins(0, 6, 0, 0)
-        v_pal.setSpacing(6)
+        v_pal.setContentsMargins(0, 8, 0, 0)
+        v_pal.setSpacing(8)
+        tools_title = QLabel("EDITING TOOLS \u00b7 PEN")
+        tools_title.setObjectName("panelTitle")
+        v_pal.addWidget(tools_title)
         h_modes = QHBoxLayout()
         self.mode_group = QButtonGroup()
         modes = [('paint', 'Paint'), ('draw', 'Draw line'), ('text', 'Add text'), ('transform', 'Move / rotate text')]
@@ -635,7 +686,8 @@ class PlotterApp(QMainWindow):
 
         self.scroll_pens = QScrollArea()
         self.scroll_pens.setWidgetResizable(True)
-        self.scroll_pens.setFixedHeight(84)
+        self.scroll_pens.setMinimumHeight(96)
+        self.scroll_pens.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.scroll_content = QWidget()
         self.v_palette_btns = QGridLayout(self.scroll_content)
         self.v_palette_btns.setContentsMargins(0, 0, 0, 0)
@@ -643,10 +695,21 @@ class PlotterApp(QMainWindow):
         self.pen_btn_group = QButtonGroup()
         self.pen_btn_group.buttonClicked.connect(self.on_palette_selected)
         self.scroll_pens.setWidget(self.scroll_content)
-        v_pal.addWidget(self.scroll_pens)
+        v_pal.addWidget(self.scroll_pens, 1)
         self.rebuild_palette_ui()
         self.update_mode_button_styles()
-        prev_col.addWidget(self.frame_palette)
+        self.frame_palette.setMinimumHeight(210)
+
+        # Drag the handle between the preview and the tools to give either more room.
+        prev_split = QSplitter(Qt.Orientation.Vertical)
+        prev_split.setObjectName("previewSplit")
+        prev_split.setChildrenCollapsible(False)
+        prev_split.addWidget(prev_top)
+        prev_split.addWidget(self.frame_palette)
+        prev_split.setStretchFactor(0, 3)
+        prev_split.setStretchFactor(1, 2)
+        prev_split.setSizes([600, 320])         # proportions; the preview is square-ish, tools get the rest
+        prev_col.addWidget(prev_split, 1)
         prev_outer.addLayout(prev_col, 1)
 
         self.layer_panel = LayerPanel()
@@ -656,6 +719,7 @@ class PlotterApp(QMainWindow):
         splitter.addWidget(prev_card)
         splitter.setStretchFactor(0, 4)
         splitter.setStretchFactor(1, 6)
+        splitter.setSizes([420, 680])           # map : preview+layers, kept as proportions on resize
 
         work = QWidget()
         wl = QHBoxLayout(work)
@@ -710,7 +774,6 @@ class PlotterApp(QMainWindow):
 
         self.lbl_region.setVisible(is_earth)
         self.chk_borders.setVisible(is_earth)
-        self.chk_apollo.setVisible(planet == 'Moon')
         self.chk_plot_borders.setVisible(is_earth)
         self.chk_blue_water.setVisible(is_earth)
         self.chk_ocean.setText("Plot ocean depths" if is_earth else "Plot all depths (below datum)")
@@ -863,6 +926,32 @@ class PlotterApp(QMainWindow):
         else:
             self.render_canvas()
 
+    def contour_target_lines(self):
+        return max(3, int(round(AUTO_CONTOUR_TARGET_LINES * 2 ** (self.slider_density.value() / 50.0))))
+
+    def apply_contour_density(self):
+        """Density slider -> nearest standard interval for the last rendered relief."""
+        if "Tahoe" in self.combo_region.currentText():
+            self.lbl_status.setText("Tahoe uses a fixed 75 ft bathymetry interval - use the override box.")
+            return
+        if not self.last_relief_ft:
+            self.interval_auto_done = False          # the next draw picks the interval with this density
+            return
+        step = auto_contour_interval(self.last_relief_ft, self.contour_target_lines())
+        if not step:
+            return
+        self.slider_int.blockSignals(True)
+        self.txt_int.blockSignals(True)
+        self.interval_ft = step
+        self.slider_int.setValue(min(max(step, self.slider_int.minimum()), self.slider_int.maximum()))
+        self.txt_int.setText(str(step))
+        self.slider_int.blockSignals(False)
+        self.txt_int.blockSignals(False)
+        n = int(self.last_relief_ft // step) + 1
+        self.lbl_usgs_interval.setText(f"Interval: Auto \u00b7 {step:,} ft  (~{n} levels)")
+        self.interval_auto_done = True
+        self.trigger_recalc()
+
     def tone_gamma(self):
         return float(2.0 ** (self.slider_tone.value() / 100.0))
 
@@ -900,7 +989,10 @@ class PlotterApp(QMainWindow):
             'circle_mode': self.chk_circle.isChecked(),
             'show_ocean': self.chk_ocean.isChecked(),
             'show_borders': self.chk_plot_borders.isChecked(),
-            'show_apollo': self.chk_apollo.isChecked(),
+            'show_apollo': False,
+            'sites': sorted(self.selected_sites.get(self.active_planet, set())),
+            'site_labels': self.chk_site_labels.isChecked(),
+            'contour_target_lines': self.contour_target_lines(),
             'blue_water': self.chk_blue_water.isChecked(),
             'interval_ft': self.interval_ft,
             'auto_index': self.chk_auto_index.isChecked(),
@@ -988,6 +1080,8 @@ class PlotterApp(QMainWindow):
             self._finish_render("Selection changed - click Draw Map.")
             return
         self.current_dem_crop = result['dem_data']
+        if result['dem_data'] is not None and result['max_e'] > result['min_e']:
+            self.last_relief_ft = result['max_e'] - result['min_e']
         self.current_data_extent = result['extent']
         self.dem_segments = result['segments']
         fresh = result['fresh']
@@ -1005,6 +1099,7 @@ class PlotterApp(QMainWindow):
             self.txt_int.blockSignals(False)
 
         self.has_drawn = True
+        self._cache_stroke_metrics()
         if fresh:
             self.custom_items = []
             self.undo_stack.clear()
@@ -1069,12 +1164,75 @@ class PlotterApp(QMainWindow):
                 label = LAYER_LABELS.get(k, k)
             rows.append((k, label, colors, groups[k]['n']))
         self.layer_panel.set_layers(rows, self.layer_visible)
-        self.layer_panel.set_order([self.pens[p]['name'] for p in self.plot_order_pens()])
+        self.update_time_estimate()
 
     def on_layer_visibility(self, key, visible):
         self.layer_visible[key] = visible
         self.render_canvas()
-        self.layer_panel.set_order([self.pens[p]['name'] for p in self.plot_order_pens()])
+        self.update_time_estimate()
+
+    # --- LIVE PLOT-TIME ESTIMATE ---
+    def _cache_stroke_metrics(self):
+        """Paper-mm length and end points for every stroke (done once per render)."""
+        if not self.dem_segments or not self.current_view_extent:
+            return
+        sx, sy = self._paper_mm_per_data_unit()
+        for item in self.dem_segments:
+            seg = np.asarray(item['seg'], dtype=float)
+            if len(seg) < 2:
+                item['_len_mm'], item['_p0'], item['_p1'] = 0.0, (0.0, 0.0), (0.0, 0.0)
+                continue
+            d = np.diff(seg, axis=0)
+            item['_len_mm'] = float(np.sum(np.hypot(d[:, 0] * sx, d[:, 1] * sy)))
+            item['_p0'] = (seg[0, 0] * sx, seg[0, 1] * sy)
+            item['_p1'] = (seg[-1, 0] * sx, seg[-1, 1] * sy)
+
+    def estimate_pen_minutes(self, p_id):
+        """Same model as the G-code estimator: draw at F1500, travel at F3000, a 1 mm pen lift per stroke,
+        +15 % for acceleration. Travel is approximated (vpype re-sorts strokes at export)."""
+        p0s, p1s, draw = [], [], 0.0
+        for item in self.dem_segments:
+            if item['pen_id'] != p_id or not self.is_visible(item) or '_len_mm' not in item:
+                continue
+            L = item['_len_mm']
+            if L < MIN_SEGMENT_MM and item.get('type') != 'stipple':
+                continue                                 # dropped by the export filter
+            draw += L
+            p0s.append(item['_p0'])
+            p1s.append(item['_p1'])
+        if self.annotations_visible():
+            sx, sy = self._paper_mm_per_data_unit()
+            for item in self.custom_items:
+                if item['pen_id'] != p_id:
+                    continue
+                pts = np.asarray(item['points']) if item['type'] == 'line' else None
+                if pts is not None and len(pts) > 1:
+                    d = np.diff(pts, axis=0)
+                    draw += float(np.sum(np.hypot(d[:, 0] * sx, d[:, 1] * sy)))
+                    p0s.append((pts[0, 0] * sx, pts[0, 1] * sy))
+                    p1s.append((pts[-1, 0] * sx, pts[-1, 1] * sy))
+                elif item['type'] == 'text':
+                    draw += 12.0 * len(item['text']) * item['scale'] * sx / 3.0   # rough outline length
+        n = len(p0s)
+        if n == 0:
+            return 0.0
+        p0, p1 = np.asarray(p0s), np.asarray(p1s)
+        seq = float(np.sum(np.hypot(*(p0[1:] - p1[:-1]).T))) if n > 1 else 0.0
+        bound = 0.6 * np.sqrt(self.pw * self.ph * n)
+        travel = min(seq, bound) + np.hypot(self.pw, self.ph)           # + trips to/from home
+        return (draw / DRAW_FEED + travel / TRAVEL_FEED + n * PEN_UP_DOWN_MIN) * ACCEL_FACTOR
+
+    def update_time_estimate(self):
+        if not self.has_drawn:
+            self.layer_panel.set_order([], '')
+            return
+        rows, total = [], 0.0
+        for p_id in self.plot_order_pens():
+            m = self.estimate_pen_minutes(p_id)
+            total += m
+            t = fmt_minutes(m)
+            rows.append((self.pens[p_id]["name"], t if t.startswith("<") else "\u2248 " + t))
+        self.layer_panel.set_order(rows, fmt_minutes(total))
 
     def plot_order_pens(self):
         """Pens that have visible strokes, lightest ink first (dark inks last so they sit on top
@@ -1433,6 +1591,7 @@ class PlotterApp(QMainWindow):
 
     def clear_selection(self):
         self._render_token += 1
+        self.last_relief_ft = None
         self.interval_auto_done = False
         self.last_drag_coords = None
         self.current_view_extent = None
@@ -1451,7 +1610,7 @@ class PlotterApp(QMainWindow):
         self.update_undo_redo_btns()
         self.ink_image = None
         self.layer_panel.set_layers([], {})
-        self.layer_panel.set_order([])
+        self.layer_panel.set_order([], '')
 
     def toggle_circle_mode(self, checked):
         if checked:
@@ -1488,6 +1647,14 @@ class PlotterApp(QMainWindow):
         self.btn_zoom_tool.setChecked(False)
 
     def on_mouse_press_map(self, event):
+        if event.button == 1:
+            hit = self._site_at(event)
+            if hit is not None:
+                if event.dblclick:
+                    self.frame_site(hit[1])
+                else:
+                    self.toggle_site(hit[1])
+                return
         if event.button == 2:
             self.pan_active = True
             self.pan_start_x, self.pan_start_y = event.x, event.y
@@ -1517,6 +1684,7 @@ class PlotterApp(QMainWindow):
             self.ax_map.set_xlim(self.pan_xlim[0] - (ex - sx), self.pan_xlim[1] - (ex - sx))
             self.ax_map.set_ylim(self.pan_ylim[0] - (ey - sy), self.pan_ylim[1] - (ey - sy))
             self.canvas_map.draw_idle()
+            return
         elif getattr(self, 'circle_dragging', False) and event.inaxes == self.ax_map:
             dx = event.xdata - self.circle_drag_start
             self.circle_center_lon = (self.circle_start_lon + dx + 180) % 360 - 180
@@ -1526,6 +1694,9 @@ class PlotterApp(QMainWindow):
                 if self.circle_patch_1.get_visible(): self.ax_map.draw_artist(self.circle_patch_1)
                 if self.circle_patch_2.get_visible(): self.ax_map.draw_artist(self.circle_patch_2)
                 self.canvas_map.blit(self.ax_map.bbox)
+            return
+        if event.button is None:
+            self._update_site_hover(event)
 
     def on_mouse_release_map(self, event):
         if event.button == 2:
@@ -1586,20 +1757,8 @@ class PlotterApp(QMainWindow):
         for artist in self.border_artists:
             artist.set_visible(self.chk_borders.isChecked())
 
-        # Preload Apollo Sites invisibly
-        self.apollo_artists = []
-        if self.active_planet == 'Moon':
-            apollo_sites = {
-                "Apollo 11": (0.67416, 23.47314), "Apollo 12": (-3.0128, -23.4219),
-                "Apollo 14": (-3.64589, -17.47194), "Apollo 15": (26.13239, 3.63330),
-                "Apollo 16": (-8.9734, 15.5011), "Apollo 17": (20.1911, 30.7723)
-            }
-            for name, (lat, lon) in apollo_sites.items():
-                marker, = self.ax_map.plot(lon, lat, marker='X', markersize=7, color='#E8B04B', markeredgecolor='#2A2824',
-                                           zorder=10)
-                self.apollo_artists.append(marker)
-        for artist in self.apollo_artists:
-            artist.set_visible(self.chk_apollo.isChecked())
+        # Points of interest (hover = details, click = plot it, double-click = frame it)
+        self.build_site_markers()
 
         self.circle_patch_1 = patches.Rectangle((0, 0), 0, 0, facecolor=ACCENT, alpha=0.22, edgecolor=ACCENT,
                                                 linewidth=1.5, zorder=5)
@@ -1637,11 +1796,111 @@ class PlotterApp(QMainWindow):
         for artist in self.border_artists: artist.set_visible(checked)
         self.canvas_map.draw_idle()
 
-    def toggle_apollo(self, checked):
-        for artist in self.apollo_artists: artist.set_visible(checked)
+    # --- POINTS OF INTEREST ---
+    def build_site_markers(self):
+        self.site_artists = []
+        chosen = self.selected_sites.setdefault(self.active_planet, set())
+        for site in sites_for(self.active_planet):
+            name, lat, lon, cat, span, note = site
+            marker, color = CATEGORY_STYLE.get(cat, ('o', '#E8B04B'))
+            plotted = name in chosen
+            art, = self.ax_map.plot(lon, lat, marker=marker, markersize=8 if plotted else 7,
+                                    markerfacecolor=color if plotted else 'none',
+                                    markeredgecolor=color if not plotted else '#2A2824',
+                                    markeredgewidth=1.6, linestyle='none', zorder=12)
+            art.set_visible(self.chk_sites.isChecked())
+            self.site_artists.append((art, site))
+        self.site_annot = self.ax_map.annotate(
+            "", xy=(0, 0), xytext=(12, 12), textcoords='offset points', zorder=30, fontsize=8.5,
+            color='#2A2824', multialignment='left',
+            bbox=dict(boxstyle='round,pad=0.5', fc='#FFFDF9', ec='#D8D1C4', lw=1),
+            annotation_clip=False)
+        self.site_annot.set_visible(False)
+
+    def _site_at(self, event, radius_px=9):
+        if not self.chk_sites.isChecked() or event.inaxes != self.ax_map or event.x is None:
+            return None
+        best, best_d = None, radius_px
+        for art, site in self.site_artists:
+            px, py = self.ax_map.transData.transform((site[2], site[1]))
+            d = np.hypot(px - event.x, py - event.y)
+            if d < best_d:
+                best, best_d = (art, site), d
+        return best
+
+    def _update_site_hover(self, event):
+        hit = self._site_at(event)
+        if hit is None:
+            if self.site_annot is not None and self.site_annot.get_visible():
+                self.site_annot.set_visible(False)
+                self.canvas_map.draw_idle()
+            return
+        art, (name, lat, lon, cat, span, note) = hit
+        plotted = name in self.selected_sites.get(self.active_planet, set())
+        ns = f"{abs(lat):.2f}\u00b0{'N' if lat >= 0 else 'S'}"
+        ew = f"{abs(lon):.2f}\u00b0{'E' if lon >= 0 else 'W'}"
+        action = "\u2713 On the plot - click to remove" if plotted else "Click to add to the plot"
+        text = f"{name}\n{cat} \u00b7 {ns} {ew}\n{note}\n{action} \u00b7 double-click to frame"
+        self.site_annot.xy = (lon, lat)
+        # keep the tooltip inside the axes: flip it to the left / below near the right / top edge
+        x0, x1 = self.ax_map.get_xlim()
+        y0, y1 = self.ax_map.get_ylim()
+        dx = -12 if lon > x0 + 0.6 * (x1 - x0) else 12
+        dy = -12 if lat > y0 + 0.6 * (y1 - y0) else 12
+        self.site_annot.set_position((dx, dy))
+        self.site_annot.set_ha('right' if dx < 0 else 'left')
+        self.site_annot.set_va('top' if dy < 0 else 'bottom')
+        self.site_annot.set_text(text)
+        self.site_annot.set_visible(True)
         self.canvas_map.draw_idle()
-        # Apollo crosshairs are real plot vectors built by the contour engine -> re-render.
-        self.trigger_recalc()
+
+    def toggle_site(self, site):
+        chosen = self.selected_sites.setdefault(self.active_planet, set())
+        name = site[0]
+        if name in chosen:
+            chosen.discard(name)
+        else:
+            chosen.add(name)
+        for art, s_ in self.site_artists:
+            if s_[0] == name:
+                marker, color = CATEGORY_STYLE.get(s_[3], ('o', '#E8B04B'))
+                on = name in chosen
+                art.set_markerfacecolor(color if on else 'none')
+                art.set_markeredgecolor('#2A2824' if on else color)
+                art.set_markersize(8 if on else 7)
+        self.canvas_map.draw_idle()
+        verb = "Added" if name in chosen else "Removed"
+        self.lbl_status.setText(f"{verb} {name}." + ("" if self.has_drawn else " It will appear when you draw."))
+        if self.has_drawn:
+            self.trigger_recalc()
+
+    def frame_site(self, site):
+        name, lat, lon, cat, span, note = site
+        if self.chk_circle.isChecked():
+            self.circle_center_lon = lon
+            self.update_circle_patches()
+            self.canvas_map.draw_idle()
+            return
+        half_w = span / 2.0 / max(np.cos(np.radians(lat)), 0.2)
+        half_h = span / 2.0
+        x1, x2 = lon - half_w, lon + half_w
+        y1, y2 = max(-90.0, lat - half_h), min(90.0, lat + half_h)
+        self.last_drag_coords = (x1, x2, y1, y2)
+        self.process_selection(x1, x2, y1, y2)
+        self.selector.set_visible(True)
+        self.selector.extents = (x1, x2, y1, y2)
+        pad_x, pad_y = (x2 - x1) * 1.5, (y2 - y1) * 1.5
+        self.ax_map.set_xlim(max(-180, x1 - pad_x), min(180, x2 + pad_x))
+        self.ax_map.set_ylim(max(-90, y1 - pad_y), min(90, y2 + pad_y))
+        self.canvas_map.draw_idle()
+        self.lbl_status.setText(f"Framed {name} - click Draw Map.")
+
+    def toggle_sites(self, checked):
+        for art, _ in self.site_artists:
+            art.set_visible(checked)
+        if not checked and self.site_annot is not None:
+            self.site_annot.set_visible(False)
+        self.canvas_map.draw_idle()
 
     def zoom_map(self, event):
         if event.inaxes != self.ax_map: return
@@ -1658,6 +1917,14 @@ class PlotterApp(QMainWindow):
     def on_select(self, eclick, erelease):
         x1, x2 = sorted([eclick.xdata, erelease.xdata]);
         y1, y2 = sorted([eclick.ydata, erelease.ydata])
+        tiny = abs(erelease.x - eclick.x) < 4 or abs(erelease.y - eclick.y) < 4
+        if tiny:
+            # A click (e.g. on a point of interest), not a drag: keep the existing selection.
+            if self.last_drag_coords:
+                self.selector.set_visible(True)
+                self.selector.extents = self.last_drag_coords
+                self.canvas_map.draw_idle()
+            return
         self.last_drag_coords = (x1, x2, y1, y2)
         self.process_selection(x1, x2, y1, y2)
 
@@ -1676,6 +1943,7 @@ class PlotterApp(QMainWindow):
         ey1, ey2 = cy - pad_geo_h / 2, cy + pad_geo_h / 2
         self.current_view_extent = [ex1, ex2, ey1, ey2]
         self._render_token += 1
+        self.last_relief_ft = None
         self.interval_auto_done = False
         self.has_drawn = False
         self.ax_prev.clear();
@@ -1685,7 +1953,7 @@ class PlotterApp(QMainWindow):
         self.canvas_prev.draw_idle()
         self.ink_image = None
         self.layer_panel.set_layers([], {})
-        self.layer_panel.set_order([])
+        self.layer_panel.set_order([], '')
         self.lbl_status.setText("Selection captured - click Draw Map.")
 
     # --- EXPORT PIPELINES ---
@@ -1942,5 +2210,5 @@ if __name__ == '__main__':
     app.setWindowIcon(app_icon())
     apply_theme(app)
     window = PlotterApp()
-    window.show()
+    window.showMaximized()
     sys.exit(app.exec())

@@ -11,6 +11,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 from config import DATA_FILES, PLANET_RADII, MAX_DEM_PX, TAHOE
 from contour_engine import generate_contours, auto_contour_interval
 from hatch_engine import generate_hatches, srgb_to_linear, linear_to_srgb
+from sites import site_segments
 
 COLOR_PX_PER_MM = 4.0      # colour map resolution requested for hatching (0.25 mm / px)
 MAX_COLOR_PX = 4000
@@ -197,7 +198,7 @@ class RenderWorker(QThread):
                 # Auto interval for fresh draws, computed BEFORE contouring (single pass).
                 if (self.fresh or self.params.get('force_auto_interval')) and not is_tahoe and not all_nan:
                     lo = max(min_e, 0.0) if (self.planet == 'Earth' and not self.params.get('show_ocean', True)) else min_e
-                    step = auto_contour_interval(max_e - lo)
+                    step = auto_contour_interval(max_e - lo, self.params.get('contour_target_lines', 20))
                     if step:
                         self.params['interval_ft'] = step
                         result['auto_interval'] = step
@@ -209,6 +210,11 @@ class RenderWorker(QThread):
             # ---------------- Fill / hatch layer ----------------
             if do_fill:
                 segments += self._fill_layer(extent, is_tahoe, dem_cache)
+
+            # ---------------- Points of interest ----------------
+            if self.params.get('sites'):
+                segments += site_segments(self.planet, set(self.params['sites']), extent, self.params,
+                                          label=self.params.get('site_labels', True))
 
             result['segments'] = segments
             self.result_ready.emit(result)

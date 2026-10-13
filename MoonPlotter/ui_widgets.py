@@ -99,14 +99,18 @@ class LayerPanel(QWidget):
         self.hint.setObjectName("hint")
         self.hint.setWordWrap(True)
         v.addWidget(self.hint)
-        order_title = QLabel("PLOT ORDER")
+        order_title = QLabel("PLOT ORDER \u00b7 EST. TIME")
         order_title.setObjectName("panelTitle")
         v.addSpacing(6)
         v.addWidget(order_title)
         self.order = QLabel("—")
         self.order.setObjectName("hint")
         self.order.setWordWrap(True)
+        self.order.setTextFormat(Qt.TextFormat.RichText)
         v.addWidget(self.order)
+        self.total = QLabel("")
+        self.total.setObjectName("intervalBadge")
+        v.addWidget(self.total)
         self._updating = False
 
     def set_layers(self, layers, visibility):
@@ -121,8 +125,16 @@ class LayerPanel(QWidget):
             self.list.addItem(it)
         self._updating = False
 
-    def set_order(self, names):
-        self.order.setText("\n".join(f"{i + 1}. {n}" for i, n in enumerate(names)) if names else "—")
+    def set_order(self, rows, total=""):
+        """rows: list of (pen name, time string)."""
+        if not rows:
+            self.order.setText("—")
+            self.total.setText("")
+            return
+        html = "<table width='100%' cellspacing='0' cellpadding='1'>" + "".join(
+            f"<tr><td>{i + 1}. {n}</td><td align='right'>{t}</td></tr>" for i, (n, t) in enumerate(rows)) + "</table>"
+        self.order.setText(html)
+        self.total.setText(f"Total \u2248 {total}" if total else "")
 
     def _changed(self, item):
         if self._updating:

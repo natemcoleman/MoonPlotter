@@ -84,7 +84,10 @@ QProgressBar {{ border: none; background: {RULE}; border-radius: 2px; max-height
 QProgressBar::chunk {{ background: {ACCENT}; border-radius: 2px; }}
 
 QToolTip {{ background: {TEXT}; color: {CARD}; border: none; padding: 5px; }}
-QSplitter::handle {{ background: {BG}; width: 6px; }}
+QSplitter::handle {{ background: {BG}; }}
+QSplitter#workSplit::handle {{ width: 8px; }}
+QSplitter#previewSplit::handle {{ height: 8px; background: {CARD}; image: none; }}
+QSplitter#previewSplit::handle:hover {{ background: {RULE}; }}
 QScrollBar:vertical {{ background: transparent; width: 8px; margin: 0; }}
 QScrollBar::handle:vertical {{ background: {BORDER}; border-radius: 4px; min-height: 30px; }}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}

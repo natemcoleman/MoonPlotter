@@ -269,28 +269,6 @@ def generate_contours(dem_crop, data_extent, view_extent, params, progress_callb
                         for line in iter_lines(clipped):
                             append_border(line.coords)
 
-    if params.get('show_apollo', False) and planet == 'Moon':
-        if progress_callback: progress_callback("Mapping Apollo site landing vectors...")
-        apollo_sites = {
-            "Apollo 11": (0.67416, 23.47314), "Apollo 12": (-3.0128, -23.4219),
-            "Apollo 14": (-3.64589, -17.47194), "Apollo 15": (26.13239, 3.63330),
-            "Apollo 16": (-8.9734, 15.5011), "Apollo 17": (20.1911, 30.7723)
-        }
-        rad = 0.5
-        for name, (lat, lon) in apollo_sites.items():
-            c1 = np.array([[lon - rad, lat - rad], [lon + rad, lat + rad]])
-            c2 = np.array([[lon - rad, lat + rad], [lon + rad, lat - rad]])
-            if is_circle:
-                lon_diff = (lon - mid_lon + 180) % 360 - 180
-                if abs(lon_diff) <= 90:
-                    segments.append({'type': 'border', 'layer': 'borders', 'seg': ortho_project(c1, R_planet, mid_lon, deg2rad), 'level': 0,
-                                     'pen_id': 'red_038'})
-                    segments.append({'type': 'border', 'layer': 'borders', 'seg': ortho_project(c2, R_planet, mid_lon, deg2rad), 'level': 0,
-                                     'pen_id': 'red_038'})
-            else:
-                segments.append({'type': 'border', 'layer': 'borders', 'seg': c1, 'level': 0, 'pen_id': 'red_038'})
-                segments.append({'type': 'border', 'layer': 'borders', 'seg': c2, 'level': 0, 'pen_id': 'red_038'})
-
     if is_circle:
         theta = np.linspace(0, 2 * np.pi, 200)
         globe_circle = np.column_stack((R_planet * np.cos(theta), R_planet * np.sin(theta)))
