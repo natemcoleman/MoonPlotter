@@ -12,6 +12,7 @@ from config import DATA_FILES, PLANET_RADII, MAX_DEM_PX, TAHOE
 from contour_engine import generate_contours, auto_contour_interval
 from hatch_engine import generate_hatches, srgb_to_linear, linear_to_srgb
 from sites import site_segments
+from regions import UNIT_MULT
 
 COLOR_PX_PER_MM = 4.0      # colour map resolution requested for hatching (0.25 mm / px)
 MAX_COLOR_PX = 4000
@@ -75,8 +76,9 @@ def read_dem_window(path, ds_bounds, lon_min, lon_max, lat_min, lat_max, wrap, m
     return dem, extent, k
 
 
-def read_color_window(path, lon_min, lon_max, lat_min, lat_max, deg_per_px_lon, deg_per_px_lat):
-    """Reads a global equirectangular colour map window (lon may run past +-180).
+def read_color_window(path, lon_min, lon_max, lat_min, lat_max, deg_per_px_lon, deg_per_px_lat, ds_bounds=None):
+    """Reads a colour map window. Global equirectangular maps (ds_bounds=None) may wrap the dateline;
+    regional maps pass their (left, bottom, right, top) and are clipped to it.
 
     Returns (rgb float32 (h, w, 3) in 0..1, bounds dict) or (None, None) if empty.
     The bounds are the exact pixel-edge bounds of the returned array.
@@ -84,6 +86,10 @@ def read_color_window(path, lon_min, lon_max, lat_min, lat_max, deg_per_px_lon, 
     lat_top, lat_bot = min(lat_max, 90.0), max(lat_min, -90.0)
     if lat_top <= lat_bot or lon_max <= lon_min:
         return None, None
+
+    if ds_bounds is not None:
+        return _read_color_regional(path, ds_bounds, lon_min, lon_max, lat_min, lat_max,
+                                    deg_per_px_lon, deg_per_px_lat)
 
     with rasterio.open(path) as src:
         W, H = src.width, src.height
@@ -132,6 +138,39 @@ def read_color_window(path, lon_min, lon_max, lat_min, lat_max, deg_per_px_lon, 
     return np.clip(rgb, 0.0, 1.0), bounds
 
 
+def _to_unit_rgb(arr):
+    if np.issubdtype(arr.dtype, np.integer):
+        rgb = arr.astype(np.float32) / float(np.iinfo(arr.dtype).max)
+    else:
+        rgb = arr.astype(np.float32)
+        if np.nanmax(rgb) > 1.5:
+            rgb /= 255.0
+    rgb = np.moveaxis(rgb, 0, -1)
+    if rgb.shape[2] == 1:
+        rgb = np.repeat(rgb, 3, axis=2)
+    return np.clip(rgb, 0.0, 1.0)
+
+
+def _read_color_regional(path, ds_bounds, lon_min, lon_max, lat_min, lat_max, dpp_lon, dpp_lat):
+    L, B, R, T = ds_bounds
+    with rasterio.open(path) as src:
+        W, H = src.width, src.height
+        pxw, pxh = (R - L) / W, (T - B) / H
+        c0 = max(0, int(np.floor((lon_min - L) / pxw)))
+        c1 = min(W, int(np.ceil((lon_max - L) / pxw)))
+        r0 = max(0, int(np.floor((T - lat_max) / pxh)))
+        r1 = min(H, int(np.ceil((T - lat_min) / pxh)))
+        if c1 <= c0 or r1 <= r0:
+            return None, None
+        out_w = int(np.clip(np.ceil((c1 - c0) * pxw / max(dpp_lon, 1e-12)), 2, min(c1 - c0, MAX_COLOR_PX)))
+        out_h = int(np.clip(np.ceil((r1 - r0) * pxh / max(dpp_lat, 1e-12)), 2, min(r1 - r0, MAX_COLOR_PX)))
+        bands = [1, 2, 3] if src.count >= 3 else [1]
+        arr = src.read(bands, window=Window(c0, r0, c1 - c0, r1 - r0), out_shape=(len(bands), out_h, out_w),
+                       resampling=Resampling.average)
+    bounds = {'lon0': L + c0 * pxw, 'lon_span': (c1 - c0) * pxw, 'lat_top': T - r0 * pxh, 'lat_bot': T - r1 * pxh}
+    return _to_unit_rgb(arr), bounds
+
+
 # ==========================================
 # BACKGROUND RENDER THREAD
 # ==========================================
@@ -152,10 +191,16 @@ class RenderWorker(QThread):
 
     # ------------------------------------------------------------------
     def _read_dem(self, lon_min, lon_max, lat_min, lat_max, is_tahoe, max_px=MAX_DEM_PX):
+        regional = self.params.get('regional_dem')
         if is_tahoe:
             mult = TAHOE['multiplier']
             dem, ext, k = read_dem_window(self.dem_path, TAHOE['bounds'], lon_min, lon_max, lat_min, lat_max,
                                           wrap=False, max_px=max_px)
+        elif regional:
+            self.progress.emit(f"Using regional elevation: {regional['name']}")
+            mult = UNIT_MULT.get(regional.get('units', 'm'), 3.28084)
+            dem, ext, k = read_dem_window(regional['path'], tuple(regional['bounds']), lon_min, lon_max,
+                                          lat_min, lat_max, wrap=False, max_px=max_px)
         else:
             mult = DATA_FILES[self.planet]['multiplier']
             is_global = self.dem_path in [DATA_FILES[p]['dem'] for p in DATA_FILES]
@@ -262,7 +307,13 @@ class RenderWorker(QThread):
             if not os.path.exists(color_path):
                 raise ValueError(f"Cannot find colour map {color_path}")
             self.progress.emit("Reading colour map window...")
-            rgb, bounds = read_color_window(color_path, lon_min, lon_max, lat_min, lat_max, dpp_lon, dpp_lat)
+            reg_c = self.params.get('regional_color')
+            if reg_c:
+                self.progress.emit(f"Using regional colour map: {reg_c['name']}")
+                rgb, bounds = read_color_window(reg_c['path'], lon_min, lon_max, lat_min, lat_max, dpp_lon, dpp_lat,
+                                                ds_bounds=tuple(reg_c['bounds']))
+            else:
+                rgb, bounds = read_color_window(color_path, lon_min, lon_max, lat_min, lat_max, dpp_lon, dpp_lat)
             if rgb is None:
                 return []
 

@@ -14,9 +14,9 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QRadioButton, QCheckBox, QComboBox, QSplitter,
                              QFileDialog, QMessageBox, QFrame, QButtonGroup,
                              QInputDialog, QColorDialog, QSlider, QScrollArea, QSpinBox, QCompleter,
-                             QProgressBar, QDoubleSpinBox, QGridLayout)
+                             QProgressBar, QDoubleSpinBox, QGridLayout, QDialog)
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
-from PyQt6.QtGui import QDoubleValidator, QIntValidator, QShortcut, QKeySequence, QIcon
+from PyQt6.QtGui import QDoubleValidator, QIntValidator, QShortcut, QKeySequence, QIcon, QAction
 
 # Matplotlib Imports
 import matplotlib
@@ -39,6 +39,14 @@ from hatch_engine import composite_ink_layers, STRATEGIES
 from theme import apply_theme, style_axes, SEPIA, ACCENT, TEXT, MUTED
 from ui_widgets import CollapsibleSection, LayerPanel, swatch_icon
 from sites import sites_for, CATEGORY_STYLE
+import exporter
+import regions
+from decorations import build_decorations
+from calibration import build_calibration_sheet
+from export_dialog import ExportDialog
+from pen_dialog import PenManagerDialog
+from data_dialog import DataDialog
+import project_io
 from contour_engine import auto_contour_interval
 from config import AUTO_CONTOUR_TARGET_LINES
 
@@ -46,6 +54,7 @@ SEL_FILL = SEPIA        # selection rectangle on the source map
 SEL_EDGE = SEPIA
 ZOOM_FILL = ACCENT
 LAYER_LABELS = {'contours': 'Contours', 'borders': 'Borders & outlines', 'sites': 'Points of interest',
+                'decor': 'Map furniture', 'calibration': 'Calibration sheet',
                 'annotations': 'Text & drawn lines'}
 
 # Rough plotter model for the live time estimate (matches the G-code writer / estimator):
@@ -145,6 +154,14 @@ class PlotterApp(QMainWindow):
         self.interval_auto_done = False   # an auto interval has been picked for the current selection
         self.layer_visible = {}           # layer key -> bool (missing = visible)
         self.selected_sites = {}          # planet -> set of site names to plot
+        self.map_segments = []            # strokes from the worker (contours, fill, sites)
+        self.decor_segments = []          # title / scale bar / north arrow / graticule / frame
+        self.decor_masks = []             # data-coord boxes blanked behind the decorations
+        self.calibration_mode = False
+        self.circle_center_lon = 0.0
+        self._saved_selection = None
+        self._loading = False
+        self.project_path = None
         self.site_artists = []            # (artist, site tuple) on the source map
         self.site_annot = None
         self.last_relief_ft = None
@@ -193,6 +210,35 @@ class PlotterApp(QMainWindow):
         QShortcut(QKeySequence("Ctrl+Z"), self).activated.connect(self.undo_action)
         QShortcut(QKeySequence("Ctrl+Shift+Z"), self).activated.connect(self.redo_action)
         QShortcut(QKeySequence("Ctrl+Y"), self).activated.connect(self.redo_action)
+        self.setup_menu()
+
+    def setup_menu(self):
+        mb = self.menuBar()
+
+        def act(menu, text, slot, shortcut=None, tip=None):
+            a = QAction(text, self)
+            if shortcut:
+                a.setShortcut(QKeySequence(shortcut))
+            if tip:
+                a.setStatusTip(tip)
+            a.triggered.connect(lambda _=False: slot())
+            menu.addAction(a)
+            return a
+
+        m_file = mb.addMenu("&File")
+        act(m_file, "New project", self.new_project, "Ctrl+N")
+        act(m_file, "Open project\u2026", self.open_project, "Ctrl+O")
+        act(m_file, "Save project", self.save_project, "Ctrl+S")
+        act(m_file, "Save project as\u2026", lambda: self.save_project(save_as=True), "Ctrl+Shift+S")
+        m_file.addSeparator()
+        act(m_file, "Save SVG\u2026", self.export_svg_action)
+        act(m_file, "Export G-code\u2026", self.export_action, "Ctrl+E")
+        m_file.addSeparator()
+        act(m_file, "Quit", self.close, "Ctrl+Q")
+        m_tools = mb.addMenu("&Tools")
+        act(m_tools, "Pens\u2026", self.open_pen_manager)
+        act(m_tools, "Pen calibration sheet\u2026", self.open_pen_manager)
+        act(m_tools, "Data sources (sharper regional data)\u2026", self.open_data_dialog)
 
     # ------------------------------------------------------------------
     # UI CONSTRUCTION
@@ -268,6 +314,25 @@ class PlotterApp(QMainWindow):
         vbox.setAlignment(Qt.AlignmentFlag.AlignTop)
         scroll.setWidget(body)
         side_v.addWidget(scroll, 1)
+
+        # ---------- STYLE PRESETS ----------
+        preset_row = QHBoxLayout()
+        self.combo_preset = QComboBox()
+        self.combo_preset.setToolTip("Saved looks: contour / fill / map-furniture settings (not the place).")
+        self.btn_preset_apply = QPushButton("Apply")
+        self.btn_preset_apply.clicked.connect(self.apply_selected_preset)
+        self.btn_preset_save = QPushButton("Save\u2026")
+        self.btn_preset_save.setObjectName("ghost")
+        self.btn_preset_save.clicked.connect(self.save_preset_dialog)
+        self.btn_preset_del = QPushButton("Delete")
+        self.btn_preset_del.setObjectName("ghost")
+        self.btn_preset_del.clicked.connect(self.delete_selected_preset)
+        preset_row.addWidget(self.combo_preset, 1)
+        preset_row.addWidget(self.btn_preset_apply)
+        preset_row.addWidget(self.btn_preset_save)
+        preset_row.addWidget(self.btn_preset_del)
+        vbox.addWidget(self._field("Style preset", preset_row))
+        self.reload_presets()
 
         # ---------- SOURCE ----------
         sec_src = CollapsibleSection("Source")
@@ -533,6 +598,42 @@ class PlotterApp(QMainWindow):
         self.chk_join.toggled.connect(self.trigger_recalc)
         self.sec_fill.add(self.chk_join)
         vbox.addWidget(self.sec_fill)
+
+        # ---------- MAP FURNITURE ----------
+        sec_deco = CollapsibleSection("Map furniture", expanded=False)
+        self.chk_deco_title = QCheckBox("Title block")
+        self.chk_deco_title.toggled.connect(self.update_decorations)
+        sec_deco.add(self.chk_deco_title)
+        self.txt_title = QLineEdit()
+        self.txt_title.setPlaceholderText("Title (e.g. Mare Imbrium)")
+        self.txt_title.textChanged.connect(lambda _: self.decor_timer.start(400))
+        sec_deco.add(self.txt_title)
+        self.chk_deco_scale = QCheckBox("Scale bar")
+        self.chk_deco_scale.toggled.connect(self.update_decorations)
+        sec_deco.add(self.chk_deco_scale)
+        self.chk_deco_north = QCheckBox("North arrow")
+        self.chk_deco_north.toggled.connect(self.update_decorations)
+        sec_deco.add(self.chk_deco_north)
+        self.chk_deco_frame = QCheckBox("Neat-line frame")
+        self.chk_deco_frame.toggled.connect(self.update_decorations)
+        sec_deco.add(self.chk_deco_frame)
+        self.combo_graticule = QComboBox()
+        self.combo_graticule.addItems(["Off", "Edge ticks", "Full lines"])
+        self.combo_graticule.currentTextChanged.connect(self.update_decorations)
+        sec_deco.add(self._field("Coordinate grid", self.combo_graticule))
+        self.combo_deco_pen = QComboBox()
+        for pid, pen in self.pens.items():
+            self.combo_deco_pen.addItem(pen['name'], pid)
+        idx = self.combo_deco_pen.findData('base')
+        if idx >= 0:
+            self.combo_deco_pen.setCurrentIndex(idx)
+        self.combo_deco_pen.currentIndexChanged.connect(self.update_decorations)
+        sec_deco.add(self._field("Pen", self.combo_deco_pen, "Map lines are blanked behind the title, scale bar "
+                                                             "and north arrow."))
+        vbox.addWidget(sec_deco)
+        self.decor_timer = QTimer()
+        self.decor_timer.setSingleShot(True)
+        self.decor_timer.timeout.connect(self.update_decorations)
         vbox.addStretch()
         # Long combo entries (ink-set names) must not widen the sidebar past its scroll area.
         for cb in body.findChildren(QComboBox):
@@ -673,10 +774,10 @@ class PlotterApp(QMainWindow):
         self.chk_mask_text = QCheckBox("Blank lines behind text")
         self.chk_mask_text.setChecked(True)
         self.chk_mask_text.toggled.connect(self.render_canvas)
-        self.btn_add_pen = QPushButton("+ Pen")
+        self.btn_add_pen = QPushButton("Pens\u2026")
         self.btn_add_pen.setObjectName("ghost")
-        self.btn_add_pen.setToolTip("Add a custom pen")
-        self.btn_add_pen.clicked.connect(self.add_custom_pen)
+        self.btn_add_pen.setToolTip("Edit pens: colours, measured line widths, feed rates, calibration")
+        self.btn_add_pen.clicked.connect(self.open_pen_manager)
         h_tools.addWidget(self.btn_undo)
         h_tools.addWidget(self.btn_redo)
         h_tools.addWidget(self.chk_mask_text)
@@ -958,6 +1059,8 @@ class PlotterApp(QMainWindow):
     def trigger_recalc(self):
         # NOTE: no extra parameters - this slot is connected to toggled(bool)/valueChanged(int),
         # and PyQt would pass those values in as arguments.
+        if self._loading or self.calibration_mode:
+            return
         if self.is_calculating:
             self.recalc_pending = True
             return
@@ -1016,12 +1119,32 @@ class PlotterApp(QMainWindow):
             'paper_w_mm': self.pw,
             'paper_h_mm': self.ph,
             'pens': copy.deepcopy(self.pens),
+            'regional_dem': self._regional('dem'),
+            'regional_color': self._regional('color'),
         }
+
+    def _regional(self, kind):
+        """Sharper regional raster covering the selection (see Tools > Data sources), else None."""
+        if not self.current_view_extent or self.chk_circle.isChecked():
+            return None
+        if kind == 'dem' and self.active_planet == 'Earth' and "Tahoe" in self.combo_region.currentText():
+            return None
+        try:
+            meta = regions.best_region(self.active_planet, kind, self.current_view_extent)
+        except Exception as e:
+            print(f"Regional data lookup failed: {e}")
+            return None
+        if meta is None:
+            return None
+        return {'path': meta['path'], 'bounds': meta['bounds'], 'units': meta.get('units', 'm'),
+                'name': meta['name']}
 
     def draw_action(self):
         """'Draw Map' button: always a fresh render (auto interval, reset view, clear annotations)."""
         if self.is_calculating:
             return
+        if self.calibration_mode:
+            self.exit_calibration()
         self._start_render(fresh=True)
 
     def _start_render(self, fresh):
@@ -1083,7 +1206,8 @@ class PlotterApp(QMainWindow):
         if result['dem_data'] is not None and result['max_e'] > result['min_e']:
             self.last_relief_ft = result['max_e'] - result['min_e']
         self.current_data_extent = result['extent']
-        self.dem_segments = result['segments']
+        self.map_segments = result['segments']
+        self.dem_segments = self.map_segments + self.decor_segments
         fresh = result['fresh']
 
         step = result.get('auto_interval')
@@ -1099,6 +1223,7 @@ class PlotterApp(QMainWindow):
             self.txt_int.blockSignals(False)
 
         self.has_drawn = True
+        self._build_decorations()
         self._cache_stroke_metrics()
         if fresh:
             self.custom_items = []
@@ -1152,7 +1277,7 @@ class PlotterApp(QMainWindow):
         if self.custom_items:
             groups['annotations'] = {'pens': list(dict.fromkeys(i['pen_id'] for i in self.custom_items)),
                                      'n': len(self.custom_items)}
-        order = ['contours', 'borders'] + sorted(k for k in groups if k.startswith('fill:')) + ['annotations']
+        order = ['calibration', 'contours', 'borders', 'sites'] + sorted(k for k in groups if k.startswith('fill:')) + ['decor', 'annotations']
         rows = []
         for k in order:
             if k not in groups: continue
@@ -1187,7 +1312,7 @@ class PlotterApp(QMainWindow):
             item['_p0'] = (seg[0, 0] * sx, seg[0, 1] * sy)
             item['_p1'] = (seg[-1, 0] * sx, seg[-1, 1] * sy)
 
-    def estimate_pen_minutes(self, p_id):
+    def estimate_pen_minutes(self, p_id, feed_override=None):
         """Same model as the G-code estimator: draw at F1500, travel at F3000, a 1 mm pen lift per stroke,
         +15 % for acceleration. Travel is approximated (vpype re-sorts strokes at export)."""
         p0s, p1s, draw = [], [], 0.0
@@ -1220,7 +1345,8 @@ class PlotterApp(QMainWindow):
         seq = float(np.sum(np.hypot(*(p0[1:] - p1[:-1]).T))) if n > 1 else 0.0
         bound = 0.6 * np.sqrt(self.pw * self.ph * n)
         travel = min(seq, bound) + np.hypot(self.pw, self.ph)           # + trips to/from home
-        return (draw / DRAW_FEED + travel / TRAVEL_FEED + n * PEN_UP_DOWN_MIN) * ACCEL_FACTOR
+        feed = float(feed_override or self.pens.get(p_id, {}).get('feed', DRAW_FEED))
+        return (draw / feed + travel / TRAVEL_FEED + n * PEN_UP_DOWN_MIN) * ACCEL_FACTOR
 
     def update_time_estimate(self):
         if not self.has_drawn:
@@ -1273,7 +1399,8 @@ class PlotterApp(QMainWindow):
         mid_lat = np.radians((self.current_view_extent[2] + self.current_view_extent[3]) / 2)
         self.ax_prev.set_aspect(1 / np.cos(mid_lat))
 
-        self._visible_idx = [i for i, item in enumerate(self.dem_segments) if self.is_visible(item)]
+        self._visible_idx = [i for i, item in enumerate(self.dem_segments)
+                             if self.is_visible(item) and item.get('layer') != 'decor']
         self.dem_collection = None
         if self._visible_idx:
             vis = [self.dem_segments[i] for i in self._visible_idx]
@@ -1312,6 +1439,16 @@ class PlotterApp(QMainWindow):
                     line, = self.ax_prev.plot(poly[:, 0], poly[:, 1], color=pen['color'],
                                               linewidth=pen['width'] * PT_PER_MM, picker=True, pickradius=5, zorder=15)
                     line.item_ref = ('custom', idx)
+
+        for (x0, y0, x1, y1) in self.decor_masks:
+            self.ax_prev.add_patch(patches.Rectangle((x0, y0), x1 - x0, y1 - y0, facecolor=self.current_paper_color(),
+                                                     edgecolor='none', zorder=13))
+        # Map furniture sits above its own blanking boxes (and above the ink preview image).
+        decor = [it for it in self.dem_segments if it.get('layer') == 'decor' and self.is_visible(it)]
+        if decor:
+            dpen = self.pens.get(decor[0]['pen_id'], self.pens['base'])
+            self.ax_prev.add_collection(LineCollection([it['seg'] for it in decor], colors=dpen['color'],
+                                                       linewidths=dpen['width'] * PT_PER_MM, zorder=14))
 
         if is_fresh and self.current_view_extent:
             if self.chk_circle.isChecked():
@@ -1382,7 +1519,7 @@ class PlotterApp(QMainWindow):
 
         by_pen = {}
         for item in self.dem_segments:
-            if self.is_visible(item):
+            if self.is_visible(item) and item.get('layer') != 'decor':
                 by_pen.setdefault(item['pen_id'], []).append(item['seg'])
 
         off_fig = Figure(figsize=(w / dpi, h / dpi), dpi=dpi, facecolor='white')
@@ -1605,6 +1742,10 @@ class PlotterApp(QMainWindow):
         self.canvas_map.draw_idle()
         self.custom_items = []
         self.dem_segments = []
+        self.map_segments = []
+        self.decor_segments = []
+        self.decor_masks = []
+        self.calibration_mode = False
         self.undo_stack.clear();
         self.redo_stack.clear()
         self.update_undo_redo_btns()
@@ -1929,6 +2070,7 @@ class PlotterApp(QMainWindow):
         self.process_selection(x1, x2, y1, y2)
 
     def process_selection(self, x1, x2, y1, y2):
+        self.calibration_mode = False
         gw, gh = x2 - x1, y2 - y1
         if gw == 0 or gh == 0: return
         mid_lat = np.radians((y1 + y2) / 2)
@@ -1956,9 +2098,336 @@ class PlotterApp(QMainWindow):
         self.layer_panel.set_order([], '')
         self.lbl_status.setText("Selection captured - click Draw Map.")
 
+    # --- MAP FURNITURE ---
+    def deco_options(self):
+        return {'title': self.chk_deco_title.isChecked(), 'title_text': self.txt_title.text().strip(),
+                'scale_bar': self.chk_deco_scale.isChecked(), 'north_arrow': self.chk_deco_north.isChecked(),
+                'graticule': self.combo_graticule.currentText(), 'frame': self.chk_deco_frame.isChecked(),
+                'pen': self.combo_deco_pen.currentData() or 'base'}
+
+    def _subtitle(self):
+        e = self.current_view_extent
+        if not e:
+            return ""
+        lat = 0.5 * (e[2] + e[3])
+        lon = ((0.5 * (e[0] + e[1]) + 180) % 360) - 180
+        parts = [self.active_planet.upper(), f"{abs(lat):.2f}°{'N' if lat >= 0 else 'S'} "
+                                            f"{abs(lon):.2f}°{'E' if lon >= 0 else 'W'}"]
+        if self.sec_contours.is_enabled() and any(i.get('layer') == 'contours' for i in self.map_segments):
+            parts.append(f"{self.interval_ft:,} ft contours")
+        return "  ·  ".join(parts)
+
+    def _build_decorations(self):
+        self.decor_segments, self.decor_masks = [], []
+        if self.has_drawn and self.current_view_extent and not self.calibration_mode:
+            try:
+                self.decor_segments, self.decor_masks = build_decorations(
+                    self.deco_options(), self.current_view_extent, self.pw, self.ph, self.chk_circle.isChecked(),
+                    self.active_planet, subtitle=self._subtitle())
+            except Exception as e:
+                print(f"Decorations failed: {e}")
+        self.dem_segments = self.map_segments + self.decor_segments
+
+    def update_decorations(self, *_):
+        if not self.has_drawn or self._loading:
+            return
+        self._build_decorations()
+        self._cache_stroke_metrics()
+        self.render_canvas()
+        self.refresh_layer_panel()
+
+    # --- STYLE PRESETS ---
+    WIDGET_KEYS = None
+
+    def _state_widgets(self):
+        """key -> (widget, kind). kind: 'check' | 'value' | 'text' | 'combo' | 'data'."""
+        return {
+            'contours_on': (self.sec_contours.enable_box, 'check'), 'fill_on': (self.sec_fill.enable_box, 'check'),
+            'density': (self.slider_density, 'value'), 'auto_index': (self.chk_auto_index, 'check'),
+            'index_every': (self.spin_idx, 'value'), 'blur': (self.slider_blur, 'value'),
+            'simplify': (self.slider_simp, 'value'), 'smooth': (self.slider_smooth, 'value'),
+            'tanaka': (self.chk_tanaka, 'check'), 'ocean': (self.chk_ocean, 'check'),
+            'blue_water': (self.chk_blue_water, 'check'), 'plot_borders': (self.chk_plot_borders, 'check'),
+            'pattern': (self.combo_hatch, 'combo'), 'tone_source': (self.combo_source, 'combo'),
+            'inks': (self.combo_inks, 'combo'), 'mono_pen': (self.combo_mono_pen, 'combo'),
+            'ink_set': (self.combo_ink_set, 'combo'), 'spacing': (self.spin_spacing, 'value'),
+            'tone': (self.slider_tone, 'value'), 'auto_contrast': (self.chk_auto_contrast, 'check'),
+            'join': (self.chk_join, 'check'),
+            'deco_title': (self.chk_deco_title, 'check'), 'deco_title_text': (self.txt_title, 'text'),
+            'deco_scale': (self.chk_deco_scale, 'check'), 'deco_north': (self.chk_deco_north, 'check'),
+            'deco_graticule': (self.combo_graticule, 'combo'), 'deco_frame': (self.chk_deco_frame, 'check'),
+            'deco_pen': (self.combo_deco_pen, 'data'), 'site_labels': (self.chk_site_labels, 'check'),
+            'show_sites': (self.chk_sites, 'check'), 'mask_text': (self.chk_mask_text, 'check'),
+            'show_map_borders': (self.chk_borders, 'check'),
+        }
+
+    def _get_widget_state(self):
+        out = {}
+        for key, (w, kind) in self._state_widgets().items():
+            if kind == 'check':
+                out[key] = w.isChecked()
+            elif kind == 'value':
+                out[key] = w.value()
+            elif kind == 'text':
+                out[key] = w.text()
+            elif kind == 'combo':
+                out[key] = w.currentText()
+            elif kind == 'data':
+                out[key] = w.currentData()
+        return out
+
+    def _set_widget_state(self, state):
+        widgets = self._state_widgets()
+        for key, val in state.items():
+            if key not in widgets or val is None:
+                continue
+            w, kind = widgets[key]
+            try:
+                if kind == 'check':
+                    w.setChecked(bool(val))
+                elif kind == 'value':
+                    w.setValue(type(w.value())(val))
+                elif kind == 'text':
+                    w.setText(str(val))
+                elif kind == 'combo':
+                    if w.findText(str(val)) >= 0:
+                        w.setCurrentText(str(val))
+                elif kind == 'data':
+                    i = w.findData(val)
+                    if i >= 0:
+                        w.setCurrentIndex(i)
+            except Exception as e:
+                print(f"Could not restore {key}: {e}")
+
+    def reload_presets(self, select=None):
+        self.presets = project_io.load_presets()
+        self.combo_preset.blockSignals(True)
+        self.combo_preset.clear()
+        for name in self.presets:
+            tag = "" if name not in project_io.BUILTIN_PRESETS else "  (built-in)"
+            self.combo_preset.addItem(name + tag, name)
+        if select:
+            i = self.combo_preset.findData(select)
+            if i >= 0:
+                self.combo_preset.setCurrentIndex(i)
+        self.combo_preset.blockSignals(False)
+
+    def apply_selected_preset(self):
+        name = self.combo_preset.currentData()
+        if not name or name not in self.presets:
+            return
+        self._loading = True
+        try:
+            self._set_widget_state(self.presets[name])
+        finally:
+            self._loading = False
+        self.context_ui_update()
+        self.lbl_status.setText(f"Applied preset '{name}'.")
+        if self.has_drawn:
+            self.interval_auto_done = False             # let the density setting pick the interval
+            self.trigger_recalc()
+
+    def save_preset_dialog(self):
+        name, ok = QInputDialog.getText(self, "Save style preset", "Preset name:")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        if name in project_io.BUILTIN_PRESETS:
+            QMessageBox.information(self, "Presets", "That name is a built-in preset - choose another name.")
+            return
+        project_io.save_user_preset(name, self._get_widget_state())
+        self.reload_presets(select=name)
+        self.lbl_status.setText(f"Saved preset '{name}'.")
+
+    def delete_selected_preset(self):
+        name = self.combo_preset.currentData()
+        if not name:
+            return
+        if name in project_io.BUILTIN_PRESETS:
+            QMessageBox.information(self, "Presets", "Built-in presets can't be deleted.")
+            return
+        if project_io.delete_user_preset(name):
+            self.reload_presets()
+
+    # --- PROJECTS ---
+    def get_project_state(self):
+        st = self._get_widget_state()
+        st.update({
+            'planet': self.active_planet, 'region': self.combo_region.currentText(),
+            'paper_name': self.paper_name, 'custom_w': self.txt_cw.text(), 'custom_h': self.txt_ch.text(),
+            'landscape': self.is_landscape, 'circle_mode': self.chk_circle.isChecked(),
+            'circle_center_lon': getattr(self, 'circle_center_lon', 0.0),
+            'selection': list(self.last_drag_coords) if self.last_drag_coords else None,
+            'interval_ft': self.interval_ft, 'interval_auto_done': self.interval_auto_done,
+            'selected_sites': {k: sorted(v) for k, v in self.selected_sites.items()},
+            'layer_visible': self.layer_visible, 'custom_items': self.custom_items,
+            'has_drawn': self.has_drawn and not self.calibration_mode,
+            'map_view': [list(self.ax_map.get_xlim()), list(self.ax_map.get_ylim())],
+        })
+        return st
+
+    def apply_project_state(self, st):
+        self._loading = True
+        try:
+            planet = st.get('planet', 'Earth')
+            {'Earth': self.radio_earth, 'Moon': self.radio_moon, 'Mars': self.radio_mars}[planet].setChecked(True)
+            if self.active_planet != planet:
+                self.switch_planet()
+            self.selected_sites = {k: set(v) for k, v in st.get('selected_sites', {}).items()}
+            self.switch_planet()                       # rebuild site markers with the loaded selection
+            self.txt_cw.setText(str(st.get('custom_w', '150')))
+            self.txt_ch.setText(str(st.get('custom_h', '150')))
+            self.is_landscape = bool(st.get('landscape', True))
+            self.combo_paper.setCurrentText(st.get('paper_name', self.paper_name))
+            self.paper_name = self.combo_paper.currentText()
+            self.update_paper_dims()
+            self._set_widget_state(st)
+            self.combo_region.setCurrentText(st.get('region', "None (Plot Full Selection)"))
+            if st.get('circle_mode'):
+                self.circle_center_lon = float(st.get('circle_center_lon', 0.0))
+                self.chk_circle.setChecked(True)
+                self.update_circle_patches()
+            else:
+                self.chk_circle.setChecked(False)
+                sel = st.get('selection')
+                if sel:
+                    self.last_drag_coords = tuple(sel)
+                    self.process_selection(*sel)
+                    self.selector.set_visible(True)
+                    self.selector.extents = tuple(sel)
+            mv = st.get('map_view')
+            if mv:
+                self.ax_map.set_xlim(*mv[0])
+                self.ax_map.set_ylim(*mv[1])
+            self.interval_ft = int(st.get('interval_ft', self.interval_ft))
+            self.slider_int.blockSignals(True)
+            self.txt_int.blockSignals(True)
+            self.slider_int.setValue(min(max(self.interval_ft, self.slider_int.minimum()), self.slider_int.maximum()))
+            self.txt_int.setText(str(self.interval_ft))
+            self.slider_int.blockSignals(False)
+            self.txt_int.blockSignals(False)
+            self.layer_visible = dict(st.get('layer_visible', {}))
+        finally:
+            self._loading = False
+        self.context_ui_update()
+        self.canvas_map.draw_idle()
+        if st.get('has_drawn') and self.current_view_extent:
+            # Re-render with the saved interval (no auto pick) and keep the saved annotations.
+            self.interval_auto_done = True
+            self.has_drawn = True
+            self.custom_items = list(st.get('custom_items', []))
+            self.ax_prev.set_xlim(0.0, 1.0)
+            self.ax_prev.set_ylim(0.0, 1.0)
+            self._start_render(fresh=False)
+        self.lbl_status.setText("Project loaded.")
+
+    def new_project(self):
+        if QMessageBox.question(self, "New project", "Clear the current map and annotations?") \
+                != QMessageBox.StandardButton.Yes:
+            return
+        self.project_path = None
+        self.clear_selection()
+        self.setWindowTitle("Topo Plotter Studio - Cartographer Edition")
+
+    def save_project(self, save_as=False):
+        path = self.project_path
+        if save_as or not path:
+            default = f"{self.active_planet.lower()}_plot.topo.json"
+            path, _ = QFileDialog.getSaveFileName(self, "Save project", default, "Topo projects (*.topo.json)")
+            if not path:
+                return
+        try:
+            project_io.save_project(path, self.get_project_state())
+        except Exception as e:
+            QMessageBox.critical(self, "Save project", f"Could not save:\n{e}")
+            return
+        self.project_path = path
+        self.setWindowTitle(f"Topo Plotter Studio - {os.path.basename(path)}")
+        self.lbl_status.setText(f"Saved {os.path.basename(path)}.")
+
+    def open_project(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Open project", "", "Topo projects (*.topo.json);;JSON (*.json)")
+        if not path:
+            return
+        try:
+            st = project_io.load_project(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Open project", f"Could not open:\n{e}")
+            return
+        self.apply_project_state(st)
+        self.project_path = path
+        self.setWindowTitle(f"Topo Plotter Studio - {os.path.basename(path)}")
+
+    # --- PENS / CALIBRATION / DATA ---
+    def open_pen_manager(self):
+        dlg = PenManagerDialog(self.pens, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.pens = dlg.pens
+        save_pens(self.pens)
+        if self.active_pen_id not in self.pens:
+            self.active_pen_id = 'base'
+        self.rebuild_palette_ui()
+        cur = self.combo_deco_pen.currentData()
+        self.combo_deco_pen.blockSignals(True)
+        self.combo_deco_pen.clear()
+        for pid, pen in self.pens.items():
+            self.combo_deco_pen.addItem(pen['name'], pid)
+        i = self.combo_deco_pen.findData(cur)
+        self.combo_deco_pen.setCurrentIndex(max(0, i))
+        self.combo_deco_pen.blockSignals(False)
+        if dlg.calibration_request:
+            self.show_calibration_sheet(dlg.calibration_request)
+            return
+        if self.has_drawn:
+            self.render_canvas()
+            self.refresh_layer_panel()
+
+    def show_calibration_sheet(self, pen_ids):
+        if self.is_calculating:
+            return
+        if not self.calibration_mode:
+            self._saved_selection = (self.current_view_extent, self.last_drag_coords, self.has_drawn)
+        if self.chk_circle.isChecked():
+            self.chk_circle.setChecked(False)
+        segs, extent = build_calibration_sheet(self.pens, pen_ids, self.pw, self.ph)
+        self._render_token += 1
+        self.calibration_mode = True
+        self.current_view_extent = extent
+        self.map_segments = segs
+        self.decor_segments, self.decor_masks = [], []
+        self.dem_segments = list(segs)
+        self.custom_items = []
+        self.has_drawn = True
+        self._cache_stroke_metrics()
+        self.ax_prev.set_xlim(0.0, 1.0)
+        self.ax_prev.set_ylim(0.0, 1.0)
+        self.render_canvas()
+        self.refresh_layer_panel()
+        self.lbl_status.setText("Calibration sheet ready - export the G-code and plot it. Draw Map returns to "
+                                "your map.")
+
+    def exit_calibration(self):
+        self.calibration_mode = False
+        saved = self._saved_selection
+        self.map_segments, self.dem_segments = [], []
+        if saved and saved[1]:
+            self.last_drag_coords = saved[1]
+            self.process_selection(*saved[1])
+        elif saved and saved[0]:
+            self.current_view_extent = saved[0]
+
+    def open_data_dialog(self):
+        ext = self.current_view_extent if (self.current_view_extent and not self.chk_circle.isChecked()
+                                           and not self.calibration_mode) else None
+        dlg = DataDialog(self.active_planet, ext, self)
+        dlg.exec()
+        if dlg.changed and self.has_drawn and not self.calibration_mode:
+            self.trigger_recalc()
+
     # --- EXPORT PIPELINES ---
     def _text_mask_boxes(self):
-        boxes = []
+        boxes = [shp_box(*m) for m in self.decor_masks]
         if self.chk_mask_text.isChecked():
             for item in getattr(self, 'custom_items', []):
                 if item['type'] == 'text':
@@ -1992,8 +2461,8 @@ class PlotterApp(QMainWindow):
         lines = []
         for item in getattr(self, 'dem_segments', []):
             if item.get('pen_id') == p_id and self.is_visible(item):
-                if item.get('type') == 'stipple':
-                    lines.append(np.asarray(item['seg']))        # dots are never blanked or merged
+                if item.get('type') == 'stipple' or item.get('layer') == 'decor':
+                    lines.append(np.asarray(item['seg']))        # dots / map furniture are never blanked
                 else:
                     lines.extend(self._mask_line(item['seg'], text_boxes))
         for item in (getattr(self, 'custom_items', []) if self.annotations_visible() else []):
@@ -2054,150 +2523,157 @@ class PlotterApp(QMainWindow):
         if not self.has_drawn:
             QMessageBox.warning(self, "Not Ready", "Draw a map first!")
             return
+        order = self.plot_order_pens()
+        if not order:
+            QMessageBox.warning(self, "No Data", "Nothing visible to plot - check the layer list.")
+            return
+        rows = []
+        for p_id in order:
+            n = sum(1 for it in self.dem_segments if it['pen_id'] == p_id and self.is_visible(it))
+            if self.annotations_visible():
+                n += sum(1 for it in self.custom_items if it['pen_id'] == p_id)
+            pen = self.pens[p_id]
+            rows.append({'pen_id': p_id, 'name': pen['name'], 'color': pen['color'], 'strokes': n,
+                         'feed': pen.get('feed', exporter.DEFAULT_DRAW_FEED)})
+        mx, my = exporter.max_plot_area()
+        note = (f"Paper {self.pw:g} x {self.ph:g} mm. With the G28 + G92 (-{exporter.GCODE_OFFSET_MM[0]:g}, "
+                f"-{exporter.GCODE_OFFSET_MM[1]:g}) header the reachable plot area is about {mx:g} x {my:g} mm "
+                f"(edit BED_MM in config.py if your bed differs).")
+        if self.pw > mx + 1e-6 or self.ph > my + 1e-6:
+            note = "⚠ " + note + " This paper size is larger than that - check the bed check after export."
+        dlg = ExportDialog(rows, lambda pid, feed: self.estimate_pen_minutes(pid, feed), note, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        st = dlg.settings()
+        changed = False
+        for pid, feed in st['feeds'].items():
+            if self.pens[pid].get('feed') != feed:
+                self.pens[pid]['feed'] = feed
+                changed = True
+        if changed:
+            save_pens(self.pens)
+            self.update_time_estimate()
+        self._export_gcode(st)
 
+    def _vpype_body(self, lines, has_dots, tag):
+        """lines (data coords) -> list of vpype gcodemm lines, or None on failure."""
+        if not lines:
+            return []
+        temp_dir = tempfile.gettempdir()
+        t_svg = os.path.join(temp_dir, f"topo_{tag}.svg").replace("\\", "/")
+        t_gcode = os.path.join(temp_dir, f"topo_{tag}.gcode").replace("\\", "/")
+        export_fig, export_ax = self._make_export_axes()
+        export_ax.add_collection(LineCollection(lines, colors='black', linewidths=1))
+        export_fig.savefig(t_svg, format='svg')
+        try:
+            vpype_cli.execute(exporter.vpype_command(t_svg, t_gcode, has_dots))
+            with open(t_gcode) as f:
+                body = f.read().splitlines()
+        except Exception as e:
+            print(f"vpype failed for {tag}: {e}")
+            body = None
+        for p in (t_svg, t_gcode):
+            try:
+                if os.path.exists(p): os.remove(p)
+            except OSError:
+                pass
+        return body
+
+    def _export_gcode(self, st):
         orient = "landscape" if self.is_landscape else "portrait"
         default_base_name = f"{self.active_planet.lower()}_{orient}_{int(self.pw)}x{int(self.ph)}.gcode"
-
-        base_filepath, _ = QFileDialog.getSaveFileName(self, "Select Base Name for G-Code Files", default_base_name,
+        base_filepath, _ = QFileDialog.getSaveFileName(self, "Select base name for the G-code", default_base_name,
                                                        "G-Code Files (*.gcode)")
-        if not base_filepath: return
+        if not base_filepath:
+            return
         base_filepath = base_filepath.replace("\\", "/")
         dir_path = os.path.dirname(base_filepath)
         base_name = os.path.splitext(os.path.basename(base_filepath))[0]
-
-        self.lbl_status.setText("Generating individual multi-pen G-Code files...")
-        QApplication.processEvents()
-
-        temp_dir = tempfile.gettempdir()
-        exported_files = []
-
         text_boxes = self._text_mask_boxes()
+        sx, sy = self._paper_mm_per_data_unit()
 
-        # Lightest ink first, darkest last; the number prefix is the order to load the pens.
-        for order_no, p_id in enumerate(self.plot_order_pens(), start=1):
+        per_pen = []          # (pen_id, wrapped gcode body)
+        for p_id, feed in st['pens']:
             pen = self.pens[p_id]
-            safe_pen_name = "".join([c if c.isalnum() else "_" for c in pen['name']])
-            safe_pen_name = re.sub(r'_+', '_', safe_pen_name).strip('_')
-            final_out_gcode = f"{dir_path}/{order_no:02d}_{safe_pen_name}_{base_name}.gcode"
-
-            t_svg = os.path.join(temp_dir, f"temp_{p_id}.svg").replace("\\", "/")
-            t_gcode = os.path.join(temp_dir, f"temp_{p_id}.gcode").replace("\\", "/")
-
+            self.lbl_status.setText(f"Optimising {pen['name']}...")
+            QApplication.processEvents()
             lines = self._lines_for_pen(p_id, text_boxes)
-            has_dots = any(item.get('type') == 'stipple' and item['pen_id'] == p_id and self.is_visible(item)
-                           for item in self.dem_segments)
+            has_dots = any(it.get('type') == 'stipple' and it['pen_id'] == p_id and self.is_visible(it)
+                           for it in self.dem_segments)
+            lengths = [float(np.sum(np.hypot(np.diff(np.asarray(ln)[:, 0]) * sx, np.diff(np.asarray(ln)[:, 1]) * sy)))
+                       for ln in lines]
             if has_dots:
-                # vpype's length filter / merge would delete or join the tiny stipple circles, so for
-                # this pen the short-stroke filter is applied here to everything except the dots.
-                sx, sy = self._paper_mm_per_data_unit()
-                kept = []
-                for ln in lines:
-                    ln = np.asarray(ln)
-                    is_dot = len(ln) == 7 and np.allclose(ln[0], ln[-1])
-                    length = np.sum(np.hypot(np.diff(ln[:, 0]) * sx, np.diff(ln[:, 1]) * sy))
-                    if is_dot or length >= MIN_SEGMENT_MM:
-                        kept.append(ln)
-                lines = kept
+                keep = [i for i, ln in enumerate(lines)
+                        if (len(ln) == 7 and np.allclose(ln[0], ln[-1])) or lengths[i] >= MIN_SEGMENT_MM]
+                lines = [lines[i] for i in keep]
+                lengths = [lengths[i] for i in keep]
             if not lines:
                 continue
-
-            self.lbl_status.setText(f"Optimising {pen['name']} ({len(lines):,} strokes)...")
-            QApplication.processEvents()
-            export_fig, export_ax = self._make_export_axes()
-            export_ax.add_collection(LineCollection(lines, colors='black', linewidths=1))
-            export_fig.savefig(t_svg, format='svg')
-
-            try:
-                if has_dots:
-                    vpype_cmd = f'read "{t_svg}" linesort gwrite --profile gcodemm "{t_gcode}"'
-                else:
-                    vpype_cmd = (f'read "{t_svg}" linesimplify -t 0.1mm linemerge -t 0.3mm '
-                                 f'filter --min-length {MIN_SEGMENT_MM:g}mm linesort gwrite --profile gcodemm "{t_gcode}"')
-                vpype_cli.execute(vpype_cmd)
-            except Exception as e:
-                print(f"Skipping {pen['name']} optimization: {e}")
+            prime, rest = exporter.split_for_priming(lines, lengths, st['prime'] if not has_dots else 0)
+            body = []
+            ok = True
+            for part, tag in ((prime, f"{p_id}_prime"), (rest, p_id)):
+                b = self._vpype_body(part, has_dots, tag)
+                if b is None:
+                    ok = False
+                    break
+                body += b
+            if not ok:
+                QMessageBox.warning(self, "Export", f"vpype could not optimise {pen['name']} - skipped.")
                 continue
+            per_pen.append((p_id, exporter.wrap_vpype_body(body, feed, exporter.TRAVEL_FEED, st['settle_ms'])))
 
-            master_gcode = [
-                f"; --- START ROUTINE: {pen['name']} ---", "G21", "G90", "G28", "G92 X-50.0 Y-50.0 Z-4.0",
-                "G0 Z1.0 F1500", "M400"
-            ]
-
-            with open(t_gcode, "r") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line: continue
-                    if line.startswith("G0 X") or line.startswith("G00 X"):
-                        master_gcode.extend(["G0 Z1.0 F1500", "M400", f"{line} F3000", "M400", "G1 Z0.0 F1000", "M400"])
-                    elif line.startswith("G1 X") or line.startswith("G01 X"):
-                        master_gcode.append(f"{line} F1500")
-
-            master_gcode.extend(["G0 Z1.0 F1500", "M400", "; --- END OF PLOT ---", "G0 X0 Y0 F3000", "G0 Z25.0 F1500",
-                                 f"M117 {pen['name']} Complete!", "M84"])
-
-            try:
-                with open(final_out_gcode, "w") as f:
-                    f.write("\n".join(master_gcode))
-
-                total_time_min = 0.0
-                cx, cy, cz = -50.0, -50.0, -4.0
-                cf = 1500.0
-
-                for line in master_gcode:
-                    line = line.split(';')[0].strip()
-                    if not line: continue
-                    parts = line.split()
-                    cmd = parts[0]
-
-                    if cmd in ['G0', 'G00', 'G1', 'G01']:
-                        nx, ny, nz = cx, cy, cz
-                        for p in parts[1:]:
-                            if p.startswith('X'):
-                                nx = float(p[1:])
-                            elif p.startswith('Y'):
-                                ny = float(p[1:])
-                            elif p.startswith('Z'):
-                                nz = float(p[1:])
-                            elif p.startswith('F'):
-                                cf = float(p[1:])
-
-                        dist = np.sqrt((nx - cx) ** 2 + (ny - cy) ** 2 + (nz - cz) ** 2)
-                        if cf > 0: total_time_min += dist / cf
-                        cx, cy, cz = nx, ny, nz
-
-                total_time_min *= 1.15
-                h = int(total_time_min // 60);
-                m = int(total_time_min % 60);
-                s = int((total_time_min * 60) % 60)
-                time_str = f"{h}h {m}m {s}s" if h > 0 else f"{m}m {s}s"
-
-                exported_files.append(
-                    {'path': final_out_gcode, 'name': pen['name'], 'time': time_str, 'mins': total_time_min})
-
-            except Exception as e:
-                print(f"Error saving {final_out_gcode}: {e}")
-
-            try:
-                if os.path.exists(t_svg): os.remove(t_svg)
-                if os.path.exists(t_gcode): os.remove(t_gcode)
-            except:
-                pass
-
-        if exported_files:
-            total_mins = sum(f['mins'] for f in exported_files)
-            th = int(total_mins // 60);
-            tm = int(total_mins % 60);
-            ts = int((total_mins * 60) % 60)
-            total_time_str = f"{th}h {tm}m {ts}s" if th > 0 else f"{tm}m {ts}s"
-
-            self.lbl_status.setText(f"Successfully generated {len(exported_files)} files. (Est: {total_time_str})")
-            msg = (f"Generated {len(exported_files)} G-Code files (Total Est. Time: {total_time_str}).\n"
-                   f"Plot them in this order - lightest ink first:\n\n")
-            for f in exported_files: msg += f"• {os.path.basename(f['path'])}  ->  {f['time']}\n"
-            QMessageBox.information(self, "Success", msg)
-        else:
-            QMessageBox.warning(self, "No Data", "No vector elements found for any active pen!")
+        if not per_pen:
+            QMessageBox.warning(self, "No Data", "No vector elements found for the selected pens.")
             self.lbl_status.setText("Ready.")
+            return
+
+        files = []
+        if st['combine']:
+            names = [self.pens[p]['name'] for p, _ in per_pen]
+            g = exporter.header(f"COMBINED PLOT: {' -> '.join(names)}")
+            for i, (p_id, body) in enumerate(per_pen):
+                g += exporter.pen_change(self.pens[p_id]['name']) if i > 0 else \
+                    [f"M117 Load {self.pens[p_id]['name']}"[:40], f"M0 Load {self.pens[p_id]['name']}, then click"[:60]]
+                g += body
+            g += exporter.footer("Plot complete!")
+            path = f"{dir_path}/{base_name}_all_pens.gcode"
+            files.append((path, "All pens (with pauses)", g))
+        else:
+            for order_no, (p_id, body) in enumerate(per_pen, start=1):
+                pen = self.pens[p_id]
+                safe = re.sub(r'_+', '_', "".join(c if c.isalnum() else "_" for c in pen['name'])).strip('_')
+                g = exporter.header(f"START ROUTINE: {pen['name']}") + body + \
+                    exporter.footer(f"{pen['name']} Complete!")
+                files.append((f"{dir_path}/{order_no:02d}_{safe}_{base_name}.gcode", pen['name'], g))
+
+        report, total, problems = [], 0.0, []
+        for path, label, g in files:
+            try:
+                with open(path, "w") as f:
+                    f.write("\n".join(g))
+            except Exception as e:
+                QMessageBox.critical(self, "Export", f"Could not write {path}:\n{e}")
+                return
+            mins = exporter.estimate_minutes(g)
+            total += mins
+            report.append(f"• {os.path.basename(path)}  ->  {exporter.fmt_duration(mins)}")
+            bad = exporter.bed_violation(exporter.xy_bounds(g))
+            if bad:
+                problems.append(f"{label}: {bad}")
+
+        self.lbl_status.setText(f"Exported {len(files)} file(s). (Est: {exporter.fmt_duration(total)})")
+        msg = (f"Generated {len(files)} G-code file(s), total ≈ {exporter.fmt_duration(total)}.\n"
+               + ("Plot in this order - lightest ink first:\n\n" if not st['combine'] else "\n")
+               + "\n".join(report))
+        if problems:
+            msg += ("\n\n⚠ BED CHECK: these moves go outside the reachable area - the plotter would hit its "
+                    "limits:\n" + "\n".join(problems) +
+                    "\nUse a smaller paper size or adjust BED_MM / GCODE_OFFSET_MM in config.py.")
+            QMessageBox.warning(self, "Exported - check bed limits", msg)
+        else:
+            QMessageBox.information(self, "Success", msg)
+
 
 
 if __name__ == '__main__':
@@ -2211,4 +2687,4 @@ if __name__ == '__main__':
     apply_theme(app)
     window = PlotterApp()
     window.showMaximized()
-    sys.exit(app.exec())
+    sys.exit(app.exec())

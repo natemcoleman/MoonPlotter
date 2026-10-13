@@ -85,6 +85,21 @@ DEFAULT_MONO_INK_SET = 'Thick Black G2 (0.7)'
 
 DEFAULT_HATCH_SPACING_MM = 1.0
 
+# ==========================================
+# PLOTTER / G-CODE
+# ==========================================
+# The G-code header homes (G28) then declares the head to be at (-50, -50) with G92, so plot
+# coordinate (0, 0) sits 50 mm in from the home corner. The usable plot area is therefore the bed
+# size minus that offset. Adjust BED_MM if your Ender's travel differs.
+BED_MM = (235.0, 235.0)
+GCODE_OFFSET_MM = (50.0, 50.0)
+DEFAULT_DRAW_FEED = 1500.0      # mm/min, pen down
+TRAVEL_FEED = 3000.0            # mm/min, pen up
+PEN_LIFT_MM = 1.0
+
+# Folder for high-resolution regional data (DEMs and colour maps) - see regions.py
+REGIONS_DIR = "regions"
+
 
 # ==========================================
 # PEN PERSISTENCE HANDLERS
