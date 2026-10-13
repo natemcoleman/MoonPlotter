@@ -15,20 +15,25 @@ Tone pipeline:
      searched (nearest in CIELAB) for every pixel colour. Monochrome is the
      same model with one black ink (solved analytically).
   3. Each ink's density map (0..1 of that pattern's max coverage) drives one of
-     three hatch patterns.
+     the stroke patterns: crosshatch, variable-spacing lines, sine squiggles or stipple
+     dots. "Hachures" is elevation-driven: short strokes that run downhill, packed
+     densest where the terrain is steepest.
+
+Every returned stroke carries 'layer': 'fill' so the UI can list / toggle it.
 """
 import numpy as np
 import scipy.ndimage
 from scipy.spatial import cKDTree
 
-from config import PLANET_RADII, MIN_SEGMENT_MM, INK_SETS, DEFAULT_INK_SET, MONO_INK_SET, \
-    DEFAULT_HATCH_SPACING_MM
+from config import PLANET_RADII, MIN_SEGMENT_MM, INK_SETS, DEFAULT_INK_SET, MONO_INK_SETS, \
+    DEFAULT_MONO_INK_SET, DEFAULT_HATCH_SPACING_MM
 
 DEG2RAD = np.pi / 180.0
 SAMPLE_STEP_MM = 0.2          # sampling step along straight hatch lines
 GAP_CLOSE_MM = 0.6            # bridge pen-up gaps shorter than this
 MAX_COVERAGE = 0.95           # never try to lay down more ink than this per pen
 REG_WEIGHT = 2.0              # Lab units per full ink layer (prefers less ink on ties)
+STIPPLE_DOT_RADIUS_MM = 0.12  # each stipple is a tiny circle so the pen deposits a round dot
 
 
 # ------------------------------------------------------------------
@@ -63,6 +68,28 @@ def luminance(lin):
     return lin @ _RGB2XYZ[1]
 
 
+def linear_to_srgb(c):
+    c = np.clip(c, 0.0, 1.0)
+    return np.where(c <= 0.0031308, 12.92 * c, 1.055 * np.power(c, 1.0 / 2.4) - 0.055)
+
+
+def composite_ink_layers(layers, paper_hex):
+    """Subtractive preview: each layer is an sRGB uint8/float image of ONE pen's strokes on white.
+
+    Layers are multiplied in linear light (each ink acts as a filter over the paper), which is how
+    overlapping translucent gel ink combines on paper - unlike normal alpha drawing, where the last
+    pen drawn simply covers the ones below it. Returns an sRGB uint8 image.
+    """
+    out = None
+    for layer in layers:
+        lin = srgb_to_linear(np.asarray(layer, dtype=np.float64)[..., :3] / 255.0)
+        out = lin if out is None else out * lin
+    paper = srgb_to_linear(hex_to_srgb(paper_hex))
+    if out is None:
+        return None
+    return (linear_to_srgb(out * paper) * 255.0 + 0.5).astype(np.uint8)
+
+
 # ------------------------------------------------------------------
 # Pattern coverage models
 # ------------------------------------------------------------------
@@ -91,6 +118,9 @@ def pattern_max_coverage(strategy, line_w, spacing, n_passes):
     k = min(1.0, line_w / spacing)
     if "Squiggle" in strategy:
         return float(_squiggle_table(line_w, spacing)[1][-1])
+    if "Stipp" in strategy:
+        dot_d = line_w + 2.0 * STIPPLE_DOT_RADIUS_MM
+        return min(MAX_COVERAGE, np.pi * dot_d * dot_d / 4.0 / (spacing * spacing))
     if "Variable" in strategy:
         return min(MAX_COVERAGE, k)
     return min(MAX_COVERAGE, 1.0 - (1.0 - k) ** n_passes)
@@ -169,10 +199,80 @@ class _Raster:
         return out
 
 
+    def sample_bilinear(self, lon, lat):
+        """Bilinear lookup (NaN-propagating) for smooth fields such as elevation."""
+        fx = np.mod(lon - self.lon0, 360.0) / self.span * self.w - 0.5
+        fy = (self.lat_top - lat) / (self.lat_top - self.lat_bot) * self.h - 0.5
+        x0 = np.floor(fx).astype(np.int64); y0 = np.floor(fy).astype(np.int64)
+        tx = (fx - x0).astype(np.float32); ty = (fy - y0).astype(np.float32)
+        out = np.full(lon.shape, np.nan, dtype=np.float32)
+        ok = (x0 >= 0) & (x0 < self.w - 1) & (y0 >= 0) & (y0 < self.h - 1)
+        x0, y0, tx, ty = x0[ok], y0[ok], tx[ok], ty[ok]
+        a = self.arr
+        out[ok] = ((a[y0, x0] * (1 - tx) + a[y0, x0 + 1] * tx) * (1 - ty)
+                   + (a[y0 + 1, x0] * (1 - tx) + a[y0 + 1, x0 + 1] * tx) * ty)
+        return out
+
+
+_BLUE_NOISE = None
+
+
+def blue_noise(n=64, sigma=1.5, seed=7):
+    """Tileable n x n blue-noise threshold matrix in (0, 1) (void-and-cluster, Ulichney 1993)."""
+    global _BLUE_NOISE
+    if _BLUE_NOISE is not None and _BLUE_NOISE.shape[0] == n:
+        return _BLUE_NOISE
+    rng = np.random.default_rng(seed)
+    yy, xx = np.meshgrid(np.arange(n), np.arange(n), indexing='ij')
+    dy = np.minimum(yy, n - yy); dx = np.minimum(xx, n - xx)
+    kernel = np.exp(-(dx * dx + dy * dy) / (2 * sigma * sigma))          # toroidal Gaussian at (0,0)
+    K = np.fft.rfft2(kernel)
+
+    def energy(mask):
+        return np.fft.irfft2(np.fft.rfft2(mask.astype(np.float64)) * K, s=(n, n))
+
+    # Initial pattern: ~10% random points, relaxed until stable.
+    pts = np.zeros((n, n), bool)
+    pts.flat[rng.choice(n * n, n * n // 10, replace=False)] = True
+    for _ in range(4 * n * n):
+        e = energy(pts)
+        tight = np.unravel_index(np.argmax(np.where(pts, e, -np.inf)), pts.shape)
+        pts[tight] = False
+        e = energy(pts)
+        void = np.unravel_index(np.argmin(np.where(pts, np.inf, e)), pts.shape)
+        if void == tight:
+            pts[tight] = True
+            break
+        pts[void] = True
+    rank = np.zeros((n, n), np.int64)
+    ones = int(pts.sum())
+    # Phase 1: remove points from the initial pattern (ranks ones-1 .. 0)
+    p = pts.copy(); e = energy(p)
+    for r in range(ones - 1, -1, -1):
+        tight = np.unravel_index(np.argmax(np.where(p, e, -np.inf)), p.shape)
+        p[tight] = False; rank[tight] = r
+        e -= np.roll(np.roll(kernel, tight[0], 0), tight[1], 1)
+    # Phase 2/3: add points into the largest voids (ranks ones .. n*n-1)
+    p = pts.copy(); e = energy(p)
+    for r in range(ones, n * n):
+        void = np.unravel_index(np.argmin(np.where(p, np.inf, e)), p.shape)
+        p[void] = True; rank[void] = r
+        e += np.roll(np.roll(kernel, void[0], 0), void[1], 1)
+    _BLUE_NOISE = (rank + 0.5) / (n * n)
+    return _BLUE_NOISE
+
+
+def apply_tone_curve(d, gamma):
+    """Darkness map -> darkness map. gamma > 1 darkens, < 1 lightens (applied to lightness)."""
+    if abs(gamma - 1.0) < 1e-6:
+        return d
+    return 1.0 - np.power(np.clip(1.0 - d, 0.0, 1.0), gamma)
+
+
 # ------------------------------------------------------------------
 # Colour separation
 # ------------------------------------------------------------------
-def _separate(rgb, valid, inks, paper_hex, max_cov, auto_contrast):
+def _separate(rgb, valid, inks, paper_hex, max_cov, auto_contrast, tone_gamma=1.0):
     """Returns a list of density maps (0..1, one per ink) for an sRGB image."""
     lo, hi = 0.0, 1.0
     if auto_contrast and valid.any():
@@ -201,6 +301,8 @@ def _separate(rgb, valid, inks, paper_hex, max_cov, auto_contrast):
 
     def stretch(lin):
         lin = np.clip((lin - lo) / (hi - lo), 0.0, 1.0)
+        if abs(tone_gamma - 1.0) > 1e-6:
+            lin = np.power(lin, tone_gamma)        # tone curve (gamma > 1 = darker)
         return y_floor + lin * (1.0 - y_floor)
 
     if len(inks) == 1:
@@ -270,33 +372,174 @@ def _runs(on):
     return rows, starts, ends
 
 
-def _straight_segments(frame, on, U, V, pen_id, level):
+def _run_polylines(on, U, V):
+    """Runs of 'on' samples per scan row -> (row index array, list of (n, 2) paper-mm polylines)."""
     rows, s, e = _runs(on)
-    if len(rows) == 0:
+    lines = [np.column_stack([U[r, a:b], V[r, a:b]]) for r, a, b in zip(rows, s, e)]
+    return rows, lines
+
+
+def _straight_runs(on, U, V):
+    rows, s, e = _runs(on)
+    lines = [np.array([[U[r, a], V[r, a]], [U[r, b - 1], V[r, b - 1]]]) for r, a, b in zip(rows, s, e)]
+    return rows, lines
+
+
+def join_neighbouring_runs(rows, lines, max_gap, lookahead=1):
+    """Boustrophedon joining: links the end of each stroke to the nearest free stroke end in the
+    next scan row(s) when it is within max_gap mm, producing zigzags with far fewer pen lifts."""
+    if len(lines) < 2:
+        return list(lines)
+    by_row = {}
+    for i, r in enumerate(rows):
+        by_row.setdefault(int(r), []).append(i)
+    used = np.zeros(len(lines), dtype=bool)
+    chains = []
+    for i in range(len(lines)):
+        if used[i]:
+            continue
+        used[i] = True
+        chain = [lines[i]]
+        cur_row, end = int(rows[i]), lines[i][-1]
+        while True:
+            best, best_d = None, max_gap
+            for rr in range(cur_row + 1, cur_row + 1 + lookahead):
+                for j in by_row.get(rr, ()):
+                    if used[j]:
+                        continue
+                    d0 = np.hypot(*(lines[j][0] - end))
+                    d1 = np.hypot(*(lines[j][-1] - end))
+                    if d0 < best_d: best, best_d = (j, False), d0
+                    if d1 < best_d: best, best_d = (j, True), d1
+                if best is not None:
+                    break
+            if best is None:
+                break
+            j, rev = best
+            nxt = lines[j][::-1] if rev else lines[j]
+            used[j] = True
+            chain.append(nxt)
+            cur_row, end = int(rows[j]), nxt[-1]
+        chains.append(np.vstack(chain) if len(chain) > 1 else chain[0])
+    return chains
+
+
+def _emit(frame, lines, pen_id, level, seg_type='hatch'):
+    out = []
+    for ln in lines:
+        X, Y = frame.to_data(ln[:, 0], ln[:, 1])
+        out.append({'type': seg_type, 'layer': 'fill', 'seg': np.column_stack([X, Y]),
+                    'level': level, 'pen_id': pen_id})
+    return out
+
+
+def _tile_threshold(ix, iy, shift=0):
+    bn = blue_noise()
+    n = bn.shape[0]
+    return bn[(iy + 29 * shift) % n, (ix + 17 * shift) % n]
+
+
+def _stipple_dots(frame, raster, spacing, ink_idx, rng):
+    """Blue-noise (FM) screening: one candidate per grid cell, kept when the local density beats the
+    cell's blue-noise threshold. Returns a list of tiny-circle polylines in paper mm."""
+    g = spacing
+    golden = 0.6180339887
+    ox, oy = (golden * ink_idx) % 1.0 * g, (golden * 2 * ink_idx) % 1.0 * g
+    nx_, ny_ = int(np.ceil(frame.pw / g)) + 1, int(np.ceil(frame.ph / g)) + 1
+    iy, ix = np.mgrid[0:ny_, 0:nx_]
+    U = ix * g + ox + rng.uniform(-0.3, 0.3, ix.shape) * g
+    V = iy * g + oy + rng.uniform(-0.3, 0.3, ix.shape) * g
+    inside = frame.inside(U, V)
+    d = raster.sample(*frame.to_lonlat(U, V))
+    keep = inside & (d > _tile_threshold(ix, iy, ink_idx))
+    cu, cv = U[keep], V[keep]
+    t = np.linspace(0.0, 2.0 * np.pi, 7)
+    r = STIPPLE_DOT_RADIUS_MM
+    ring = np.column_stack([r * np.cos(t), r * np.sin(t)])
+    return [ring + (u, v) for u, v in zip(cu, cv)]
+
+
+def _hachures(frame, elev, spacing, tone_gamma, rng, progress_callback=None):
+    """Elevation-driven hachures: strokes traced downhill from blue-noise seeds; seed density follows
+    slope steepness (normalised to the page). Works in paper space, so circle mode is handled too."""
+    h = 0.5                                              # finite-difference step, mm
+    step = 0.25                                          # streamline step, mm
+    half_len = max(MIN_SEGMENT_MM * 0.6, 1.1 * spacing)
+
+    def z_at(U, V):
+        return elev.sample_bilinear(*frame.to_lonlat(U, V))
+
+    def grad(U, V):
+        gx = (z_at(U + h, V) - z_at(U - h, V)) / (2 * h)
+        gy = (z_at(U, V + h) - z_at(U, V - h)) / (2 * h)
+        return gx, gy
+
+    g = spacing
+    nx_, ny_ = int(np.ceil(frame.pw / g)) + 1, int(np.ceil(frame.ph / g)) + 1
+    iy, ix = np.mgrid[0:ny_, 0:nx_]
+    U = (ix + 0.5 + rng.uniform(-0.3, 0.3, ix.shape)) * g
+    V = (iy + 0.5 + rng.uniform(-0.3, 0.3, ix.shape)) * g
+    inside = frame.inside(U, V)
+    gx, gy = grad(U, V)
+    slope = np.hypot(gx, gy)
+    ok = inside & np.isfinite(slope)
+    if not ok.any():
         return []
-    U0, V0 = frame.to_data(U[rows, s], V[rows, s])
-    U1, V1 = frame.to_data(U[rows, e - 1], V[rows, e - 1])
-    pts = np.stack([np.column_stack([U0, V0]), np.column_stack([U1, V1])], axis=1)
-    return [{'type': 'hatch', 'seg': p, 'level': level, 'pen_id': pen_id} for p in pts]
+    s_ref = np.percentile(slope[ok], 95)
+    if not np.isfinite(s_ref) or s_ref <= 0:
+        return []
+    d = apply_tone_curve(np.clip(slope / s_ref, 0.0, 1.0), tone_gamma)
+    keep = ok & (d > np.maximum(_tile_threshold(ix, iy), 0.08))   # leave near-flat ground blank
+    P = np.column_stack([U[keep], V[keep]])
+    if len(P) == 0:
+        return []
+    if progress_callback: progress_callback(f"Tracing {len(P):,} hachures...")
+
+    # Straight strokes centred on each seed, pointing straight downhill (classic hachures).
+    gx_s, gy_s = gx[keep], gy[keep]
+    m = np.hypot(gx_s, gy_s)
+    dirs = -np.column_stack([gx_s, gy_s]) / m[:, None]
+    n_pts = int(np.ceil(2 * half_len / step)) + 1
+    t = np.linspace(-half_len, half_len, n_pts)
+    pts = P[:, None, :] + t[None, :, None] * dirs[:, None, :]        # (n, n_pts, 2), uphill -> downhill
+    ins = frame.inside(pts[..., 0], pts[..., 1])
+    out = []
+    for st, ok_pts in zip(pts, ins):
+        idx = np.nonzero(ok_pts)[0]
+        if len(idx) < 2:
+            continue
+        st = st[idx[0]:idx[-1] + 1][[0, -1]]                       # straight: keep the two ends
+        if np.hypot(*(st[1] - st[0])) >= MIN_SEGMENT_MM:
+            out.append(st)
+    return out
 
 
 # ------------------------------------------------------------------
 # Main entry point
 # ------------------------------------------------------------------
-def generate_hatches(rgb, rgb_bounds, view_extent, params, progress_callback=None):
-    """rgb: float (h, w, 3) sRGB 0..1 covering rgb_bounds (see workers.read_color_window)."""
-    segments = []
-    if rgb is None or rgb.size == 0:
-        return segments
+STRATEGIES = ["Multi-Pass Crosshatch", "Variable Spacing Scanlines", "Modulated Sine Squiggles",
+              "Stippling", "Hachures (Slope)"]
 
-    mode = params.get('plot_mode', '')
-    strategy = params.get('hatch_strategy', 'Multi-Pass Thresholded')
+
+def generate_hatches(rgb, rgb_bounds, view_extent, params, progress_callback=None, elev=None):
+    """Fill layer generator.
+
+    rgb:   float (h, w, 3) sRGB 0..1 covering rgb_bounds (tone source; may be None for hachures).
+    elev:  optional (elevation_m float array, bounds dict) - required for "Hachures (Slope)".
+    """
+    segments = []
+    strategy = params.get('hatch_strategy', STRATEGIES[0])
     pens = params.get('pens', {})
     spacing = max(0.2, float(params.get('hatch_spacing_mm', DEFAULT_HATCH_SPACING_MM)))
     auto_contrast = params.get('auto_contrast', True)
+    tone_gamma = float(params.get('tone_gamma', 1.0))
+    join = params.get('join_lines', True)
+    is_hachure = "Hachure" in strategy
 
-    if "Monochrome" in mode:
-        ink_set, n_passes = MONO_INK_SET, 3
+    use_mono = params.get('fill_inks', 'mono' if "Monochrome" in params.get('plot_mode', '') else 'color') == 'mono'
+    if use_mono or is_hachure:
+        ink_set, n_passes = MONO_INK_SETS.get(params.get('mono_ink_set', DEFAULT_MONO_INK_SET),
+                                              MONO_INK_SETS[DEFAULT_MONO_INK_SET]), 3
     else:
         ink_set, n_passes = INK_SETS.get(params.get('ink_set', DEFAULT_INK_SET), INK_SETS[DEFAULT_INK_SET]), 2
 
@@ -306,6 +549,29 @@ def generate_hatches(rgb, rgb_bounds, view_extent, params, progress_callback=Non
 
     frame = _Frame(view_extent, params)
     if frame.pw <= 0 or frame.ph <= 0 or view_extent[1] <= view_extent[0]:
+        return segments
+    rng = np.random.default_rng(12345)
+
+    # --- Elevation-driven hachures (single pen) ---
+    if is_hachure:
+        if elev is None:
+            raise ValueError("Hachures need elevation data for this selection.")
+        dem, dem_bounds = elev
+        mm_per_px = dem_bounds['lon_span'] / dem.shape[1] * frame.mm_per_deg()
+        sigma = 1.0 * spacing / max(mm_per_px, 1e-9)      # smooth so stroke directions are coherent
+        if sigma > 0.3:
+            valid = np.isfinite(dem)
+            filled = np.where(valid, dem, np.nanmean(dem) if valid.any() else 0.0)
+            dem = np.where(valid, scipy.ndimage.gaussian_filter(filled, sigma, mode='nearest'), np.nan)
+        if progress_callback: progress_callback("Computing slope field for hachures...")
+        lines = _hachures(frame, _Raster(dem.astype(np.float32), dem_bounds), spacing, tone_gamma, rng,
+                          progress_callback)
+        pen_id = inks[0][0]
+        segments = _emit(frame, lines, pen_id, 1000)
+        if progress_callback: progress_callback(f"Hachures complete ({len(segments):,} strokes).")
+        return segments
+
+    if rgb is None or rgb.size == 0:
         return segments
 
     line_w = [float(pens[pid].get('line_mm', pens[pid]['width'])) for pid, _ in inks]
@@ -320,14 +586,19 @@ def generate_hatches(rgb, rgb_bounds, view_extent, params, progress_callback=Non
     if sigma > 0.3:
         rgb = scipy.ndimage.gaussian_filter(rgb, sigma=(sigma, sigma, 0), mode='nearest')
     dens_maps = _separate(rgb, valid, [pens[pid]['color'] for pid, _ in inks], ink_set['paper'],
-                          max_cov, auto_contrast)
+                          max_cov, auto_contrast, tone_gamma)
 
     golden = 0.6180339887
     for ink_idx, ((pen_id, base_angle), dmap, lw, cmax) in enumerate(zip(inks, dens_maps, line_w, max_cov)):
         raster = _Raster(dmap, rgb_bounds)
-        if progress_callback: progress_callback(f"Hatching {pens[pen_id]['name']} ({strategy})...")
+        level = 1000 * (ink_idx + 1)
+        if progress_callback: progress_callback(f"{strategy}: {pens[pen_id]['name']}...")
 
-        if "Squiggle" in strategy:
+        if "Stipp" in strategy:
+            dots = _stipple_dots(frame, raster, spacing, ink_idx, rng)
+            segments.extend(_emit(frame, dots, pen_id, level, seg_type='stipple'))
+
+        elif "Squiggle" in strategy:
             line_spacing, _, wavelength = _squiggle_params(spacing)
             amps, covs = _squiggle_table(lw, spacing)
             dt = wavelength / 16.0
@@ -341,12 +612,10 @@ def generate_hatches(rgb, rgb_bounds, view_extent, params, progress_callback=Non
             A = np.interp(c, covs, amps) if len(covs) > 1 else np.zeros_like(c)
             wave = np.sin(2.0 * np.pi * ts / wavelength)[None, :]
             Ud, Vd = frame.clamp(U + A * wave * nx, V + A * wave * ny)
-            rows, s, e = _runs(on)
-            Xd, Yd = frame.to_data(Ud, Vd)
-            level = 1000 * (ink_idx + 1)
-            for r, a, b in zip(rows, s, e):
-                segments.append({'type': 'hatch', 'seg': np.column_stack([Xd[r, a:b], Yd[r, a:b]]),
-                                 'level': level, 'pen_id': pen_id})
+            rows, lines = _run_polylines(on, Ud, Vd)
+            if join:
+                lines = join_neighbouring_runs(rows, lines, 1.6 * line_spacing)
+            segments.extend(_emit(frame, lines, pen_id, level))
 
         elif "Variable" in strategy:
             dt = SAMPLE_STEP_MM
@@ -358,7 +627,10 @@ def generate_hatches(rgb, rgb_bounds, view_extent, params, progress_callback=Non
             thr = (_bitrev(j % 16, 4) + 0.5) / 16.0
             on = (d >= thr[:, None]) & inside
             on = _clean_runs(on, inside, dt)
-            segments.extend(_straight_segments(frame, on, U, V, pen_id, 1000 * (ink_idx + 1)))
+            rows, lines = _straight_runs(on, U, V)
+            if join:
+                lines = join_neighbouring_runs(rows, lines, 1.6 * spacing)
+            segments.extend(_emit(frame, lines, pen_id, level))
 
         else:
             # Multi-pass thresholded crosshatch. Pass n turns on where the target is closer to
@@ -375,7 +647,10 @@ def generate_hatches(rgb, rgb_bounds, view_extent, params, progress_callback=Non
                 d = raster.sample(*frame.to_lonlat(U, V)) * inside
                 on = (d >= thr) & inside
                 on = _clean_runs(on, inside, dt)
-                segments.extend(_straight_segments(frame, on, U, V, pen_id, 1000 * (ink_idx + 1) + p))
+                rows, lines = _straight_runs(on, U, V)
+                if join:
+                    lines = join_neighbouring_runs(rows, lines, 1.6 * spacing)
+                segments.extend(_emit(frame, lines, pen_id, level + p))
 
-    if progress_callback: progress_callback(f"Hatching complete ({len(segments)} strokes).")
+    if progress_callback: progress_callback(f"Fill complete ({len(segments):,} strokes).")
     return segments

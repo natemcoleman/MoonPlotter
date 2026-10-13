@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QRadioButton, QCheckBox, QComboBox, QSplitter,
                              QFileDialog, QMessageBox, QFrame, QButtonGroup,
                              QInputDialog, QColorDialog, QSlider, QScrollArea, QSpinBox, QCompleter,
-                             QProgressBar, QDoubleSpinBox)
+                             QProgressBar, QDoubleSpinBox, QGridLayout)
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from PyQt6.QtGui import QDoubleValidator, QIntValidator, QShortcut, QKeySequence, QIcon
 
@@ -32,9 +32,32 @@ import matplotlib.patches as patches
 
 # Geometry & Local Imports
 from shapely.geometry import box as shp_box, LineString
-from config import (DATA_FILES, PAPER_SIZES, PT_PER_MM, PLANET_RADII, INK_SETS, DEFAULT_INK_SET, MONO_INK_SET,
-                    MIN_SEGMENT_MM, DEFAULT_HATCH_SPACING_MM, load_pens, save_pens)
+from config import (DATA_FILES, PAPER_SIZES, PT_PER_MM, PLANET_RADII, INK_SETS, DEFAULT_INK_SET, MONO_INK_SETS,
+                    DEFAULT_MONO_INK_SET, TAHOE, MIN_SEGMENT_MM, DEFAULT_HATCH_SPACING_MM, load_pens, save_pens)
 from workers import RenderWorker
+from hatch_engine import composite_ink_layers, STRATEGIES
+from theme import apply_theme, style_axes, SEPIA, ACCENT, TEXT, MUTED
+from ui_widgets import CollapsibleSection, LayerPanel, swatch_icon
+
+SEL_FILL = SEPIA        # selection rectangle on the source map
+SEL_EDGE = SEPIA
+ZOOM_FILL = ACCENT
+LAYER_LABELS = {'contours': 'Contours', 'borders': 'Borders & markers', 'annotations': 'Text & drawn lines'}
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def app_icon():
+    """Multi-size icon resolved next to this script (not the current working directory)."""
+    icon = QIcon()
+    for name in ("icon.ico", "icon.png", "icon.jpg"):
+        path = os.path.join(APP_DIR, name)
+        if os.path.exists(path):
+            icon = QIcon(path)
+            if not icon.isNull():
+                break
+    return icon
 
 import warnings
 from rasterio.errors import NotGeoreferencedWarning
@@ -86,8 +109,8 @@ class PlotterApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Topo Plotter Studio - Cartographer Edition")
-        self.setWindowIcon(QIcon("icon.jpg"))
-        self.resize(1000, 1200)
+        self.setWindowIcon(app_icon())
+        self.resize(1500, 500)
 
         self.active_planet = 'Earth'
         self.paper_name = '100x100mm (Default)'
@@ -102,6 +125,9 @@ class PlotterApp(QMainWindow):
         self.is_calculating = False
         self.recalc_pending = False
         self.pending_fresh = False
+        self.interval_auto_done = False   # an auto interval has been picked for the current selection
+        self.layer_visible = {}           # layer key -> bool (missing = visible)
+        self._visible_idx = []            # preview collection index -> dem_segments index
         self._workers = set()      # keeps QThread objects alive until they have fully exited
         self._render_token = 0     # bumped when the selection/planet changes; stale results are dropped
         self.worker = None
@@ -128,6 +154,12 @@ class PlotterApp(QMainWindow):
         self.transform_start_state = None
 
         # Debounce timer for sliders
+        # Debounced re-render of the subtractive ink preview (after zoom/pan/resize)
+        self.ink_image = None
+        self.ink_timer = QTimer()
+        self.ink_timer.setSingleShot(True)
+        self.ink_timer.timeout.connect(self._refresh_ink_sim)
+
         self.recalc_timer = QTimer()
         self.recalc_timer.setSingleShot(True)
         self.recalc_timer.timeout.connect(self.trigger_recalc)
@@ -141,120 +173,105 @@ class PlotterApp(QMainWindow):
         QShortcut(QKeySequence("Ctrl+Shift+Z"), self).activated.connect(self.redo_action)
         QShortcut(QKeySequence("Ctrl+Y"), self).activated.connect(self.redo_action)
 
+    # ------------------------------------------------------------------
+    # UI CONSTRUCTION
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _field(label_text, widget, hint=None):
+        """Label above a control (sidebar form row)."""
+        box = QWidget()
+        v = QVBoxLayout(box)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(2)
+        lbl = QLabel(label_text)
+        lbl.setObjectName("fieldLabel")
+        v.addWidget(lbl)
+        if isinstance(widget, QHBoxLayout):
+            v.addLayout(widget)
+        else:
+            v.addWidget(widget)
+        if hint:
+            h = QLabel(hint)
+            h.setObjectName("hint")
+            h.setWordWrap(True)
+            v.addWidget(h)
+        return box
+
+    @staticmethod
+    def _slider_row(slider, value_label):
+        w = QWidget()
+        h = QHBoxLayout(w)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.addWidget(slider, 1)
+        value_label.setObjectName("value")
+        value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        h.addWidget(value_label)
+        return w
+
     def init_ui(self):
         main_widget = QWidget()
+        main_widget.setObjectName("central")
         self.setCentralWidget(main_widget)
         main_layout = QHBoxLayout(main_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
 
-        # --- LEFT PANEL: CONTROLS ---
-        left_panel = QWidget()
-        left_panel.setFixedWidth(340)
-        vbox = QVBoxLayout(left_panel)
+        # ================= SIDEBAR =================
+        sidebar = QWidget()
+        sidebar.setObjectName("sidebar")
+        sidebar.setFixedWidth(330)
+        side_v = QVBoxLayout(sidebar)
+        side_v.setContentsMargins(0, 0, 0, 0)
+        side_v.setSpacing(0)
+
+        header = QWidget()
+        hv = QVBoxLayout(header)
+        hv.setContentsMargins(16, 14, 16, 8)
+        hv.setSpacing(0)
+        t = QLabel("Topo Plotter Studio")
+        t.setObjectName("appTitle")
+        st = QLabel("Cartographer Edition")
+        st.setObjectName("appSubtitle")
+        hv.addWidget(t)
+        hv.addWidget(st)
+        side_v.addWidget(header)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        body = QWidget()
+        body.setObjectName("sidebarBody")
+        vbox = QVBoxLayout(body)
+        vbox.setContentsMargins(14, 4, 14, 8)
+        vbox.setSpacing(4)
         vbox.setAlignment(Qt.AlignmentFlag.AlignTop)
+        scroll.setWidget(body)
+        side_v.addWidget(scroll, 1)
 
-        vbox.addWidget(QLabel("<b>Planet Source</b>"))
-        self.radio_earth = QRadioButton("Earth (Local)")
-        self.radio_moon = QRadioButton("Moon (Local)")
+        # ---------- SOURCE ----------
+        sec_src = CollapsibleSection("Source")
+        self.radio_earth = QRadioButton("Earth")
+        self.radio_moon = QRadioButton("Moon")
+        self.radio_mars = QRadioButton("Mars")
         self.radio_earth.setChecked(True)
-        self.radio_earth.toggled.connect(self.switch_planet)
+        mars_files = DATA_FILES['Mars']
+        if not (os.path.exists(mars_files['dem']) or os.path.exists(mars_files['color'])):
+            self.radio_mars.setEnabled(False)
+            self.radio_mars.setToolTip("Download the USGS Mars files into the project folder:\n"
+                                       f"{mars_files['dem']}\n{mars_files['color']}")
+        for r in (self.radio_earth, self.radio_moon, self.radio_mars):
+            r.toggled.connect(lambda checked: checked and self.switch_planet())
         h_planet = QHBoxLayout()
-        h_planet.addWidget(self.radio_earth)
-        h_planet.addWidget(self.radio_moon)
-        vbox.addLayout(h_planet)
+        for r in (self.radio_earth, self.radio_moon, self.radio_mars):
+            h_planet.addWidget(r)
+        h_planet.addStretch()
+        sec_src.add(self._field("Planet", h_planet))
 
-        # Rendering Mode Settings
-        vbox.addSpacing(10)
-        vbox.addWidget(QLabel("<b>Plot Rendering Mode</b>"))
-        self.combo_mode = QComboBox()
-        self.combo_mode.addItems(
-            ["Topography (DEM)", "Monochrome Hatch (Color Map)", "Color Separation (Color Map)"])
-        self.combo_mode.currentTextChanged.connect(self.on_mode_changed)
-        vbox.addWidget(self.combo_mode)
-
-        self.lbl_hatch = QLabel("Hatching Strategy:")
-        self.combo_hatch = QComboBox()
-        self.combo_hatch.addItems(["Multi-Pass Thresholded", "Variable Spacing Scanlines", "Modulated Sine Squiggles"])
-        self.combo_hatch.currentTextChanged.connect(lambda _: self.recalc_timer.start(150))
-        vbox.addWidget(self.lbl_hatch)
-        vbox.addWidget(self.combo_hatch)
-
-        self.lbl_ink_set = QLabel("Ink Set / Paper:")
-        self.combo_ink_set = QComboBox()
-        self.combo_ink_set.addItems(list(INK_SETS.keys()))
-        self.combo_ink_set.setCurrentText(DEFAULT_INK_SET)
-        self.combo_ink_set.currentTextChanged.connect(lambda _: self.recalc_timer.start(150))
-        vbox.addWidget(self.lbl_ink_set)
-        vbox.addWidget(self.combo_ink_set)
-
-        self.widget_hatch_opts = QWidget()
-        h_hopt = QHBoxLayout(self.widget_hatch_opts)
-        h_hopt.setContentsMargins(0, 0, 0, 0)
-        h_hopt.addWidget(QLabel("Line spacing (mm):"))
-        self.spin_spacing = QDoubleSpinBox()
-        self.spin_spacing.setRange(0.3, 5.0)
-        self.spin_spacing.setSingleStep(0.1)
-        self.spin_spacing.setDecimals(2)
-        self.spin_spacing.setValue(DEFAULT_HATCH_SPACING_MM)
-        self.spin_spacing.valueChanged.connect(lambda _: self.recalc_timer.start(400))
-        h_hopt.addWidget(self.spin_spacing)
-        self.chk_auto_contrast = QCheckBox("Auto contrast")
-        self.chk_auto_contrast.setChecked(True)
-        self.chk_auto_contrast.toggled.connect(self.trigger_recalc)
-        h_hopt.addWidget(self.chk_auto_contrast)
-        vbox.addWidget(self.widget_hatch_opts)
-
-        vbox.addSpacing(10)
-        vbox.addWidget(QLabel("<b>Map Options</b>"))
-
-        self.chk_ocean = QCheckBox("Plot Ocean/Crater Depths")
-        self.chk_ocean.setChecked(True)
-        self.chk_ocean.toggled.connect(self.trigger_recalc)
-
-        self.chk_borders = QCheckBox("Show Color Map Borders")
-        self.chk_borders.setChecked(True)
-        self.chk_borders.toggled.connect(self.toggle_borders)
-
-        self.chk_apollo = QCheckBox("Show Apollo Landing Sites")
-        self.chk_apollo.setChecked(False)
-        self.chk_apollo.setStyleSheet("color: #8E44AD; font-weight: bold;")
-        self.chk_apollo.toggled.connect(self.toggle_apollo)
-
-        self.chk_plot_borders = QCheckBox("Plot Borders (Index Pen)")
-        self.chk_plot_borders.setChecked(True)
-        self.chk_plot_borders.setStyleSheet("color: #2E86C1; font-weight: bold;")
-        self.chk_plot_borders.toggled.connect(self.trigger_recalc)
-
-        self.chk_circle = QCheckBox("Circle Mode (Hemisphere)")
-        self.chk_circle.setChecked(False)
-        self.chk_circle.setStyleSheet("color: #D35400; font-weight: bold;")
-        self.chk_circle.toggled.connect(self.toggle_circle_mode)
-
-        self.chk_blue_water = QCheckBox("Use blue pen for underwater (<0m)")
-        self.chk_blue_water.setChecked(True)
-        self.chk_blue_water.toggled.connect(self.trigger_recalc)
-
-        self.chk_mask_text = QCheckBox("Clear background behind Text")
-        self.chk_mask_text.setChecked(True)
-        self.chk_mask_text.setStyleSheet("color: #2E86C1; font-weight: bold;")
-        self.chk_mask_text.toggled.connect(self.render_canvas)
-
-        vbox.addWidget(self.chk_ocean)
-        vbox.addWidget(self.chk_borders)
-        vbox.addWidget(self.chk_apollo)
-        vbox.addWidget(self.chk_plot_borders)
-        vbox.addWidget(self.chk_circle)
-        vbox.addWidget(self.chk_blue_water)
-        vbox.addWidget(self.chk_mask_text)
-
-        # Region Masking UI
-        self.lbl_region = QLabel("<b>Region Masking (Clip to border)</b>")
-        vbox.addWidget(self.lbl_region)
         self.combo_region = QComboBox()
         self.combo_region.setEditable(True)
         self.combo_region.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self.combo_region.addItem("None (Plot Full Selection)")
         self.combo_region.addItem("Lake Tahoe (High-Res Bathymetry)")
-
         if HAS_GPD:
             regions = []
             w_col = 'NAME' if 'NAME' in world_borders.columns else 'name' if 'name' in world_borders.columns else None
@@ -267,18 +284,34 @@ class PlotterApp(QMainWindow):
             completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
             completer.setFilterMode(Qt.MatchFlag.MatchContains)
             self.combo_region.setCompleter(completer)
-
         self.combo_region.currentTextChanged.connect(self.on_region_changed)
-        vbox.addWidget(self.combo_region)
+        self.lbl_region = sec_src.add(self._field("Clip to region", self.combo_region))
 
-        # Paper Size
-        vbox.addSpacing(10)
-        vbox.addWidget(QLabel("<b>Paper / Bed Size</b>"))
+        self.chk_circle = QCheckBox("Circle mode (whole hemisphere)")
+        self.chk_circle.toggled.connect(self.toggle_circle_mode)
+        sec_src.add(self.chk_circle)
+        self.chk_borders = QCheckBox("Show borders on the source map")
+        self.chk_borders.setChecked(True)
+        self.chk_borders.toggled.connect(self.toggle_borders)
+        sec_src.add(self.chk_borders)
+        self.chk_apollo = QCheckBox("Apollo landing sites")
+        self.chk_apollo.setToolTip("Marks the six crewed landing sites on the map and plots red crosshairs.")
+        self.chk_apollo.toggled.connect(self.toggle_apollo)
+        sec_src.add(self.chk_apollo)
+        vbox.addWidget(sec_src)
+
+        # ---------- PAPER ----------
+        sec_paper = CollapsibleSection("Paper")
         self.combo_paper = QComboBox()
         self.combo_paper.addItems(list(PAPER_SIZES.keys()))
         self.combo_paper.currentTextChanged.connect(self.change_paper)
-        vbox.addWidget(self.combo_paper)
-
+        self.btn_orientation = QPushButton("Rotate")
+        self.btn_orientation.setToolTip("Toggle portrait / landscape")
+        self.btn_orientation.clicked.connect(self.toggle_orientation)
+        h_paper = QHBoxLayout()
+        h_paper.addWidget(self.combo_paper, 1)
+        h_paper.addWidget(self.btn_orientation)
+        sec_paper.add(self._field("Bed / paper size", h_paper))
         self.widget_custom = QWidget()
         h_custom = QHBoxLayout(self.widget_custom)
         h_custom.setContentsMargins(0, 0, 0, 0)
@@ -286,206 +319,285 @@ class PlotterApp(QMainWindow):
         self.txt_ch = QLineEdit("150")
         self.txt_cw.textChanged.connect(self.update_paper_dims)
         self.txt_ch.textChanged.connect(self.update_paper_dims)
-        h_custom.addWidget(QLabel("W:"));
+        h_custom.addWidget(QLabel("W"))
         h_custom.addWidget(self.txt_cw)
-        h_custom.addWidget(QLabel("H:"));
+        h_custom.addWidget(QLabel("H"))
         h_custom.addWidget(self.txt_ch)
+        h_custom.addWidget(QLabel("mm"))
         self.widget_custom.setVisible(False)
-        vbox.addWidget(self.widget_custom)
+        sec_paper.add(self.widget_custom)
+        vbox.addWidget(sec_paper)
 
-        self.btn_orientation = QPushButton("Toggle Portrait/Landscape")
-        self.btn_orientation.clicked.connect(self.toggle_orientation)
-        vbox.addWidget(self.btn_orientation)
-
-        # --- CONTOUR SPECIFIC CONTROLS ---
-        line2 = QFrame();
-        line2.setFrameShape(QFrame.Shape.HLine);
-        vbox.addWidget(line2)
-
-        self.lbl_contour_hdr = QLabel("<b>Contour Generation</b>")
-        vbox.addWidget(self.lbl_contour_hdr)
-
-        self.lbl_usgs_interval = QLabel("Interval: Auto (USGS Scale)")
-        self.lbl_usgs_interval.setStyleSheet("color: #8E44AD; font-weight: bold;")
-        vbox.addWidget(self.lbl_usgs_interval)
+        # ---------- CONTOURS LAYER ----------
+        self.sec_contours = CollapsibleSection("Contours", checkable=True, checked=True)
+        self.sec_contours.enabled_changed.connect(self.on_layers_changed)
+        self.lbl_usgs_interval = QLabel("Interval: Auto")
+        self.lbl_usgs_interval.setObjectName("intervalBadge")
+        self.sec_contours.add(self.lbl_usgs_interval)
 
         self.widget_interval = QWidget()
         h_int = QHBoxLayout(self.widget_interval)
         h_int.setContentsMargins(0, 0, 0, 0)
-        h_int.addWidget(QLabel("Override (ft):"))
         self.slider_int = QSlider(Qt.Orientation.Horizontal)
         self.slider_int.setRange(50, 10000)
         self.slider_int.setSingleStep(50)
         self.slider_int.setValue(self.interval_ft)
         self.txt_int = QLineEdit(str(self.interval_ft))
-        self.txt_int.setValidator(QIntValidator(1, 20000))
-        self.txt_int.setFixedWidth(55)
+        self.txt_int.setValidator(QIntValidator(1, 50000))
+        self.txt_int.setFixedWidth(60)
         self.slider_int.valueChanged.connect(lambda v: self.txt_int.setText(str(v)))
         self.txt_int.textChanged.connect(self.update_interval)
-        h_int.addWidget(self.slider_int);
+        h_int.addWidget(self.slider_int, 1)
         h_int.addWidget(self.txt_int)
-        vbox.addWidget(self.widget_interval)
+        h_int.addWidget(QLabel("ft"))
+        self.sec_contours.add(self._field("Interval override", self.widget_interval))
 
         self.widget_index = QWidget()
         h_idx = QHBoxLayout(self.widget_index)
         h_idx.setContentsMargins(0, 0, 0, 0)
-        self.chk_auto_index = QCheckBox("Auto-Index lines every")
+        self.chk_auto_index = QCheckBox("Index line every")
         self.chk_auto_index.setChecked(True)
         self.spin_idx = QSpinBox()
         self.spin_idx.setRange(2, 20)
         self.spin_idx.setValue(5)
-        self.spin_idx.setFixedWidth(40)
-        h_idx.addWidget(self.chk_auto_index);
-        h_idx.addWidget(self.spin_idx);
-        h_idx.addWidget(QLabel("intervals"))
+        self.spin_idx.setFixedWidth(52)
+        h_idx.addWidget(self.chk_auto_index)
+        h_idx.addWidget(self.spin_idx)
+        h_idx.addWidget(QLabel("lines"))
         h_idx.addStretch()
         self.chk_auto_index.toggled.connect(self.trigger_recalc)
         self.spin_idx.valueChanged.connect(self.trigger_recalc)
-        vbox.addWidget(self.widget_index)
+        self.sec_contours.add(self.widget_index)
 
-        self.lbl_smooth_hdr = QLabel("<b>Vector Smoothing (USGS Parameters)</b>")
-        vbox.addWidget(self.lbl_smooth_hdr)
-
+        self.lbl_smooth_hdr = QLabel("Generalisation")
+        self.lbl_smooth_hdr.setObjectName("fieldLabel")
+        self.sec_contours.add(self.lbl_smooth_hdr)
         self.widget_presets = QWidget()
         h_presets = QHBoxLayout(self.widget_presets)
         h_presets.setContentsMargins(0, 0, 0, 0)
-        btn_low = QPushButton("Low");
-        btn_low.clicked.connect(lambda: self.apply_usgs_preset(8, 128))
-        btn_med = QPushButton("Medium");
-        btn_med.clicked.connect(lambda: self.apply_usgs_preset(40, 640))
-        btn_high = QPushButton("High");
-        btn_high.clicked.connect(lambda: self.apply_usgs_preset(160, 2560))
-        h_presets.addWidget(QLabel("Presets:"));
-        h_presets.addWidget(btn_low);
-        h_presets.addWidget(btn_med);
-        h_presets.addWidget(btn_high)
-        vbox.addWidget(self.widget_presets)
+        for name, simp, smooth in (("Low", 8, 128), ("Medium", 40, 640), ("High", 160, 2560)):
+            b = QPushButton(name)
+            b.clicked.connect(lambda _=False, a=simp, c=smooth: self.apply_usgs_preset(a, c))
+            h_presets.addWidget(b)
+        self.sec_contours.add(self.widget_presets)
 
-        self.widget_blur = QWidget()
-        h_blur = QHBoxLayout(self.widget_blur)
-        h_blur.setContentsMargins(0, 0, 0, 0)
-        h_blur.addWidget(QLabel("Raster Blur \u03c3:"))
         self.slider_blur = QSlider(Qt.Orientation.Horizontal)
         self.slider_blur.setRange(0, 50)
-        self.slider_blur.setValue(0)
         self.lbl_blur_val = QLabel("0.0")
         self.slider_blur.valueChanged.connect(
             lambda v: (self.lbl_blur_val.setText(f"{v / 10.0:.1f}"), self.recalc_timer.start(150)))
-        h_blur.addWidget(self.slider_blur);
-        h_blur.addWidget(self.lbl_blur_val)
-        vbox.addWidget(self.widget_blur)
+        self.widget_blur = self.sec_contours.add(
+            self._field("Raster blur σ (px)", self._slider_row(self.slider_blur, self.lbl_blur_val)))
 
-        self.widget_simplify = QWidget()
-        h_simp = QHBoxLayout(self.widget_simplify)
-        h_simp.setContentsMargins(0, 0, 0, 0)
-        h_simp.addWidget(QLabel("Simplify Tol:"))
         self.slider_simp = QSlider(Qt.Orientation.Horizontal)
         self.slider_simp.setRange(0, 250)
         self.slider_simp.setValue(40)
-        self.lbl_simp_val = QLabel("4.0m")
+        self.lbl_simp_val = QLabel("4.0 m")
         self.slider_simp.valueChanged.connect(
-            lambda v: (self.lbl_simp_val.setText(f"{v / 10.0:.1f}m"), self.recalc_timer.start(150)))
-        h_simp.addWidget(self.slider_simp);
-        h_simp.addWidget(self.lbl_simp_val)
-        vbox.addWidget(self.widget_simplify)
+            lambda v: (self.lbl_simp_val.setText(f"{v / 10.0:.1f} m"), self.recalc_timer.start(150)))
+        self.widget_simplify = self.sec_contours.add(
+            self._field("Simplify tolerance", self._slider_row(self.slider_simp, self.lbl_simp_val)))
 
-        self.widget_smooth = QWidget()
-        h_smooth = QHBoxLayout(self.widget_smooth)
-        h_smooth.setContentsMargins(0, 0, 0, 0)
-        h_smooth.addWidget(QLabel("Smoothing:"))
         self.slider_smooth = QSlider(Qt.Orientation.Horizontal)
         self.slider_smooth.setRange(0, 3000)
         self.slider_smooth.setValue(640)
-        self.lbl_smooth_val = QLabel("64.0m")
+        self.lbl_smooth_val = QLabel("64.0 m")
         self.slider_smooth.valueChanged.connect(
-            lambda v: (self.lbl_smooth_val.setText(f"{v / 10.0:.1f}m"), self.recalc_timer.start(150)))
-        h_smooth.addWidget(self.slider_smooth);
-        h_smooth.addWidget(self.lbl_smooth_val)
-        vbox.addWidget(self.widget_smooth)
+            lambda v: (self.lbl_smooth_val.setText(f"{v / 10.0:.1f} m"), self.recalc_timer.start(150)))
+        self.widget_smooth = self.sec_contours.add(
+            self._field("Smoothing", self._slider_row(self.slider_smooth, self.lbl_smooth_val)))
 
+        self.chk_tanaka = QCheckBox("Illuminated contours (Tanaka)")
+        self.chk_tanaka.setToolTip("Thin pen on slopes facing a north-west light, thick pen on the shadowed side.")
+        self.chk_tanaka.toggled.connect(self.trigger_recalc)
+        self.sec_contours.add(self.chk_tanaka)
+        self.chk_ocean = QCheckBox("Plot ocean / crater depths")
+        self.chk_ocean.setChecked(True)
+        self.chk_ocean.toggled.connect(self.trigger_recalc)
+        self.sec_contours.add(self.chk_ocean)
+        self.chk_blue_water = QCheckBox("Blue pen below sea level")
+        self.chk_blue_water.setChecked(True)
+        self.chk_blue_water.toggled.connect(self.trigger_recalc)
+        self.sec_contours.add(self.chk_blue_water)
+        self.chk_plot_borders = QCheckBox("Plot country / state borders")
+        self.chk_plot_borders.setChecked(True)
+        self.chk_plot_borders.toggled.connect(self.trigger_recalc)
+        self.sec_contours.add(self.chk_plot_borders)
+        self.lbl_contour_hdr = self.sec_contours      # kept for older code paths
+        vbox.addWidget(self.sec_contours)
+
+        # ---------- FILL / HATCHING LAYER ----------
+        self.sec_fill = CollapsibleSection("Fill / Hatching", checkable=True, checked=False)
+        self.sec_fill.enabled_changed.connect(self.on_layers_changed)
+        self.combo_hatch = QComboBox()
+        self.combo_hatch.addItems(STRATEGIES)
+        self.combo_hatch.currentTextChanged.connect(lambda _: (self.context_ui_update(), self.recalc_timer.start(150)))
+        self.lbl_hatch = self.sec_fill.add(self._field("Pattern", self.combo_hatch))
+
+        self.combo_source = QComboBox()
+        self.combo_source.addItems(["Color map", "Hillshade", "Color map × Hillshade"])
+        self.combo_source.setToolTip("What drives the tone: the colour image, light/shadow computed from\n"
+                                     "the elevation data, or both multiplied together.")
+        self.combo_source.currentTextChanged.connect(lambda _: self.recalc_timer.start(150))
+        self.lbl_source = self.sec_fill.add(self._field("Tone source", self.combo_source))
+
+        self.combo_inks = QComboBox()
+        self.combo_inks.addItems(["Monochrome", "Color separation"])
+        self.combo_inks.currentTextChanged.connect(lambda _: (self.context_ui_update(), self.recalc_timer.start(150)))
+        self.lbl_inks = self.sec_fill.add(self._field("Inks", self.combo_inks))
+
+        self.combo_mono_pen = QComboBox()
+        self.combo_mono_pen.addItems(list(MONO_INK_SETS.keys()))
+        self.combo_mono_pen.setCurrentText(DEFAULT_MONO_INK_SET)
+        self.combo_mono_pen.currentTextChanged.connect(lambda _: self.recalc_timer.start(150))
+        self.lbl_mono_pen = self.sec_fill.add(self._field("Pen", self.combo_mono_pen))
+
+        self.combo_ink_set = QComboBox()
+        self.combo_ink_set.addItems(list(INK_SETS.keys()))
+        self.combo_ink_set.setCurrentText(DEFAULT_INK_SET)
+        self.combo_ink_set.currentTextChanged.connect(lambda _: self.recalc_timer.start(150))
+        self.lbl_ink_set = self.sec_fill.add(self._field("Ink set / paper", self.combo_ink_set))
+
+        self.spin_spacing = QDoubleSpinBox()
+        self.spin_spacing.setRange(0.3, 5.0)
+        self.spin_spacing.setSingleStep(0.1)
+        self.spin_spacing.setDecimals(2)
+        self.spin_spacing.setSuffix(" mm")
+        self.spin_spacing.setValue(DEFAULT_HATCH_SPACING_MM)
+        self.spin_spacing.valueChanged.connect(lambda _: self.recalc_timer.start(400))
+        self.widget_hatch_opts = self.sec_fill.add(self._field(
+            "Line / dot spacing", self.spin_spacing, "Wider spacing gives thick pens more tonal steps."))
+
+        self.slider_tone = QSlider(Qt.Orientation.Horizontal)
+        self.slider_tone.setRange(-100, 100)
+        self.slider_tone.setValue(0)
+        self.lbl_tone_val = QLabel("0")
+        self.slider_tone.valueChanged.connect(
+            lambda v: (self.lbl_tone_val.setText(f"{v:+d}" if v else "0"), self.recalc_timer.start(300)))
+        tone_row = self._slider_row(self.slider_tone, self.lbl_tone_val)
+        self.widget_tone = self.sec_fill.add(self._field(
+            "Tone  (lighter ← → darker)", tone_row,
+            "Gel ink spreads into paper; pull this left if plots come out too dark."))
+
+        self.chk_auto_contrast = QCheckBox("Auto contrast")
+        self.chk_auto_contrast.setChecked(True)
+        self.chk_auto_contrast.toggled.connect(self.trigger_recalc)
+        self.sec_fill.add(self.chk_auto_contrast)
+        self.chk_join = QCheckBox("Join neighbouring lines (zigzag)")
+        self.chk_join.setChecked(True)
+        self.chk_join.setToolTip("Links the end of each stroke to the next line - far fewer pen lifts.")
+        self.chk_join.toggled.connect(self.trigger_recalc)
+        self.sec_fill.add(self.chk_join)
+        vbox.addWidget(self.sec_fill)
         vbox.addStretch()
+        # Long combo entries (ink-set names) must not widen the sidebar past its scroll area.
+        for cb in body.findChildren(QComboBox):
+            cb.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            cb.setMinimumContentsLength(8)
+
+        # ---------- FOOTER (always visible) ----------
+        footer = QWidget()
+        footer.setObjectName("footer")
+        fv = QVBoxLayout(footer)
+        fv.setContentsMargins(14, 10, 14, 14)
+        fv.setSpacing(6)
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 0)
+        self.progress_bar.setTextVisible(False)
         self.progress_bar.setVisible(False)
-        vbox.addWidget(self.progress_bar)
-
-        self.lbl_status = QLabel("Ready.")
-        self.lbl_status.setStyleSheet("color: gray; font-style: italic;")
-        vbox.addWidget(self.lbl_status)
-
-        self.btn_draw = QPushButton("1. DRAW MAP")
-        self.btn_draw.setStyleSheet("background-color: #2E86C1; color: white; font-weight: bold; padding: 10px;")
+        fv.addWidget(self.progress_bar)
+        self.lbl_status = QLabel("Drag a box on the map to choose an area.")
+        self.lbl_status.setObjectName("status")
+        self.lbl_status.setWordWrap(True)
+        fv.addWidget(self.lbl_status)
+        self.btn_draw = QPushButton("Draw Map")
+        self.btn_draw.setObjectName("primary")
+        self.btn_draw.setShortcut("Ctrl+Return")
+        self.btn_draw.setToolTip("Render the selection (Ctrl+Enter)")
         self.btn_draw.clicked.connect(self.draw_action)
-        vbox.addWidget(self.btn_draw)
-
-        self.btn_export_svg = QPushButton("2. SAVE SVG (Editable)")
-        self.btn_export_svg.setStyleSheet("background-color: #8E44AD; color: white; font-weight: bold; padding: 10px;")
+        fv.addWidget(self.btn_draw)
+        h_exp = QHBoxLayout()
+        self.btn_export_svg = QPushButton("Save SVG")
         self.btn_export_svg.clicked.connect(self.export_svg_action)
-        vbox.addWidget(self.btn_export_svg)
-
-        self.btn_export = QPushButton("3. GENERATE MULTI-PEN G-CODE")
-        self.btn_export.setStyleSheet("background-color: #28B463; color: white; font-weight: bold; padding: 10px;")
+        self.btn_export = QPushButton("Export G-code")
         self.btn_export.clicked.connect(self.export_action)
-        vbox.addWidget(self.btn_export)
+        h_exp.addWidget(self.btn_export_svg)
+        h_exp.addWidget(self.btn_export)
+        fv.addLayout(h_exp)
+        side_v.addWidget(footer)
 
-        # --- RIGHT PANELS: CANVASES ---
+        # ================= WORKSPACE =================
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
 
-        # Color Map
-        map_widget = QWidget();
-        v_map = QVBoxLayout(map_widget);
-        v_map.setContentsMargins(0, 0, 0, 0)
-        self.fig_map = Figure(figsize=(5, 5), dpi=100);
+        # --- Source map card ---
+        map_card = QFrame()
+        map_card.setObjectName("card")
+        v_map = QVBoxLayout(map_card)
+        v_map.setContentsMargins(10, 10, 10, 8)
+        map_title = QLabel("SOURCE MAP")
+        map_title.setObjectName("panelTitle")
+        v_map.addWidget(map_title)
+        self.fig_map = Figure(figsize=(5, 5), dpi=100)
         self.ax_map = self.fig_map.add_subplot(111)
         self.canvas_map = FigureCanvas(self.fig_map)
-        v_map.addWidget(self.canvas_map)
-
+        v_map.addWidget(self.canvas_map, 1)
         h_toolbar = QHBoxLayout()
-        self.btn_home = QPushButton("Reset View")
+        self.btn_home = QPushButton("Reset view")
+        self.btn_home.setObjectName("ghost")
         self.btn_home.clicked.connect(self.reset_home_view)
-        self.btn_zoom_tool = QPushButton("Zoom Map")
+        self.btn_zoom_tool = QPushButton("Zoom box")
         self.btn_zoom_tool.setCheckable(True)
         self.btn_zoom_tool.toggled.connect(self.toggle_zoom_tool)
-        self.btn_clear_sel = QPushButton("Clear Map")
+        self.btn_clear_sel = QPushButton("Clear")
+        self.btn_clear_sel.setObjectName("ghost")
         self.btn_clear_sel.clicked.connect(self.clear_selection)
-        h_toolbar.addWidget(self.btn_home);
+        hint_map = QLabel("Drag to select · scroll to zoom · middle-drag to pan")
+        hint_map.setObjectName("hint")
         h_toolbar.addWidget(self.btn_zoom_tool)
-        h_toolbar.addWidget(QLabel("<i>(Mid-click to pan)</i>"));
-        h_toolbar.addStretch()
+        h_toolbar.addWidget(self.btn_home)
+        h_toolbar.addWidget(hint_map, 1)
         h_toolbar.addWidget(self.btn_clear_sel)
         v_map.addLayout(h_toolbar)
-        splitter.addWidget(map_widget)
+        splitter.addWidget(map_card)
 
-        # Preview Container & Paint Palette
-        prev_widget = QWidget();
-        v_prev = QVBoxLayout(prev_widget);
-        v_prev.setContentsMargins(0, 0, 0, 0)
-        self.fig_prev = Figure(figsize=(5, 5), dpi=100);
+        # --- Preview card (canvas + tools) and layers panel ---
+        prev_card = QFrame()
+        prev_card.setObjectName("card")
+        prev_outer = QHBoxLayout(prev_card)
+        prev_outer.setContentsMargins(10, 10, 10, 8)
+        prev_outer.setSpacing(12)
+        prev_col = QVBoxLayout()
+        prev_title = QLabel("PLOT PREVIEW")
+        prev_title.setObjectName("panelTitle")
+        prev_col.addWidget(prev_title)
+        self.fig_prev = Figure(figsize=(5, 5), dpi=100)
         self.ax_prev = self.fig_prev.add_subplot(111)
         self.canvas_prev = FigureCanvas(self.fig_prev)
-        v_prev.addWidget(self.canvas_prev)
+        prev_col.addWidget(self.canvas_prev, 1)
 
         h_prev_toolbar = QHBoxLayout()
-        self.btn_prev_home = QPushButton("Reset View")
-        self.btn_prev_home.clicked.connect(self.reset_prev_view)
-        self.btn_prev_zoom = QPushButton("Zoom Preview")
+        self.btn_prev_zoom = QPushButton("Zoom box")
         self.btn_prev_zoom.setCheckable(True)
         self.btn_prev_zoom.toggled.connect(self.toggle_prev_zoom)
-        h_prev_toolbar.addWidget(self.btn_prev_home);
+        self.btn_prev_home = QPushButton("Fit page")
+        self.btn_prev_home.setObjectName("ghost")
+        self.btn_prev_home.clicked.connect(self.reset_prev_view)
+        hint_prev = QLabel("Scroll to zoom · middle-drag to pan")
+        hint_prev.setObjectName("hint")
         h_prev_toolbar.addWidget(self.btn_prev_zoom)
-        h_prev_toolbar.addWidget(QLabel("<i>(Scroll to zoom, Mid-click to pan)</i>"));
-        h_prev_toolbar.addStretch()
-        v_prev.addLayout(h_prev_toolbar)
+        h_prev_toolbar.addWidget(self.btn_prev_home)
+        h_prev_toolbar.addWidget(hint_prev, 1)
+        prev_col.addLayout(h_prev_toolbar)
 
-        # Tool Palette
-        self.frame_palette = QFrame()
-        self.frame_palette.setStyleSheet("background-color: #FDFEFE; border: 1px solid #D5D8DC; border-radius: 5px;")
+        # Tool palette
+        self.frame_palette = QWidget()
         v_pal = QVBoxLayout(self.frame_palette)
-        v_pal.setContentsMargins(8, 8, 8, 8)
-
+        v_pal.setContentsMargins(0, 6, 0, 0)
+        v_pal.setSpacing(6)
         h_modes = QHBoxLayout()
         self.mode_group = QButtonGroup()
-        modes = [('paint', 'Paint'), ('draw', 'Draw Line'), ('text', 'Add Text'), ('transform', 'Move/Rotate Text')]
+        modes = [('paint', 'Paint'), ('draw', 'Draw line'), ('text', 'Add text'), ('transform', 'Move / rotate text')]
         for mode, title in modes:
             btn = QPushButton(title)
             btn.setCheckable(True)
@@ -497,50 +609,76 @@ class PlotterApp(QMainWindow):
         v_pal.addLayout(h_modes)
 
         h_tools = QHBoxLayout()
-        btn_style = "background-color: #E5E7E9; color: black; font-weight: bold; padding: 4px; border-radius: 3px;"
-        self.btn_undo = QPushButton("Undo (Ctrl+Z)");
-        self.btn_undo.setStyleSheet(btn_style);
+        self.btn_undo = QPushButton("Undo")
+        self.btn_undo.setObjectName("ghost")
+        self.btn_undo.setToolTip("Ctrl+Z")
         self.btn_undo.setEnabled(False)
         self.btn_undo.clicked.connect(self.undo_action)
-        self.btn_redo = QPushButton("Redo (Ctrl+Y)");
-        self.btn_redo.setStyleSheet(btn_style);
+        self.btn_redo = QPushButton("Redo")
+        self.btn_redo.setObjectName("ghost")
+        self.btn_redo.setToolTip("Ctrl+Y")
         self.btn_redo.setEnabled(False)
         self.btn_redo.clicked.connect(self.redo_action)
-        self.btn_add_pen = QPushButton("Add Custom Pen");
-        self.btn_add_pen.setStyleSheet(btn_style)
+        self.chk_mask_text = QCheckBox("Blank lines behind text")
+        self.chk_mask_text.setChecked(True)
+        self.chk_mask_text.toggled.connect(self.render_canvas)
+        self.btn_add_pen = QPushButton("+ Pen")
+        self.btn_add_pen.setObjectName("ghost")
+        self.btn_add_pen.setToolTip("Add a custom pen")
         self.btn_add_pen.clicked.connect(self.add_custom_pen)
-        h_tools.addWidget(self.btn_undo);
-        h_tools.addWidget(self.btn_redo);
-        h_tools.addStretch();
+        h_tools.addWidget(self.btn_undo)
+        h_tools.addWidget(self.btn_redo)
+        h_tools.addWidget(self.chk_mask_text)
+        h_tools.addStretch()
         h_tools.addWidget(self.btn_add_pen)
         v_pal.addLayout(h_tools)
 
         self.scroll_pens = QScrollArea()
         self.scroll_pens.setWidgetResizable(True)
-        self.scroll_pens.setFixedHeight(100)
-        self.scroll_pens.setStyleSheet("border: None;")
+        self.scroll_pens.setFixedHeight(84)
         self.scroll_content = QWidget()
-        self.v_palette_btns = QVBoxLayout(self.scroll_content)
+        self.v_palette_btns = QGridLayout(self.scroll_content)
+        self.v_palette_btns.setContentsMargins(0, 0, 0, 0)
         self.v_palette_btns.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.pen_btn_group = QButtonGroup()
         self.pen_btn_group.buttonClicked.connect(self.on_palette_selected)
         self.scroll_pens.setWidget(self.scroll_content)
         v_pal.addWidget(self.scroll_pens)
-
         self.rebuild_palette_ui()
         self.update_mode_button_styles()
-        v_prev.addWidget(self.frame_palette)
+        prev_col.addWidget(self.frame_palette)
+        prev_outer.addLayout(prev_col, 1)
 
-        splitter.addWidget(prev_widget)
-        main_layout.addWidget(left_panel)
-        main_layout.addWidget(splitter)
+        self.layer_panel = LayerPanel()
+        self.layer_panel.setFixedWidth(210)
+        self.layer_panel.visibility_changed.connect(self.on_layer_visibility)
+        prev_outer.addWidget(self.layer_panel)
+        splitter.addWidget(prev_card)
+        splitter.setStretchFactor(0, 4)
+        splitter.setStretchFactor(1, 6)
+
+        work = QWidget()
+        wl = QHBoxLayout(work)
+        wl.setContentsMargins(10, 10, 10, 10)
+        wl.addWidget(splitter)
+        main_layout.addWidget(sidebar)
+        main_layout.addWidget(work, 1)
+
+        style_axes(self.fig_map, self.ax_map)
+        style_axes(self.fig_prev, self.ax_prev)
+        # Let both canvases use their whole card.
+        self.fig_map.subplots_adjust(left=0.08, right=0.96, top=0.97, bottom=0.07)
+        self.fig_prev.subplots_adjust(left=0.01, right=0.99, top=0.99, bottom=0.01)
 
         # Map Canvas Events
         self.selector = RectangleSelector(self.ax_map, self.on_select, useblit=True, button=[1], interactive=True,
-                                          props=dict(facecolor='red', edgecolor='red', alpha=0.3, fill=True))
+                                          props=dict(facecolor=SEL_FILL, edgecolor=SEL_EDGE, alpha=0.25, fill=True,
+                                                     linewidth=1.5))
         self.zoom_selector = RectangleSelector(self.ax_map, self.on_zoom_select, useblit=True, button=[1],
                                                interactive=False,
-                                               props=dict(facecolor='blue', edgecolor='blue', alpha=0.2, fill=True))
+                                               props=dict(facecolor=ZOOM_FILL, edgecolor=ZOOM_FILL, alpha=0.2,
+                                                          fill=True))
+        self.zoom_selector.set_active(False)
         self.canvas_map.mpl_connect('scroll_event', self.zoom_map)
         self.canvas_map.mpl_connect('button_press_event', self.on_mouse_press_map)
         self.canvas_map.mpl_connect('motion_notify_event', self.on_mouse_motion_map)
@@ -549,7 +687,7 @@ class PlotterApp(QMainWindow):
         # Preview Canvas Events
         self.prev_zoom_selector = RectangleSelector(self.ax_prev, self.on_prev_zoom_select, useblit=True, button=[1],
                                                     interactive=False,
-                                                    props=dict(facecolor='blue', edgecolor='blue', alpha=0.2,
+                                                    props=dict(facecolor=ZOOM_FILL, edgecolor=ZOOM_FILL, alpha=0.2,
                                                                fill=True))
         self.prev_zoom_selector.set_active(False)
         self.canvas_prev.mpl_connect('button_press_event', self.on_prev_press)
@@ -557,43 +695,32 @@ class PlotterApp(QMainWindow):
         self.canvas_prev.mpl_connect('button_release_event', self.on_prev_release)
         self.canvas_prev.mpl_connect('scroll_event', self.on_prev_scroll)
         self.canvas_prev.mpl_connect('pick_event', self.on_prev_pick)
+        self.canvas_prev.mpl_connect('resize_event', lambda e: self.schedule_ink_sim(150))
 
         self.update_paper_dims()
         self.context_ui_update()
 
     def context_ui_update(self):
-        """Dynamically hides/shows UI options based on active planet and mode."""
-        planet = 'Earth' if self.radio_earth.isChecked() else 'Moon'
-        mode = self.combo_mode.currentText()
+        """Shows only the options that apply to the current planet, layers and fill pattern."""
+        planet = self.selected_planet()
         is_earth = (planet == 'Earth')
-        is_topo = "Topography" in mode
+        strategy = self.combo_hatch.currentText()
+        is_hachure = "Hachure" in strategy
+        is_color = self.combo_inks.currentText() == "Color separation" and not is_hachure
 
-        is_color = "Color Separation" in mode
+        self.lbl_region.setVisible(is_earth)
+        self.chk_borders.setVisible(is_earth)
+        self.chk_apollo.setVisible(planet == 'Moon')
+        self.chk_plot_borders.setVisible(is_earth)
+        self.chk_blue_water.setVisible(is_earth)
+        self.chk_ocean.setText("Plot ocean depths" if is_earth else "Plot all depths (below datum)")
 
-        # These options only feed the contour engine, so hide them in hatch modes.
-        self.chk_ocean.setVisible(is_topo)
-        self.chk_plot_borders.setVisible(is_earth and is_topo)
-        self.chk_blue_water.setVisible(is_earth and is_topo)
-        self.lbl_region.setVisible(is_earth and is_topo)
-        self.combo_region.setVisible(is_earth and is_topo)
-
-        self.chk_apollo.setVisible(not is_earth and is_topo)
-
-        self.lbl_hatch.setVisible(not is_topo)
-        self.combo_hatch.setVisible(not is_topo)
-        self.widget_hatch_opts.setVisible(not is_topo)
+        self.lbl_source.setVisible(not is_hachure)
+        self.lbl_inks.setVisible(not is_hachure)
         self.lbl_ink_set.setVisible(is_color)
-        self.combo_ink_set.setVisible(is_color)
-
-        self.lbl_usgs_interval.setVisible(is_topo)
-        self.widget_interval.setVisible(is_topo)
-        self.widget_index.setVisible(is_topo)
-        self.widget_simplify.setVisible(is_topo)
-        self.widget_smooth.setVisible(is_topo)
-        self.widget_blur.setVisible(is_topo)
-        self.widget_presets.setVisible(is_topo)
-        self.lbl_smooth_hdr.setVisible(is_topo)
-        self.lbl_contour_hdr.setVisible(is_topo)
+        self.lbl_mono_pen.setVisible(not is_color)
+        self.chk_auto_contrast.setVisible(not is_hachure)
+        self.chk_join.setVisible(not ("Stipp" in strategy or is_hachure))
 
     def on_region_changed(self, text):
         if "Tahoe" in text:
@@ -607,6 +734,7 @@ class PlotterApp(QMainWindow):
             self.lbl_usgs_interval.setText("Interval: Tahoe Bathymetry (75 ft)")
             self.slider_int.blockSignals(False);
             self.txt_int.blockSignals(False)
+            self.select_tahoe_extent()
         else:
             self.slider_int.blockSignals(True);
             self.txt_int.blockSignals(True)
@@ -621,6 +749,20 @@ class PlotterApp(QMainWindow):
         # A different region is a different map: re-render fresh (auto interval unless Tahoe).
         self.pending_fresh = True
         self.recalc_timer.start(500)
+
+    def select_tahoe_extent(self):
+        """Frames the selection on the lake (padded to the paper aspect) and zooms the map to it."""
+        if self.active_planet != 'Earth' or self.chk_circle.isChecked():
+            return
+        left, bottom, right, top = TAHOE['bounds']
+        self.last_drag_coords = (left, right, bottom, top)
+        self.process_selection(left, right, bottom, top)
+        self.selector.extents = (left, right, bottom, top)
+        pad = 0.6
+        self.ax_map.set_xlim(left - pad, right + pad)
+        self.ax_map.set_ylim(bottom - pad, top + pad)
+        self.canvas_map.draw_idle()
+        self.lbl_status.setText("Lake Tahoe framed - click Draw Map.")
 
     # --- PEN PALETTE & STATES ---
     def push_undo_state(self):
@@ -656,6 +798,7 @@ class PlotterApp(QMainWindow):
                 self.dem_segments[i]['pen_id'] = p_id
         self.custom_items = copy.deepcopy(state['custom'])
         self.render_canvas()
+        self.refresh_layer_panel()
 
     def rebuild_palette_ui(self):
         while self.v_palette_btns.count():
@@ -663,13 +806,14 @@ class PlotterApp(QMainWindow):
             if item.widget():
                 self.pen_btn_group.removeButton(item.widget())
                 item.widget().deleteLater()
-        for p_id, pen in self.pens.items():
-            btn = QRadioButton(f"{pen['name']} ({pen['width']}mm)")
-            btn.setStyleSheet(f"QRadioButton {{ color: {pen['color']}; font-weight: bold; padding: 4px; }}")
+        for i, (p_id, pen) in enumerate(self.pens.items()):
+            btn = QRadioButton(f"{pen['name']}")
+            btn.setIcon(swatch_icon([pen['color']]))
+            btn.setToolTip(f"{pen['name']} - {pen['width']} mm")
             btn.setProperty("pen_id", p_id)
             if p_id == self.active_pen_id: btn.setChecked(True)
             self.pen_btn_group.addButton(btn)
-            self.v_palette_btns.addWidget(btn)
+            self.v_palette_btns.addWidget(btn, i // 2, i % 2)
 
     def on_palette_selected(self, btn):
         self.active_pen_id = btn.property("pen_id")
@@ -692,12 +836,9 @@ class PlotterApp(QMainWindow):
         self.trigger_recalc()
 
     def update_mode_button_styles(self):
+        # Checked / unchecked looks come from the theme stylesheet (QPushButton:checked).
         for btn in self.mode_group.buttons():
-            if btn.isChecked():
-                btn.setStyleSheet(
-                    "background-color: #2E86C1; color: white; font-weight: bold; border-radius: 4px; padding: 6px;")
-            else:
-                btn.setStyleSheet("background-color: #E5E7E9; color: black; border-radius: 4px; padding: 6px;")
+            btn.update()
 
     def change_mode(self, btn):
         self.canvas_mode = btn.property("mode")
@@ -715,14 +856,15 @@ class PlotterApp(QMainWindow):
                 "Paint Mode: Click a contour to change its pen (Shift+Click to change all at elevation).")
 
     # --- MAP & DATA CALCULATION ---
-    def on_mode_changed(self, _text=None):
+    def on_layers_changed(self, _checked=None):
         self.context_ui_update()
         if self.has_drawn:
-            # Switching between topo and hatching is a brand-new render (auto interval, fresh view).
-            self.pending_fresh = True
             self.recalc_timer.start(100)
         else:
             self.render_canvas()
+
+    def tone_gamma(self):
+        return float(2.0 ** (self.slider_tone.value() / 100.0))
 
     def trigger_recalc(self):
         # NOTE: no extra parameters - this slot is connected to toggled(bool)/valueChanged(int),
@@ -766,9 +908,17 @@ class PlotterApp(QMainWindow):
             'simp_tol': self.slider_simp.value() / 10.0,
             'smooth_val': self.slider_smooth.value() / 10.0,
             'blur_sigma': self.slider_blur.value() / 10.0,
-            'plot_mode': self.combo_mode.currentText(),
+            'layer_contours': self.sec_contours.is_enabled(),
+            'layer_fill': self.sec_fill.is_enabled(),
+            'force_auto_interval': not self.interval_auto_done,
+            'tanaka': self.chk_tanaka.isChecked(),
+            'fill_source': self.combo_source.currentText(),
+            'fill_inks': 'color' if self.combo_inks.currentText() == "Color separation" else 'mono',
+            'tone_gamma': self.tone_gamma(),
+            'join_lines': self.chk_join.isChecked(),
             'hatch_strategy': self.combo_hatch.currentText(),
             'ink_set': self.combo_ink_set.currentText(),
+            'mono_ink_set': self.combo_mono_pen.currentText(),
             'hatch_spacing_mm': self.spin_spacing.value(),
             'auto_contrast': self.chk_auto_contrast.isChecked(),
             'paper_w_mm': self.pw,
@@ -777,7 +927,7 @@ class PlotterApp(QMainWindow):
         }
 
     def draw_action(self):
-        """'1. DRAW MAP' button: always a fresh render (auto interval, reset view, clear annotations)."""
+        """'Draw Map' button: always a fresh render (auto interval, reset view, clear annotations)."""
         if self.is_calculating:
             return
         self._start_render(fresh=True)
@@ -787,9 +937,14 @@ class PlotterApp(QMainWindow):
         params = self.get_ui_params()
         dem_path = DATA_FILES[self.active_planet]['dem']
         if self.active_planet == 'Earth' and "Tahoe" in params['selected_region']:
-            dem_path = "tahoe2.tif"
+            dem_path = TAHOE['dem']
 
-        if "Topography" in params['plot_mode'] and not os.path.exists(dem_path):
+        if not (params['layer_contours'] or params['layer_fill']):
+            self.lbl_status.setText("Turn on the Contours and/or Fill layer first.")
+            return
+        needs_dem = params['layer_contours'] or (params['layer_fill'] and (
+            "Hachure" in params['hatch_strategy'] or "Hillshade" in params['fill_source']))
+        if needs_dem and not os.path.exists(dem_path):
             QMessageBox.critical(self, "Missing File", f"Cannot find {dem_path}")
             self.lbl_status.setText("Ready.")
             return
@@ -830,7 +985,7 @@ class PlotterApp(QMainWindow):
         sender = self.sender()
         if sender is not None and getattr(sender, 'token', self._render_token) != self._render_token:
             # Selection/planet changed while this was computing - discard it.
-            self._finish_render("Selection changed - click '1. DRAW MAP'.")
+            self._finish_render("Selection changed - click Draw Map.")
             return
         self.current_dem_crop = result['dem_data']
         self.current_data_extent = result['extent']
@@ -844,7 +999,8 @@ class PlotterApp(QMainWindow):
             self.interval_ft = step
             self.slider_int.setValue(min(max(step, self.slider_int.minimum()), self.slider_int.maximum()))
             self.txt_int.setText(str(step))
-            self.lbl_usgs_interval.setText(f"Interval: Auto ({step} ft, relief {result['max_e'] - result['min_e']:,.0f} ft)")
+            self.lbl_usgs_interval.setText(f"Interval: Auto · {step:,} ft  (relief {result['max_e'] - result['min_e']:,.0f} ft)")
+            self.interval_auto_done = True
             self.slider_int.blockSignals(False)
             self.txt_int.blockSignals(False)
 
@@ -857,6 +1013,7 @@ class PlotterApp(QMainWindow):
             self.ax_prev.set_xlim(0.0, 1.0)
             self.ax_prev.set_ylim(0.0, 1.0)
         self.render_canvas()
+        self.refresh_layer_panel()
 
         n = len(self.dem_segments)
         self._finish_render(f"Render complete ({n:,} strokes)." if n else
@@ -872,12 +1029,71 @@ class PlotterApp(QMainWindow):
         super().closeEvent(event)
 
     def current_paper_color(self):
-        mode = self.combo_mode.currentText()
-        if "Color Separation" in mode:
+        if self.sec_fill.is_enabled() and self.combo_inks.currentText() == "Color separation" \
+                and "Hachure" not in self.combo_hatch.currentText():
             return INK_SETS.get(self.combo_ink_set.currentText(), INK_SETS[DEFAULT_INK_SET])['paper']
-        if "Monochrome" in mode:
-            return MONO_INK_SET['paper']
         return '#FFFFFF'
+
+    # --- LAYERS ---
+    @staticmethod
+    def layer_key(item):
+        layer = item.get('layer') or ('borders' if item.get('type') == 'border' else 'contours')
+        return f"fill:{item['pen_id']}" if layer == 'fill' else layer
+
+    def is_visible(self, item):
+        return self.layer_visible.get(self.layer_key(item), True)
+
+    def annotations_visible(self):
+        return self.layer_visible.get('annotations', True)
+
+    def refresh_layer_panel(self):
+        groups = {}
+        for item in self.dem_segments:
+            k = self.layer_key(item)
+            g = groups.setdefault(k, {'pens': [], 'n': 0})
+            g['n'] += 1
+            if item['pen_id'] not in g['pens']:
+                g['pens'].append(item['pen_id'])
+        if self.custom_items:
+            groups['annotations'] = {'pens': list(dict.fromkeys(i['pen_id'] for i in self.custom_items)),
+                                     'n': len(self.custom_items)}
+        order = ['contours', 'borders'] + sorted(k for k in groups if k.startswith('fill:')) + ['annotations']
+        rows = []
+        for k in order:
+            if k not in groups: continue
+            pens = groups[k]['pens']
+            colors = [self.pens.get(p, self.pens['base'])['color'] for p in pens][:4]
+            if k.startswith('fill:'):
+                label = "Fill · " + self.pens.get(k[5:], {'name': k[5:]})['name']
+            else:
+                label = LAYER_LABELS.get(k, k)
+            rows.append((k, label, colors, groups[k]['n']))
+        self.layer_panel.set_layers(rows, self.layer_visible)
+        self.layer_panel.set_order([self.pens[p]['name'] for p in self.plot_order_pens()])
+
+    def on_layer_visibility(self, key, visible):
+        self.layer_visible[key] = visible
+        self.render_canvas()
+        self.layer_panel.set_order([self.pens[p]['name'] for p in self.plot_order_pens()])
+
+    def plot_order_pens(self):
+        """Pens that have visible strokes, lightest ink first (dark inks last so they sit on top
+        and wet light ink is never dragged through dark ink)."""
+        used = []
+        for item in self.dem_segments:
+            if self.is_visible(item) and item['pen_id'] not in used:
+                used.append(item['pen_id'])
+        if self.annotations_visible():
+            for item in self.custom_items:
+                if item['pen_id'] not in used:
+                    used.append(item['pen_id'])
+        used = [p for p in used if p in self.pens]
+
+        def lightness(p):
+            h = self.pens[p]['color'].lstrip('#')
+            r, g, b = (int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+            return 0.2126 * r + 0.7152 * g + 0.0722 * b
+        return sorted(used, key=lightness, reverse=True)
 
     # --- HIGH PERFORMANCE RENDERER ---
     def render_canvas(self):
@@ -887,6 +1103,7 @@ class PlotterApp(QMainWindow):
         self.ax_prev.clear()
         self.ax_prev.set_xticks([]);
         self.ax_prev.set_yticks([])
+        style_axes(self.fig_prev, self.ax_prev)
 
         # Show the paper colour of the active ink set
         self.ax_prev.set_facecolor(self.current_paper_color())
@@ -898,27 +1115,22 @@ class PlotterApp(QMainWindow):
         mid_lat = np.radians((self.current_view_extent[2] + self.current_view_extent[3]) / 2)
         self.ax_prev.set_aspect(1 / np.cos(mid_lat))
 
-        if getattr(self, 'dem_segments', []):
-            segs = [item['seg'] for item in self.dem_segments]
-            colors = [self.pens.get(item['pen_id'], self.pens['base'])['color'] for item in self.dem_segments]
-            if "Topography" in self.combo_mode.currentText():
-                lws = [self.pens.get(item['pen_id'], self.pens['base'])['width'] * PT_PER_MM
-                       for item in self.dem_segments]
-            else:
-                # Hatching: draw strokes at true paper scale (for the full-page view) so the
-                # preview's tone matches what the pens will actually lay down.
-                bbox = self.ax_prev.get_window_extent()
-                pt_per_paper_mm = (bbox.width / self.pw) * 72.0 / self.fig_prev.dpi if bbox.width > 0 else PT_PER_MM
-                lws = []
-                for item in self.dem_segments:
-                    pen = self.pens.get(item['pen_id'], self.pens['base'])
-                    lws.append(float(pen.get('line_mm', pen['width'])) * pt_per_paper_mm)
-
+        self._visible_idx = [i for i, item in enumerate(self.dem_segments) if self.is_visible(item)]
+        self.dem_collection = None
+        if self._visible_idx:
+            vis = [self.dem_segments[i] for i in self._visible_idx]
+            segs = [item['seg'] for item in vis]
+            colors = [self.pens.get(item['pen_id'], self.pens['base'])['color'] for item in vis]
+            lws = [self.pens.get(item['pen_id'], self.pens['base'])['width'] * PT_PER_MM for item in vis]
             self.dem_collection = LineCollection(segs, colors=colors, linewidths=lws, picker=True, pickradius=5,
                                                  zorder=10)
+            if self.is_ink_sim_mode():
+                # Hatching is shown by the subtractive ink simulation image (see _refresh_ink_sim).
+                # This collection stays as an invisible layer so Paint-mode clicking still works.
+                self.dem_collection.set_alpha(0.0)
             self.ax_prev.add_collection(self.dem_collection)
 
-        for idx, item in enumerate(getattr(self, 'custom_items', [])):
+        for idx, item in enumerate(getattr(self, 'custom_items', []) if self.annotations_visible() else []):
             pen = self.pens.get(item['pen_id'], self.pens['base'])
             if item['type'] == 'line':
                 seg = np.array(item['points'])
@@ -945,12 +1157,7 @@ class PlotterApp(QMainWindow):
 
         if is_fresh and self.current_view_extent:
             if self.chk_circle.isChecked():
-                if self.active_planet == 'Earth':
-                    R = 6371000.0
-                elif self.active_planet == 'Moon':
-                    R = 1737400.0
-                else:
-                    R = 3389500.0
+                R = PLANET_RADII.get(self.active_planet, 6371000.0)
                 self.ax_prev.set_xlim(-R * 1.05, R * 1.05)
                 self.ax_prev.set_ylim(-R * 1.05, R * 1.05)
                 self.ax_prev.set_aspect('equal')
@@ -963,6 +1170,86 @@ class PlotterApp(QMainWindow):
             self.ax_prev.set_xlim(xlim)
             self.ax_prev.set_ylim(ylim)
 
+        self.ink_image = None                 # ax.clear() above removed the old one
+        self.canvas_prev.draw_idle()
+        self.schedule_ink_sim(0)
+
+    # --- SUBTRACTIVE INK PREVIEW (hatch modes) ---
+    def is_ink_sim_mode(self):
+        """True-to-paper ink preview is used whenever a fill layer is showing (contour-only plots keep
+        the classic, easier-to-read line view)."""
+        return self.has_drawn and any(item.get('layer') == 'fill' and self.is_visible(item)
+                                      for item in self.dem_segments)
+
+    def schedule_ink_sim(self, delay_ms=80):
+        if self.is_ink_sim_mode():
+            self.ink_timer.start(delay_ms)
+
+    def _paper_mm_per_data_unit(self):
+        """(mm per data unit in x, in y) for the current page."""
+        if self.chk_circle.isChecked():
+            k = self._paper_mm_per_data_unit_x()
+            return k, k
+        e = self.current_view_extent
+        return self.pw / (e[1] - e[0]), self.ph / (e[3] - e[2])
+
+    def _paper_mm_per_data_unit_x(self):
+        if self.chk_circle.isChecked():
+            R = PLANET_RADII.get(self.active_planet, 6371000.0)
+            return min(self.pw, self.ph) / (2.1 * R)
+        return self.pw / (self.current_view_extent[1] - self.current_view_extent[0])
+
+    def _refresh_ink_sim(self):
+        """Renders each pen's strokes to its own off-screen layer at true paper line width and
+        multiplies the layers together (plus the paper colour), the way translucent inks combine."""
+        if self.ink_image is not None:
+            try:
+                self.ink_image.remove()
+            except Exception:
+                pass
+            self.ink_image = None
+        if not self.is_ink_sim_mode() or not self.dem_segments or not self.current_view_extent:
+            return
+
+        ax = self.ax_prev
+        ax.apply_aspect()
+        bb = ax.get_window_extent()
+        w, h = int(round(bb.width)), int(round(bb.height))
+        if w < 4 or h < 4:
+            return
+        xlim, ylim = ax.get_xlim(), ax.get_ylim()
+        dpi = self.fig_prev.dpi
+        px_per_mm = (w / abs(xlim[1] - xlim[0])) / self._paper_mm_per_data_unit_x()
+        pt_per_mm = px_per_mm * 72.0 / dpi
+
+        by_pen = {}
+        for item in self.dem_segments:
+            if self.is_visible(item):
+                by_pen.setdefault(item['pen_id'], []).append(item['seg'])
+
+        off_fig = Figure(figsize=(w / dpi, h / dpi), dpi=dpi, facecolor='white')
+        off_canvas = FigureCanvasAgg(off_fig)
+        off_ax = off_fig.add_axes([0, 0, 1, 1])
+        off_ax.axis('off')
+        off_ax.set_xlim(xlim)
+        off_ax.set_ylim(ylim)
+        layers = []
+        for p_id, segs in by_pen.items():
+            pen = self.pens.get(p_id, self.pens['base'])
+            lw = float(pen.get('line_mm', pen['width'])) * pt_per_mm
+            coll = off_ax.add_collection(LineCollection(segs, colors=pen['color'], linewidths=lw,
+                                                        capstyle='round'))
+            off_canvas.draw()
+            layers.append(np.asarray(off_canvas.buffer_rgba())[..., :3].copy())
+            coll.remove()
+
+        img = composite_ink_layers(layers, self.current_paper_color())
+        if img is None:
+            return
+        self.ink_image = ax.imshow(img, extent=(xlim[0], xlim[1], ylim[0], ylim[1]), origin='upper',
+                                   aspect=ax.get_aspect(), interpolation='nearest', zorder=5)
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
         self.canvas_prev.draw_idle()
 
     # --- PREVIEW ZOOM & PAN ---
@@ -978,10 +1265,6 @@ class PlotterApp(QMainWindow):
             for btn in self.mode_group.buttons(): btn.setChecked(False)
             self.mode_group.setExclusive(True)
             self.update_mode_button_styles()
-            self.btn_prev_zoom.setStyleSheet(
-                "background-color: lightblue; font-weight: bold; color: black; border-radius: 4px; padding: 6px;")
-        else:
-            self.btn_prev_zoom.setStyleSheet("")
         self.prev_zoom_selector.set_active(checked)
 
     def on_prev_zoom_select(self, eclick, erelease):
@@ -991,6 +1274,7 @@ class PlotterApp(QMainWindow):
         self.ax_prev.set_ylim(y1, y2)
         self.canvas_prev.draw_idle();
         self.btn_prev_zoom.setChecked(False)
+        self.schedule_ink_sim()
 
     # --- INTERACTIVE MOUSE CONTROLS (Preview Canvas) ---
     def on_prev_press(self, event):
@@ -1020,6 +1304,7 @@ class PlotterApp(QMainWindow):
                 self.custom_items.append({'type': 'text', 'text': text, 'x': event.xdata, 'y': event.ydata,
                                           'rot': 0.0, 'scale': init_scale, 'pen_id': self.active_pen_id})
                 self.render_canvas()
+                self.refresh_layer_panel()
 
         elif self.canvas_mode == 'transform':
             min_dist = float('inf');
@@ -1057,7 +1342,10 @@ class PlotterApp(QMainWindow):
             self.render_canvas()
 
     def on_prev_release(self, event):
-        if event.button == 2: self.prev_pan_active = False; return
+        if event.button == 2:
+            self.prev_pan_active = False
+            self.schedule_ink_sim()
+            return
         if event.button != 1: return
 
         if self.canvas_mode == 'draw' and self.drawing_active:
@@ -1070,6 +1358,7 @@ class PlotterApp(QMainWindow):
                 self.temp_draw_line.remove();
                 self.temp_draw_line = None
             self.render_canvas()
+            self.refresh_layer_panel()
 
         elif self.canvas_mode == 'transform' and self.transform_target_idx is not None:
             start = self.transform_start_state;
@@ -1110,19 +1399,23 @@ class PlotterApp(QMainWindow):
         self.ax_prev.set_xlim([x - nw * (1 - rx), x + nw * rx])
         self.ax_prev.set_ylim([y - nh * (1 - ry), y + nh * ry])
         self.canvas_prev.draw_idle()
+        self.schedule_ink_sim(150)
 
     def on_prev_pick(self, event):
         if event.mouseevent.button != 1 or self.canvas_mode != 'paint' or self.btn_prev_zoom.isChecked(): return
         artist = event.artist
-        if hasattr(self, 'dem_collection') and artist == self.dem_collection:
-            idx = event.ind[0]
-            target_level = self.dem_segments[idx]['level']
+        if self.dem_collection is not None and artist == self.dem_collection:
+            idx = self._visible_idx[event.ind[0]]
+            target = self.dem_segments[idx]
+            target_level, target_layer = target['level'], self.layer_key(target)
             shift_held = event.mouseevent.key == 'shift'
             self.push_undo_state()
             for i, item in enumerate(self.dem_segments):
-                if (shift_held and item['level'] == target_level) or (not shift_held and i == idx):
+                if (shift_held and item['level'] == target_level and self.layer_key(item) == target_layer) \
+                        or (not shift_held and i == idx):
                     item['pen_id'] = self.active_pen_id
             self.render_canvas()
+            self.refresh_layer_panel()
             return
         if hasattr(artist, 'item_ref'):
             group, idx = artist.item_ref
@@ -1130,6 +1423,7 @@ class PlotterApp(QMainWindow):
                 self.push_undo_state()
                 self.custom_items[idx]['pen_id'] = self.active_pen_id
                 self.render_canvas()
+                self.refresh_layer_panel()
 
     # --- MAP LOGIC (Panning & Zooming) ---
     def reset_home_view(self):
@@ -1139,6 +1433,7 @@ class PlotterApp(QMainWindow):
 
     def clear_selection(self):
         self._render_token += 1
+        self.interval_auto_done = False
         self.last_drag_coords = None
         self.current_view_extent = None
         self.has_drawn = False
@@ -1146,6 +1441,7 @@ class PlotterApp(QMainWindow):
         self.ax_prev.clear();
         self.ax_prev.set_xticks([]);
         self.ax_prev.set_yticks([])
+        style_axes(self.fig_prev, self.ax_prev)
         self.canvas_prev.draw_idle()
         self.canvas_map.draw_idle()
         self.custom_items = []
@@ -1153,6 +1449,9 @@ class PlotterApp(QMainWindow):
         self.undo_stack.clear();
         self.redo_stack.clear()
         self.update_undo_redo_btns()
+        self.ink_image = None
+        self.layer_panel.set_layers([], {})
+        self.layer_panel.set_order([])
 
     def toggle_circle_mode(self, checked):
         if checked:
@@ -1179,7 +1478,6 @@ class PlotterApp(QMainWindow):
             return
         self.selector.set_active(not checked)
         self.zoom_selector.set_active(checked)
-        self.btn_zoom_tool.setStyleSheet("background-color: lightblue;" if checked else "")
 
     def on_zoom_select(self, eclick, erelease):
         x1, x2 = sorted([eclick.xdata, erelease.xdata]);
@@ -1261,21 +1559,30 @@ class PlotterApp(QMainWindow):
         self.is_landscape = not self.is_landscape;
         self.update_paper_dims()
 
+    def selected_planet(self):
+        if self.radio_mars.isChecked():
+            return 'Mars'
+        return 'Moon' if self.radio_moon.isChecked() else 'Earth'
+
     def switch_planet(self):
-        self.active_planet = 'Earth' if self.radio_earth.isChecked() else 'Moon'
+        self.active_planet = self.selected_planet()
         self.context_ui_update()
 
         _, base_img = load_planet_data(self.active_planet)
         self.ax_map.clear()
         self.ax_map.imshow(base_img, extent=[-180, 180, -90, 90], origin='upper', zorder=0)
-        self.ax_map.set_title(f"Select Region on {self.active_planet}")
+        style_axes(self.fig_map, self.ax_map)
+        self.ax_map.set_xticks(range(-180, 181, 60))
+        self.ax_map.set_yticks(range(-90, 91, 30))
 
         # Preload Geopandas Borders invisibly
         self.border_artists = []
         if HAS_GPD and self.active_planet == 'Earth':
-            world_borders.boundary.plot(ax=self.ax_map, edgecolor='cyan', linewidth=0.6, alpha=0.5, zorder=2)
-            state_borders.boundary.plot(ax=self.ax_map, edgecolor='cyan', linewidth=0.2, alpha=0.3, zorder=2)
+            world_borders.boundary.plot(ax=self.ax_map, edgecolor='#F4E9CF', linewidth=0.6, alpha=0.7, zorder=2)
+            state_borders.boundary.plot(ax=self.ax_map, edgecolor='#F4E9CF', linewidth=0.25, alpha=0.45, zorder=2)
             self.border_artists.extend(self.ax_map.collections)
+            self.ax_map.set_xlabel('')     # geopandas adds CRS axis labels; the card title says enough
+            self.ax_map.set_ylabel('')
         for artist in self.border_artists:
             artist.set_visible(self.chk_borders.isChecked())
 
@@ -1288,15 +1595,15 @@ class PlotterApp(QMainWindow):
                 "Apollo 16": (-8.9734, 15.5011), "Apollo 17": (20.1911, 30.7723)
             }
             for name, (lat, lon) in apollo_sites.items():
-                marker, = self.ax_map.plot(lon, lat, marker='X', markersize=6, color='yellow', markeredgecolor='black',
+                marker, = self.ax_map.plot(lon, lat, marker='X', markersize=7, color='#E8B04B', markeredgecolor='#2A2824',
                                            zorder=10)
                 self.apollo_artists.append(marker)
         for artist in self.apollo_artists:
             artist.set_visible(self.chk_apollo.isChecked())
 
-        self.circle_patch_1 = patches.Rectangle((0, 0), 0, 0, facecolor='blue', alpha=0.2, edgecolor='blue',
+        self.circle_patch_1 = patches.Rectangle((0, 0), 0, 0, facecolor=ACCENT, alpha=0.22, edgecolor=ACCENT,
                                                 linewidth=1.5, zorder=5)
-        self.circle_patch_2 = patches.Rectangle((0, 0), 0, 0, facecolor='blue', alpha=0.2, edgecolor='blue',
+        self.circle_patch_2 = patches.Rectangle((0, 0), 0, 0, facecolor=ACCENT, alpha=0.22, edgecolor=ACCENT,
                                                 linewidth=1.5, zorder=5)
         self.ax_map.add_patch(self.circle_patch_1);
         self.ax_map.add_patch(self.circle_patch_2)
@@ -1369,12 +1676,17 @@ class PlotterApp(QMainWindow):
         ey1, ey2 = cy - pad_geo_h / 2, cy + pad_geo_h / 2
         self.current_view_extent = [ex1, ex2, ey1, ey2]
         self._render_token += 1
+        self.interval_auto_done = False
         self.has_drawn = False
         self.ax_prev.clear();
         self.ax_prev.set_xticks([]);
         self.ax_prev.set_yticks([])
+        style_axes(self.fig_prev, self.ax_prev)
         self.canvas_prev.draw_idle()
-        self.lbl_status.setText("Selection captured. Click '1. DRAW MAP'.")
+        self.ink_image = None
+        self.layer_panel.set_layers([], {})
+        self.layer_panel.set_order([])
+        self.lbl_status.setText("Selection captured - click Draw Map.")
 
     # --- EXPORT PIPELINES ---
     def _text_mask_boxes(self):
@@ -1411,9 +1723,12 @@ class PlotterApp(QMainWindow):
         """All plot lines (in data coords) for one pen, with text blanking applied."""
         lines = []
         for item in getattr(self, 'dem_segments', []):
-            if item.get('pen_id') == p_id:
-                lines.extend(self._mask_line(item['seg'], text_boxes))
-        for item in getattr(self, 'custom_items', []):
+            if item.get('pen_id') == p_id and self.is_visible(item):
+                if item.get('type') == 'stipple':
+                    lines.append(np.asarray(item['seg']))        # dots are never blanked or merged
+                else:
+                    lines.extend(self._mask_line(item['seg'], text_boxes))
+        for item in (getattr(self, 'custom_items', []) if self.annotations_visible() else []):
             if item.get('pen_id') != p_id: continue
             if item['type'] == 'line':
                 lines.extend(self._mask_line(item['points'], text_boxes))
@@ -1453,7 +1768,8 @@ class PlotterApp(QMainWindow):
 
         export_fig, export_ax = self._make_export_axes()
         text_boxes = self._text_mask_boxes()
-        for p_id, pen in self.pens.items():
+        for p_id in self.plot_order_pens():
+            pen = self.pens[p_id]
             lines = self._lines_for_pen(p_id, text_boxes)
             if lines:
                 export_ax.add_collection(LineCollection(lines, colors=pen['color'],
@@ -1489,15 +1805,31 @@ class PlotterApp(QMainWindow):
 
         text_boxes = self._text_mask_boxes()
 
-        for p_id, pen in self.pens.items():
+        # Lightest ink first, darkest last; the number prefix is the order to load the pens.
+        for order_no, p_id in enumerate(self.plot_order_pens(), start=1):
+            pen = self.pens[p_id]
             safe_pen_name = "".join([c if c.isalnum() else "_" for c in pen['name']])
             safe_pen_name = re.sub(r'_+', '_', safe_pen_name).strip('_')
-            final_out_gcode = f"{dir_path}/{safe_pen_name}_{base_name}.gcode"
+            final_out_gcode = f"{dir_path}/{order_no:02d}_{safe_pen_name}_{base_name}.gcode"
 
             t_svg = os.path.join(temp_dir, f"temp_{p_id}.svg").replace("\\", "/")
             t_gcode = os.path.join(temp_dir, f"temp_{p_id}.gcode").replace("\\", "/")
 
             lines = self._lines_for_pen(p_id, text_boxes)
+            has_dots = any(item.get('type') == 'stipple' and item['pen_id'] == p_id and self.is_visible(item)
+                           for item in self.dem_segments)
+            if has_dots:
+                # vpype's length filter / merge would delete or join the tiny stipple circles, so for
+                # this pen the short-stroke filter is applied here to everything except the dots.
+                sx, sy = self._paper_mm_per_data_unit()
+                kept = []
+                for ln in lines:
+                    ln = np.asarray(ln)
+                    is_dot = len(ln) == 7 and np.allclose(ln[0], ln[-1])
+                    length = np.sum(np.hypot(np.diff(ln[:, 0]) * sx, np.diff(ln[:, 1]) * sy))
+                    if is_dot or length >= MIN_SEGMENT_MM:
+                        kept.append(ln)
+                lines = kept
             if not lines:
                 continue
 
@@ -1508,8 +1840,11 @@ class PlotterApp(QMainWindow):
             export_fig.savefig(t_svg, format='svg')
 
             try:
-                vpype_cmd = (f'read "{t_svg}" linesimplify -t 0.1mm linemerge -t 0.3mm '
-                             f'filter --min-length {MIN_SEGMENT_MM:g}mm linesort gwrite --profile gcodemm "{t_gcode}"')
+                if has_dots:
+                    vpype_cmd = f'read "{t_svg}" linesort gwrite --profile gcodemm "{t_gcode}"'
+                else:
+                    vpype_cmd = (f'read "{t_svg}" linesimplify -t 0.1mm linemerge -t 0.3mm '
+                                 f'filter --min-length {MIN_SEGMENT_MM:g}mm linesort gwrite --profile gcodemm "{t_gcode}"')
                 vpype_cli.execute(vpype_cmd)
             except Exception as e:
                 print(f"Skipping {pen['name']} optimization: {e}")
@@ -1588,7 +1923,8 @@ class PlotterApp(QMainWindow):
             total_time_str = f"{th}h {tm}m {ts}s" if th > 0 else f"{tm}m {ts}s"
 
             self.lbl_status.setText(f"Successfully generated {len(exported_files)} files. (Est: {total_time_str})")
-            msg = f"Generated {len(exported_files)} G-Code files (Total Est. Time: {total_time_str}):\n\n"
+            msg = (f"Generated {len(exported_files)} G-Code files (Total Est. Time: {total_time_str}).\n"
+                   f"Plot them in this order - lightest ink first:\n\n")
             for f in exported_files: msg += f"• {os.path.basename(f['path'])}  ->  {f['time']}\n"
             QMessageBox.information(self, "Success", msg)
         else:
@@ -1603,8 +1939,8 @@ if __name__ == '__main__':
         myappid = 'tps.cartographer.studio.1'
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
     app = QApplication(sys.argv)
-    app.setWindowIcon(QIcon("icon.jpg"))
-    app.setStyle("Fusion")
+    app.setWindowIcon(app_icon())
+    apply_theme(app)
     window = PlotterApp()
     window.show()
     sys.exit(app.exec())

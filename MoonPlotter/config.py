@@ -7,7 +7,21 @@ import json
 DATA_FILES = {
     'Earth': {'color': 'earth_color.tif', 'dem': 'BE_dem_v2.tif', 'multiplier': 3.28084},
     'Moon': {'color': 'lroc_color_16bit_srgb_4k.tif', 'dem': 'ldem_16.tif', 'multiplier': 3280.84},
-    'Mars': {'color': 'mars_viking_color.tif', 'dem': 'mars_mola_dem_463m.tif', 'multiplier': 3.28084}
+    # USGS Astrogeology downloads (keep the original file names):
+    #   https://planetarymaps.usgs.gov/mosaic/Mars_Viking_ClrMosaic_global_925m.tif   (~764 MB)
+    #   https://planetarymaps.usgs.gov/mosaic/Mars_MGS_MOLA_DEM_mosaic_global_463m.tif (~2 GB, metres)
+    'Mars': {'color': 'Mars_Viking_ClrMosaic_global_925m.tif', 'dem': 'Mars_MGS_MOLA_DEM_mosaic_global_463m.tif',
+             'multiplier': 3.28084}
+}
+
+# Lake Tahoe bathymetry, lake-only (NaN outside the shoreline), in feet, EPSG:4326.
+# Built from tahoe.tif (NAD83 / UTM 11N, 10 m) by reprojecting and keeping the water body
+# connected to the deepest point at or below the lake surface.
+TAHOE = {
+    'dem': 'tahoe_lake_wgs84.tif',
+    'bounds': (-120.175500, 38.917000, -119.914384, 39.259090),   # left, bottom, right, top
+    'multiplier': 1.0,          # file is already in feet
+    'surface_ft': 6225.0,
 }
 
 PLANET_RADII = {'Earth': 6371000.0, 'Moon': 1737400.0, 'Mars': 3389500.0}
@@ -48,6 +62,14 @@ INK_SETS = {
         'paper': '#FFFFFF',
         'inks': [('blue_038', 15.0), ('red_038', 75.0), ('orange_07', 45.0)],
     },
+    'Blue / Red / Orange + Thin Black (0.38) on White': {
+        'paper': '#FFFFFF',
+        'inks': [('blue_038', 15.0), ('red_038', 75.0), ('orange_07', 45.0), ('base', 0.0)],
+    },
+    'Blue / Red / Orange + Thick Black (0.7) on White': {
+        'paper': '#FFFFFF',
+        'inks': [('blue_038', 15.0), ('red_038', 75.0), ('orange_07', 45.0), ('pen_1', 0.0)],
+    },
     'Cyan / Magenta on Yellow (Legacy)': {
         'paper': '#FFE14D',
         'inks': [('cyan_07', 15.0), ('pink_07', 75.0)],
@@ -55,7 +77,11 @@ INK_SETS = {
 }
 DEFAULT_INK_SET = 'Blue / Red / Orange on White'
 
-MONO_INK_SET = {'paper': '#FFFFFF', 'inks': [('pen_1', 45.0)]}
+MONO_INK_SETS = {
+    'Thick Black G2 (0.7)': {'paper': '#FFFFFF', 'inks': [('pen_1', 45.0)]},
+    'Thin Black G2 (0.38)': {'paper': '#FFFFFF', 'inks': [('base', 45.0)]},
+}
+DEFAULT_MONO_INK_SET = 'Thick Black G2 (0.7)'
 
 DEFAULT_HATCH_SPACING_MM = 1.0
 
