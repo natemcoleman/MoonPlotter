@@ -1,12 +1,10 @@
 import sys
 import os
 import tempfile
-import json
 import copy
 import re
 import numpy as np
 import rasterio
-from rasterio.windows import Window
 from PIL import Image
 import platform
 
@@ -15,8 +13,9 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QLineEdit, QPushButton,
                              QRadioButton, QCheckBox, QComboBox, QSplitter,
                              QFileDialog, QMessageBox, QFrame, QButtonGroup,
-                             QInputDialog, QColorDialog, QSlider, QScrollArea, QSpinBox, QCompleter, QProgressBar)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+                             QInputDialog, QColorDialog, QSlider, QScrollArea, QSpinBox, QCompleter,
+                             QProgressBar, QDoubleSpinBox)
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from PyQt6.QtGui import QDoubleValidator, QIntValidator, QShortcut, QKeySequence, QIcon
 
 # Matplotlib Imports
@@ -31,9 +30,12 @@ from matplotlib.transforms import Affine2D
 from matplotlib.collections import LineCollection
 import matplotlib.patches as patches
 
-# Math / Geometry Imports
-import scipy.ndimage
-from shapely.geometry import box as shp_box, LineString, Polygon, MultiPolygon
+# Geometry & Local Imports
+from shapely.geometry import box as shp_box, LineString
+from config import (DATA_FILES, PAPER_SIZES, PT_PER_MM, PLANET_RADII, INK_SETS, DEFAULT_INK_SET, MONO_INK_SET,
+                    MIN_SEGMENT_MM, DEFAULT_HATCH_SPACING_MM, load_pens, save_pens)
+from workers import RenderWorker
+
 import warnings
 from rasterio.errors import NotGeoreferencedWarning
 
@@ -41,7 +43,7 @@ warnings.filterwarnings('ignore', r'All-NaN (slice|axis) encountered')
 warnings.filterwarnings('ignore', category=NotGeoreferencedWarning)
 Image.MAX_IMAGE_PIXELS = None
 
-# Attempt to load vpype
+# Optional Integrations
 try:
     import vpype_cli
 
@@ -50,84 +52,11 @@ except ImportError:
     HAS_VPYPE = False
     print("WARNING: vpype API not found. Please 'pip install vpype vpype-gcode'")
 
-try:
-    import geopandas as gpd
-    import warnings as gpd_warnings
+# Natural Earth borders are downloaded once, in contour_engine (shared with the worker).
+from contour_engine import HAS_GPD, world_borders, state_borders
 
-    with gpd_warnings.catch_warnings():
-        gpd_warnings.simplefilter("ignore")
-        world_borders = gpd.read_file(
-            "https://naturalearth.s3.amazonaws.com/110m_cultural/ne_110m_admin_0_countries.zip")
-        state_borders = gpd.read_file(
-            "https://naturalearth.s3.amazonaws.com/110m_cultural/ne_110m_admin_1_states_provinces.zip")
-    HAS_GPD = True
-except ImportError:
-    HAS_GPD = False
-
-
-# ==========================================
-# 0. CHAIKIN SMOOTHING ALGORITHM
-# ==========================================
-def chaikin_smooth(coords, iterations=2):
-    """Vectorized Chaikin corner-cutting for sweeping cartographic curves."""
-    if len(coords) < 3 or iterations == 0:
-        return coords
-    for _ in range(iterations):
-        p0, p1 = coords[:-1], coords[1:]
-        q = 0.75 * p0 + 0.25 * p1
-        r = 0.25 * p0 + 0.75 * p1
-        new_coords = np.empty((len(coords) * 2 - 2, 2))
-        new_coords[0::2] = q
-        new_coords[1::2] = r
-        coords = np.vstack((coords[0], new_coords, coords[-1]))
-    return coords
-
-
-# ==========================================
-# 1. CONFIGURATION & PERSISTENCE
-# ==========================================
-DATA_FILES = {
-    'Earth': {'color': 'earth_color.tif', 'dem': 'BE_dem_v2.tif', 'multiplier': 3.28084},
-    'Moon': {'color': 'lroc_color_16bit_srgb_4k.tif', 'dem': 'ldem_16.tif', 'multiplier': 3280.84},
-    'Mars':  {'color': 'mars_viking_color.tif', 'dem': 'mars_mola_dem_463m.tif', 'multiplier': 3.28084}
-}
-PAPER_SIZES = {
-    '100x100mm (Default)': (100.0, 100.0),
-    'Ender3_Safe (200x200)': (200.0, 200.0),
-    'A4': (297.0, 210.0),
-    'Letter': (279.4, 215.9),
-    'Custom (mm)': (150.0, 150.0)
-}
-PT_PER_MM = 72.0 / 25.4
+# Cache for UI map previews
 loaded_maps_cache = {}
-PENS_FILE = "plotter_pens.json"
-
-
-def load_pens():
-    if os.path.exists(PENS_FILE):
-        try:
-            with open(PENS_FILE, 'r') as f:
-                return json.load(f)
-        except:
-            pass
-    return {
-        'base': {'id': 'base', 'name': 'Thin G2 Black', 'color': '#000000', 'width': 0.38},
-        'pen_1': {'id': 'pen_1', 'name': 'Thick G2 Black', 'color': '#000000', 'width': 0.7},
-        'blue_038': {'id': 'blue_038', 'name': 'Thin Blue G2 (0.38)', 'color': '#0000B2', 'width': 0.38},
-        'red_038': {'id': 'red_038', 'name': 'Thin Red G2 (0.38)', 'color': '#E32636', 'width': 0.38},
-        'pink_07': {'id': 'pink_07', 'name': 'Thick Pink G2 (0.7)', 'color': '#FF1493', 'width': 0.70},
-        'orange_07': {'id': 'orange_07', 'name': 'Thick Orange G2 (0.7)', 'color': '#FF6600', 'width': 0.70},
-        'cyan_07': {'id': 'cyan_07', 'name': 'Thick Cyan G2 (0.7)', 'color': '#00A3CC', 'width': 0.70},
-        'cutter': {'id': 'cutter', 'name': 'Cutter Blade', 'color': '#0000FF', 'width': 0.1}
-    }
-
-
-def save_pens(pens):
-    try:
-        with open(PENS_FILE, 'w') as f:
-            json.dump(pens, f)
-    except:
-        pass
 
 
 def load_planet_data(planet):
@@ -146,109 +75,36 @@ def load_planet_data(planet):
         else:
             base_img = np.array(Image.open(files['color']))
 
-    dem_path = files['dem']
-    dem_src = rasterio.open(dem_path) if os.path.exists(dem_path) else None
-    loaded_maps_cache[planet] = (dem_src, base_img)
-    return dem_src, base_img
+    loaded_maps_cache[planet] = (None, base_img)
+    return None, base_img
 
 
 # ==========================================
-# 2. BACKGROUND WORKER THREAD
-# ==========================================
-    # ==========================================
-    # 2. BACKGROUND WORKER THREAD
-    # ==========================================
-# ==========================================
-# 2. BACKGROUND WORKER THREAD
-# ==========================================
-# ==========================================
-# 2. BACKGROUND WORKER THREAD
-# ==========================================
-# ==========================================
-# 2. BACKGROUND WORKER THREAD
-# ==========================================
-# ==========================================
-# 2. BACKGROUND WORKER THREAD
-# ==========================================
-class DataFetchWorker(QThread):
-    finished = pyqtSignal(object, list, float, float)
-    error = pyqtSignal(str)
-
-    def __init__(self, planet, dem_path, geo_bounds, selected_region):
-        super().__init__()
-        self.planet = planet
-        self.dem_path = dem_path
-        self.geo_bounds = geo_bounds
-        self.selected_region = selected_region
-
-    def run(self):
-        try:
-            from rasterio.transform import from_bounds as transform_from_bounds
-
-            with rasterio.open(self.dem_path) as src:
-                lon_min, lon_max, lat_min, lat_max = self.geo_bounds
-                global_dems = [DATA_FILES['Earth']['dem'], DATA_FILES['Moon']['dem'], DATA_FILES['Mars']['dem']]
-                is_global = self.dem_path in global_dems
-
-                if is_global:
-                    active_transform = transform_from_bounds(-180, -90, 180, 90, src.width, src.height)
-                else:
-                    active_transform = src.transform
-
-                def fetch_window(l_min, l_max):
-                    w = rasterio.windows.from_bounds(l_min, lat_min, l_max, lat_max, transform=active_transform)
-                    return src.read(1, window=w, boundless=True, fill_value=np.nan).astype(np.float32)
-
-                # Stitch the left and right array slices together if wrapped across dateline
-                if is_global and lon_min < -180:
-                    dem_data = np.hstack((fetch_window(lon_min + 360, 180), fetch_window(-180, lon_max)))
-                elif is_global and lon_max > 180:
-                    dem_data = np.hstack((fetch_window(lon_min, 180), fetch_window(-180, lon_max - 360)))
-                else:
-                    dem_data = fetch_window(lon_min, lon_max)
-
-                extent = [lon_min, lon_max, lat_min, lat_max]
-
-            dem_data[dem_data < -100000] = np.nan
-            mult = DATA_FILES[self.planet]['multiplier']
-
-            if self.planet == 'Earth' and "Tahoe" in self.selected_region:
-                temp_ft = dem_data * mult
-                dem_data[temp_ft > 6226.0] = np.nan
-
-            crop_ft = dem_data * mult
-
-            if np.isnan(crop_ft).all():
-                self.finished.emit(dem_data, extent, 0.0, 0.0)
-            else:
-                self.finished.emit(dem_data, extent, float(np.nanmin(crop_ft)), float(np.nanmax(crop_ft)))
-
-        except Exception as e:
-            self.error.emit(str(e))
-
-# ==========================================
-# 3. MAIN PYQT6 GUI
+# MAIN PYQT6 GUI
 # ==========================================
 class PlotterApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Topo Plotter Studio - Cartographer Edition")
         self.setWindowIcon(QIcon("icon.jpg"))
-        self.resize(1200, 900)
+        self.resize(1000, 1200)
 
         self.active_planet = 'Earth'
         self.paper_name = '100x100mm (Default)'
         self.is_landscape = True
-        self.show_ocean = True
-        self.show_borders = True
         self.interval_ft = 200
 
-        self.current_dem_src = None
         self.current_dem_crop = None
         self.current_data_extent = None
         self.current_view_extent = None
         self.last_drag_coords = None
         self.has_drawn = False
+        self.is_calculating = False
+        self.recalc_pending = False
+        self.pending_fresh = False
+        self._workers = set()      # keeps QThread objects alive until they have fully exited
+        self._render_token = 0     # bumped when the selection/planet changes; stale results are dropped
+        self.worker = None
 
         self.pan_active = False
         self.prev_pan_active = False
@@ -306,17 +162,67 @@ class PlotterApp(QMainWindow):
         h_planet.addWidget(self.radio_moon)
         vbox.addLayout(h_planet)
 
+        # Rendering Mode Settings
+        vbox.addSpacing(10)
+        vbox.addWidget(QLabel("<b>Plot Rendering Mode</b>"))
+        self.combo_mode = QComboBox()
+        self.combo_mode.addItems(
+            ["Topography (DEM)", "Monochrome Hatch (Color Map)", "Color Separation (Color Map)"])
+        self.combo_mode.currentTextChanged.connect(self.on_mode_changed)
+        vbox.addWidget(self.combo_mode)
+
+        self.lbl_hatch = QLabel("Hatching Strategy:")
+        self.combo_hatch = QComboBox()
+        self.combo_hatch.addItems(["Multi-Pass Thresholded", "Variable Spacing Scanlines", "Modulated Sine Squiggles"])
+        self.combo_hatch.currentTextChanged.connect(lambda _: self.recalc_timer.start(150))
+        vbox.addWidget(self.lbl_hatch)
+        vbox.addWidget(self.combo_hatch)
+
+        self.lbl_ink_set = QLabel("Ink Set / Paper:")
+        self.combo_ink_set = QComboBox()
+        self.combo_ink_set.addItems(list(INK_SETS.keys()))
+        self.combo_ink_set.setCurrentText(DEFAULT_INK_SET)
+        self.combo_ink_set.currentTextChanged.connect(lambda _: self.recalc_timer.start(150))
+        vbox.addWidget(self.lbl_ink_set)
+        vbox.addWidget(self.combo_ink_set)
+
+        self.widget_hatch_opts = QWidget()
+        h_hopt = QHBoxLayout(self.widget_hatch_opts)
+        h_hopt.setContentsMargins(0, 0, 0, 0)
+        h_hopt.addWidget(QLabel("Line spacing (mm):"))
+        self.spin_spacing = QDoubleSpinBox()
+        self.spin_spacing.setRange(0.3, 5.0)
+        self.spin_spacing.setSingleStep(0.1)
+        self.spin_spacing.setDecimals(2)
+        self.spin_spacing.setValue(DEFAULT_HATCH_SPACING_MM)
+        self.spin_spacing.valueChanged.connect(lambda _: self.recalc_timer.start(400))
+        h_hopt.addWidget(self.spin_spacing)
+        self.chk_auto_contrast = QCheckBox("Auto contrast")
+        self.chk_auto_contrast.setChecked(True)
+        self.chk_auto_contrast.toggled.connect(self.trigger_recalc)
+        h_hopt.addWidget(self.chk_auto_contrast)
+        vbox.addWidget(self.widget_hatch_opts)
+
+        vbox.addSpacing(10)
         vbox.addWidget(QLabel("<b>Map Options</b>"))
+
         self.chk_ocean = QCheckBox("Plot Ocean/Crater Depths")
         self.chk_ocean.setChecked(True)
-        self.chk_ocean.toggled.connect(self.toggle_ocean)
-        self.chk_borders = QCheckBox("Show Reference Borders")
+        self.chk_ocean.toggled.connect(self.trigger_recalc)
+
+        self.chk_borders = QCheckBox("Show Color Map Borders")
         self.chk_borders.setChecked(True)
         self.chk_borders.toggled.connect(self.toggle_borders)
+
         self.chk_apollo = QCheckBox("Show Apollo Landing Sites")
         self.chk_apollo.setChecked(False)
         self.chk_apollo.setStyleSheet("color: #8E44AD; font-weight: bold;")
         self.chk_apollo.toggled.connect(self.toggle_apollo)
+
+        self.chk_plot_borders = QCheckBox("Plot Borders (Index Pen)")
+        self.chk_plot_borders.setChecked(True)
+        self.chk_plot_borders.setStyleSheet("color: #2E86C1; font-weight: bold;")
+        self.chk_plot_borders.toggled.connect(self.trigger_recalc)
 
         self.chk_circle = QCheckBox("Circle Mode (Hemisphere)")
         self.chk_circle.setChecked(False)
@@ -327,12 +233,6 @@ class PlotterApp(QMainWindow):
         self.chk_blue_water.setChecked(True)
         self.chk_blue_water.toggled.connect(self.trigger_recalc)
 
-        # New Mask/Border features
-        self.chk_plot_borders = QCheckBox("Plot Borders (Index Pen)")
-        self.chk_plot_borders.setChecked(True)
-        self.chk_plot_borders.setStyleSheet("color: #2E86C1; font-weight: bold;")
-        self.chk_plot_borders.toggled.connect(self.trigger_recalc)
-
         self.chk_mask_text = QCheckBox("Clear background behind Text")
         self.chk_mask_text.setChecked(True)
         self.chk_mask_text.setStyleSheet("color: #2E86C1; font-weight: bold;")
@@ -341,14 +241,14 @@ class PlotterApp(QMainWindow):
         vbox.addWidget(self.chk_ocean)
         vbox.addWidget(self.chk_borders)
         vbox.addWidget(self.chk_apollo)
+        vbox.addWidget(self.chk_plot_borders)
         vbox.addWidget(self.chk_circle)
         vbox.addWidget(self.chk_blue_water)
-        vbox.addWidget(self.chk_plot_borders)
         vbox.addWidget(self.chk_mask_text)
 
-        # --- REGION MASKING UI ---
-        vbox.addSpacing(10)
-        vbox.addWidget(QLabel("<b>Region Masking (Clip to border)</b>"))
+        # Region Masking UI
+        self.lbl_region = QLabel("<b>Region Masking (Clip to border)</b>")
+        vbox.addWidget(self.lbl_region)
         self.combo_region = QComboBox()
         self.combo_region.setEditable(True)
         self.combo_region.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
@@ -359,25 +259,19 @@ class PlotterApp(QMainWindow):
             regions = []
             w_col = 'NAME' if 'NAME' in world_borders.columns else 'name' if 'name' in world_borders.columns else None
             s_col = 'name' if 'name' in state_borders.columns else None
-
             if w_col: regions.extend(world_borders[w_col].dropna().tolist())
             if s_col: regions.extend(state_borders[s_col].dropna().tolist())
-
             regions = sorted(list(set(regions)))
             self.combo_region.addItems(regions)
-
-            # Setup Case-Insensitive "Contains" Search
             completer = QCompleter(regions)
             completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
             completer.setFilterMode(Qt.MatchFlag.MatchContains)
             self.combo_region.setCompleter(completer)
 
-        # Trigger a delayed recalculation when a valid region is typed/selected
-        # self.combo_region.currentTextChanged.connect(lambda t: self.recalc_timer.start(500))
         self.combo_region.currentTextChanged.connect(self.on_region_changed)
         vbox.addWidget(self.combo_region)
-        # -------------------------
 
+        # Paper Size
         vbox.addSpacing(10)
         vbox.addWidget(QLabel("<b>Paper / Bed Size</b>"))
         self.combo_paper = QComboBox()
@@ -388,7 +282,7 @@ class PlotterApp(QMainWindow):
         self.widget_custom = QWidget()
         h_custom = QHBoxLayout(self.widget_custom)
         h_custom.setContentsMargins(0, 0, 0, 0)
-        self.txt_cw = QLineEdit("150");
+        self.txt_cw = QLineEdit("150")
         self.txt_ch = QLineEdit("150")
         self.txt_cw.textChanged.connect(self.update_paper_dims)
         self.txt_ch.textChanged.connect(self.update_paper_dims)
@@ -403,18 +297,21 @@ class PlotterApp(QMainWindow):
         self.btn_orientation.clicked.connect(self.toggle_orientation)
         vbox.addWidget(self.btn_orientation)
 
+        # --- CONTOUR SPECIFIC CONTROLS ---
         line2 = QFrame();
         line2.setFrameShape(QFrame.Shape.HLine);
         vbox.addWidget(line2)
 
-        vbox.addWidget(QLabel("<b>Contour Generation</b>"))
+        self.lbl_contour_hdr = QLabel("<b>Contour Generation</b>")
+        vbox.addWidget(self.lbl_contour_hdr)
 
-        # USGS Interval logic display
         self.lbl_usgs_interval = QLabel("Interval: Auto (USGS Scale)")
         self.lbl_usgs_interval.setStyleSheet("color: #8E44AD; font-weight: bold;")
         vbox.addWidget(self.lbl_usgs_interval)
 
-        h_int = QHBoxLayout()
+        self.widget_interval = QWidget()
+        h_int = QHBoxLayout(self.widget_interval)
+        h_int.setContentsMargins(0, 0, 0, 0)
         h_int.addWidget(QLabel("Override (ft):"))
         self.slider_int = QSlider(Qt.Orientation.Horizontal)
         self.slider_int.setRange(50, 10000)
@@ -427,14 +324,16 @@ class PlotterApp(QMainWindow):
         self.txt_int.textChanged.connect(self.update_interval)
         h_int.addWidget(self.slider_int);
         h_int.addWidget(self.txt_int)
-        vbox.addLayout(h_int)
+        vbox.addWidget(self.widget_interval)
 
-        h_idx = QHBoxLayout()
+        self.widget_index = QWidget()
+        h_idx = QHBoxLayout(self.widget_index)
+        h_idx.setContentsMargins(0, 0, 0, 0)
         self.chk_auto_index = QCheckBox("Auto-Index lines every")
         self.chk_auto_index.setChecked(True)
         self.spin_idx = QSpinBox()
-        self.spin_idx.setRange(2, 1000)
-        self.spin_idx.setValue(10)
+        self.spin_idx.setRange(2, 20)
+        self.spin_idx.setValue(5)
         self.spin_idx.setFixedWidth(40)
         h_idx.addWidget(self.chk_auto_index);
         h_idx.addWidget(self.spin_idx);
@@ -442,16 +341,14 @@ class PlotterApp(QMainWindow):
         h_idx.addStretch()
         self.chk_auto_index.toggled.connect(self.trigger_recalc)
         self.spin_idx.valueChanged.connect(self.trigger_recalc)
-        vbox.addLayout(h_idx)
+        vbox.addWidget(self.widget_index)
 
-        line3 = QFrame();
-        line3.setFrameShape(QFrame.Shape.HLine);
-        vbox.addWidget(line3)
+        self.lbl_smooth_hdr = QLabel("<b>Vector Smoothing (USGS Parameters)</b>")
+        vbox.addWidget(self.lbl_smooth_hdr)
 
-        # --- GENERALIZATION & SMOOTHING UI ---
-        vbox.addWidget(QLabel("<b>Vector Smoothing (USGS Parameters)</b>"))
-
-        h_presets = QHBoxLayout()
+        self.widget_presets = QWidget()
+        h_presets = QHBoxLayout(self.widget_presets)
+        h_presets.setContentsMargins(0, 0, 0, 0)
         btn_low = QPushButton("Low");
         btn_low.clicked.connect(lambda: self.apply_usgs_preset(8, 128))
         btn_med = QPushButton("Medium");
@@ -462,10 +359,11 @@ class PlotterApp(QMainWindow):
         h_presets.addWidget(btn_low);
         h_presets.addWidget(btn_med);
         h_presets.addWidget(btn_high)
-        vbox.addLayout(h_presets)
+        vbox.addWidget(self.widget_presets)
 
-        # Raster Blur Slider
-        h_blur = QHBoxLayout()
+        self.widget_blur = QWidget()
+        h_blur = QHBoxLayout(self.widget_blur)
+        h_blur.setContentsMargins(0, 0, 0, 0)
         h_blur.addWidget(QLabel("Raster Blur \u03c3:"))
         self.slider_blur = QSlider(Qt.Orientation.Horizontal)
         self.slider_blur.setRange(0, 50)
@@ -475,37 +373,39 @@ class PlotterApp(QMainWindow):
             lambda v: (self.lbl_blur_val.setText(f"{v / 10.0:.1f}"), self.recalc_timer.start(150)))
         h_blur.addWidget(self.slider_blur);
         h_blur.addWidget(self.lbl_blur_val)
-        vbox.addLayout(h_blur)
+        vbox.addWidget(self.widget_blur)
 
-        # Vector Simplify Slider
-        h_simp = QHBoxLayout()
+        self.widget_simplify = QWidget()
+        h_simp = QHBoxLayout(self.widget_simplify)
+        h_simp.setContentsMargins(0, 0, 0, 0)
         h_simp.addWidget(QLabel("Simplify Tol:"))
         self.slider_simp = QSlider(Qt.Orientation.Horizontal)
         self.slider_simp.setRange(0, 250)
-        self.slider_simp.setValue(40)  # Medium Default (4.0m)
+        self.slider_simp.setValue(40)
         self.lbl_simp_val = QLabel("4.0m")
         self.slider_simp.valueChanged.connect(
             lambda v: (self.lbl_simp_val.setText(f"{v / 10.0:.1f}m"), self.recalc_timer.start(150)))
         h_simp.addWidget(self.slider_simp);
         h_simp.addWidget(self.lbl_simp_val)
-        vbox.addLayout(h_simp)
+        vbox.addWidget(self.widget_simplify)
 
-        # Vector Smoothing Slider
-        h_smooth = QHBoxLayout()
+        self.widget_smooth = QWidget()
+        h_smooth = QHBoxLayout(self.widget_smooth)
+        h_smooth.setContentsMargins(0, 0, 0, 0)
         h_smooth.addWidget(QLabel("Smoothing:"))
         self.slider_smooth = QSlider(Qt.Orientation.Horizontal)
         self.slider_smooth.setRange(0, 3000)
-        self.slider_smooth.setValue(640)  # Medium Default (64.0m)
+        self.slider_smooth.setValue(640)
         self.lbl_smooth_val = QLabel("64.0m")
         self.slider_smooth.valueChanged.connect(
             lambda v: (self.lbl_smooth_val.setText(f"{v / 10.0:.1f}m"), self.recalc_timer.start(150)))
         h_smooth.addWidget(self.slider_smooth);
         h_smooth.addWidget(self.lbl_smooth_val)
-        vbox.addLayout(h_smooth)
+        vbox.addWidget(self.widget_smooth)
 
         vbox.addStretch()
         self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 0)  # Indeterminate loading animation
+        self.progress_bar.setRange(0, 0)
         self.progress_bar.setVisible(False)
         vbox.addWidget(self.progress_bar)
 
@@ -565,7 +465,6 @@ class PlotterApp(QMainWindow):
         self.canvas_prev = FigureCanvas(self.fig_prev)
         v_prev.addWidget(self.canvas_prev)
 
-        # Preview Zoom Toolbar
         h_prev_toolbar = QHBoxLayout()
         self.btn_prev_home = QPushButton("Reset View")
         self.btn_prev_home.clicked.connect(self.reset_prev_view)
@@ -584,7 +483,6 @@ class PlotterApp(QMainWindow):
         v_pal = QVBoxLayout(self.frame_palette)
         v_pal.setContentsMargins(8, 8, 8, 8)
 
-        # Top Tool Modes
         h_modes = QHBoxLayout()
         self.mode_group = QButtonGroup()
         modes = [('paint', 'Paint'), ('draw', 'Draw Line'), ('text', 'Add Text'), ('transform', 'Move/Rotate Text')]
@@ -598,31 +496,25 @@ class PlotterApp(QMainWindow):
         self.mode_group.buttonClicked.connect(self.change_mode)
         v_pal.addLayout(h_modes)
 
-        # Undo / Redo / Add Pen
         h_tools = QHBoxLayout()
         btn_style = "background-color: #E5E7E9; color: black; font-weight: bold; padding: 4px; border-radius: 3px;"
-
-        self.btn_undo = QPushButton("Undo (Ctrl+Z)")
+        self.btn_undo = QPushButton("Undo (Ctrl+Z)");
         self.btn_undo.setStyleSheet(btn_style);
         self.btn_undo.setEnabled(False)
         self.btn_undo.clicked.connect(self.undo_action)
-
-        self.btn_redo = QPushButton("Redo (Ctrl+Y)")
+        self.btn_redo = QPushButton("Redo (Ctrl+Y)");
         self.btn_redo.setStyleSheet(btn_style);
         self.btn_redo.setEnabled(False)
         self.btn_redo.clicked.connect(self.redo_action)
-
-        self.btn_add_pen = QPushButton("Add Custom Pen")
+        self.btn_add_pen = QPushButton("Add Custom Pen");
         self.btn_add_pen.setStyleSheet(btn_style)
         self.btn_add_pen.clicked.connect(self.add_custom_pen)
-
         h_tools.addWidget(self.btn_undo);
-        h_tools.addWidget(self.btn_redo)
+        h_tools.addWidget(self.btn_redo);
         h_tools.addStretch();
         h_tools.addWidget(self.btn_add_pen)
         v_pal.addLayout(h_tools)
 
-        # Vertical Scroll Area for Pens
         self.scroll_pens = QScrollArea()
         self.scroll_pens.setWidgetResizable(True)
         self.scroll_pens.setFixedHeight(100)
@@ -667,62 +559,70 @@ class PlotterApp(QMainWindow):
         self.canvas_prev.mpl_connect('pick_event', self.on_prev_pick)
 
         self.update_paper_dims()
+        self.context_ui_update()
+
+    def context_ui_update(self):
+        """Dynamically hides/shows UI options based on active planet and mode."""
+        planet = 'Earth' if self.radio_earth.isChecked() else 'Moon'
+        mode = self.combo_mode.currentText()
+        is_earth = (planet == 'Earth')
+        is_topo = "Topography" in mode
+
+        is_color = "Color Separation" in mode
+
+        # These options only feed the contour engine, so hide them in hatch modes.
+        self.chk_ocean.setVisible(is_topo)
+        self.chk_plot_borders.setVisible(is_earth and is_topo)
+        self.chk_blue_water.setVisible(is_earth and is_topo)
+        self.lbl_region.setVisible(is_earth and is_topo)
+        self.combo_region.setVisible(is_earth and is_topo)
+
+        self.chk_apollo.setVisible(not is_earth and is_topo)
+
+        self.lbl_hatch.setVisible(not is_topo)
+        self.combo_hatch.setVisible(not is_topo)
+        self.widget_hatch_opts.setVisible(not is_topo)
+        self.lbl_ink_set.setVisible(is_color)
+        self.combo_ink_set.setVisible(is_color)
+
+        self.lbl_usgs_interval.setVisible(is_topo)
+        self.widget_interval.setVisible(is_topo)
+        self.widget_index.setVisible(is_topo)
+        self.widget_simplify.setVisible(is_topo)
+        self.widget_smooth.setVisible(is_topo)
+        self.widget_blur.setVisible(is_topo)
+        self.widget_presets.setVisible(is_topo)
+        self.lbl_smooth_hdr.setVisible(is_topo)
+        self.lbl_contour_hdr.setVisible(is_topo)
 
     def on_region_changed(self, text):
         if "Tahoe" in text:
-            self.slider_int.blockSignals(True)
+            self.slider_int.blockSignals(True);
             self.txt_int.blockSignals(True)
-            self.slider_int.setRange(25, 500)
+            self.slider_int.setRange(25, 500);
             self.slider_int.setSingleStep(25)
-            self.slider_int.setValue(75)
+            self.slider_int.setValue(75);
             self.txt_int.setText("75")
             self.interval_ft = 75
             self.lbl_usgs_interval.setText("Interval: Tahoe Bathymetry (75 ft)")
-            self.slider_int.blockSignals(False)
+            self.slider_int.blockSignals(False);
             self.txt_int.blockSignals(False)
         else:
-            self.slider_int.blockSignals(True)
+            self.slider_int.blockSignals(True);
             self.txt_int.blockSignals(True)
-            self.slider_int.setRange(50, 10000)
+            self.slider_int.setRange(50, 10000);
             self.slider_int.setSingleStep(50)
             val = max(50, self.interval_ft)
-            self.slider_int.setValue(val)
+            self.slider_int.setValue(val);
             self.txt_int.setText(str(val))
             self.lbl_usgs_interval.setText("Interval: Auto (USGS Scale)")
-            self.slider_int.blockSignals(False)
+            self.slider_int.blockSignals(False);
             self.txt_int.blockSignals(False)
-
+        # A different region is a different map: re-render fresh (auto interval unless Tahoe).
+        self.pending_fresh = True
         self.recalc_timer.start(500)
 
-    # --- MODE & STATE LOGIC ---
-    def apply_usgs_preset(self, simp, smooth):
-        self.slider_simp.setValue(simp)
-        self.slider_smooth.setValue(smooth)
-        self.trigger_recalc()
-
-    def update_mode_button_styles(self):
-        for btn in self.mode_group.buttons():
-            if btn.isChecked():
-                btn.setStyleSheet(
-                    "background-color: #2E86C1; color: white; font-weight: bold; border-radius: 4px; padding: 6px;")
-            else:
-                btn.setStyleSheet("background-color: #E5E7E9; color: black; border-radius: 4px; padding: 6px;")
-
-    def change_mode(self, btn):
-        self.canvas_mode = btn.property("mode")
-        self.update_mode_button_styles()
-        self.btn_prev_zoom.setChecked(False)
-        self.prev_zoom_selector.set_active(False)
-        if self.canvas_mode == 'text':
-            self.lbl_status.setText("Text Mode: Click on the preview map to place text.")
-        elif self.canvas_mode == 'draw':
-            self.lbl_status.setText("Draw Mode: Click and drag on the preview map to draw contours.")
-        elif self.canvas_mode == 'transform':
-            self.lbl_status.setText("Transform Mode: Click & Drag to move. Scroll to Rotate. Shift+Scroll to Scale.")
-        else:
-            self.lbl_status.setText(
-                "Paint Mode: Click a contour to change its pen (Shift+Click to change all at elevation).")
-
+    # --- PEN PALETTE & STATES ---
     def push_undo_state(self):
         state = {'pens': [s['pen_id'] for s in self.dem_segments], 'custom': copy.deepcopy(self.custom_items)}
         self.undo_stack.append(state);
@@ -750,12 +650,13 @@ class PlotterApp(QMainWindow):
         self.update_undo_redo_btns()
 
     def _apply_state(self, state):
-        for i, p_id in enumerate(state['pens']):
-            if i < len(self.dem_segments): self.dem_segments[i]['pen_id'] = p_id
+        # Pen paint is stored per segment index; it only applies to the same render it came from.
+        if len(state['pens']) == len(self.dem_segments):
+            for i, p_id in enumerate(state['pens']):
+                self.dem_segments[i]['pen_id'] = p_id
         self.custom_items = copy.deepcopy(state['custom'])
         self.render_canvas()
 
-    # --- PEN PALETTE ---
     def rebuild_palette_ui(self):
         while self.v_palette_btns.count():
             item = self.v_palette_btns.takeAt(0)
@@ -785,35 +686,56 @@ class PlotterApp(QMainWindow):
         save_pens(self.pens)
         self.rebuild_palette_ui()
 
+    def apply_usgs_preset(self, simp, smooth):
+        self.slider_simp.setValue(simp)
+        self.slider_smooth.setValue(smooth)
+        self.trigger_recalc()
+
+    def update_mode_button_styles(self):
+        for btn in self.mode_group.buttons():
+            if btn.isChecked():
+                btn.setStyleSheet(
+                    "background-color: #2E86C1; color: white; font-weight: bold; border-radius: 4px; padding: 6px;")
+            else:
+                btn.setStyleSheet("background-color: #E5E7E9; color: black; border-radius: 4px; padding: 6px;")
+
+    def change_mode(self, btn):
+        self.canvas_mode = btn.property("mode")
+        self.update_mode_button_styles()
+        self.btn_prev_zoom.setChecked(False)
+        self.prev_zoom_selector.set_active(False)
+        if self.canvas_mode == 'text':
+            self.lbl_status.setText("Text Mode: Click on the preview map to place text.")
+        elif self.canvas_mode == 'draw':
+            self.lbl_status.setText("Draw Mode: Click and drag on the preview map to draw contours.")
+        elif self.canvas_mode == 'transform':
+            self.lbl_status.setText("Transform Mode: Click & Drag to move. Scroll to Rotate. Shift+Scroll to Scale.")
+        else:
+            self.lbl_status.setText(
+                "Paint Mode: Click a contour to change its pen (Shift+Click to change all at elevation).")
+
     # --- MAP & DATA CALCULATION ---
-    def trigger_recalc(self):
-        # Prevent recursive freezing by locking the thread while it calculates
-        if getattr(self, 'is_calculating', False):
-            self.recalc_pending = True
-            return
-
+    def on_mode_changed(self, _text=None):
+        self.context_ui_update()
         if self.has_drawn:
-            self.is_calculating = True
-
-            # Turn on loading UI and force render
-            self.progress_bar.setVisible(True)
-            self.lbl_status.setText("Recalculating contours...")
-            QApplication.processEvents()
-
-            self.push_undo_state()
-            self.calculate_dem_contours()
+            # Switching between topo and hatching is a brand-new render (auto interval, fresh view).
+            self.pending_fresh = True
+            self.recalc_timer.start(100)
+        else:
             self.render_canvas()
 
-            # Turn off loading UI
-            self.progress_bar.setVisible(False)
-            self.lbl_status.setText("Ready.")
-
-            self.is_calculating = False
-
-            # If the user dragged the slider WHILE it was calculating, run it one more time at the end
-            if getattr(self, 'recalc_pending', False):
-                self.recalc_pending = False
-                self.recalc_timer.start(100)
+    def trigger_recalc(self):
+        # NOTE: no extra parameters - this slot is connected to toggled(bool)/valueChanged(int),
+        # and PyQt would pass those values in as arguments.
+        if self.is_calculating:
+            self.recalc_pending = True
+            return
+        if self.has_drawn and self.current_view_extent:
+            fresh = self.pending_fresh
+            self.pending_fresh = False
+            if not fresh:
+                self.push_undo_state()
+            self._start_render(fresh=fresh)
 
     def update_interval(self, text):
         try:
@@ -823,359 +745,181 @@ class PlotterApp(QMainWindow):
                 self.slider_int.blockSignals(True)
                 self.slider_int.setValue(val)
                 self.slider_int.blockSignals(False)
+                if "Tahoe" not in self.combo_region.currentText():
+                    self.lbl_usgs_interval.setText(f"Interval: Manual ({val} ft)")
                 self.recalc_timer.start(250)
         except ValueError:
             pass
 
+    def get_ui_params(self):
+        return {
+            'active_planet': self.active_planet,
+            'selected_region': self.combo_region.currentText(),
+            'circle_mode': self.chk_circle.isChecked(),
+            'show_ocean': self.chk_ocean.isChecked(),
+            'show_borders': self.chk_plot_borders.isChecked(),
+            'show_apollo': self.chk_apollo.isChecked(),
+            'blue_water': self.chk_blue_water.isChecked(),
+            'interval_ft': self.interval_ft,
+            'auto_index': self.chk_auto_index.isChecked(),
+            'index_interval': self.spin_idx.value(),
+            'simp_tol': self.slider_simp.value() / 10.0,
+            'smooth_val': self.slider_smooth.value() / 10.0,
+            'blur_sigma': self.slider_blur.value() / 10.0,
+            'plot_mode': self.combo_mode.currentText(),
+            'hatch_strategy': self.combo_hatch.currentText(),
+            'ink_set': self.combo_ink_set.currentText(),
+            'hatch_spacing_mm': self.spin_spacing.value(),
+            'auto_contrast': self.chk_auto_contrast.isChecked(),
+            'paper_w_mm': self.pw,
+            'paper_h_mm': self.ph,
+            'pens': copy.deepcopy(self.pens),
+        }
+
     def draw_action(self):
+        """'1. DRAW MAP' button: always a fresh render (auto interval, reset view, clear annotations)."""
+        if self.is_calculating:
+            return
+        self._start_render(fresh=True)
+
+    def _start_render(self, fresh):
         if not self.current_view_extent: return
-        self.btn_draw.setEnabled(False)
-
-        self.progress_bar.setVisible(True)
-        self.lbl_status.setText("Extracting DEM data... Please wait.")
-        QApplication.processEvents()
-
+        params = self.get_ui_params()
         dem_path = DATA_FILES[self.active_planet]['dem']
-        selected_region = self.combo_region.currentText()
-        if self.active_planet == 'Earth' and "Tahoe" in selected_region:
+        if self.active_planet == 'Earth' and "Tahoe" in params['selected_region']:
             dem_path = "tahoe2.tif"
 
-        if not os.path.exists(dem_path):
+        if "Topography" in params['plot_mode'] and not os.path.exists(dem_path):
             QMessageBox.critical(self, "Missing File", f"Cannot find {dem_path}")
-            self.btn_draw.setEnabled(True)
-            self.progress_bar.setVisible(False)
             self.lbl_status.setText("Ready.")
             return
 
-        self.worker = DataFetchWorker(self.active_planet, dem_path, self.current_view_extent, selected_region)
-        self.worker.finished.connect(self.on_fetch_success)
-        self.worker.error.connect(self.on_fetch_error)  # Make sure on_fetch_error turns off the progress bar too!
-        self.worker.start()
+        self.btn_draw.setEnabled(False)
+        self.is_calculating = True
+        self.progress_bar.setVisible(True)
 
-    def on_fetch_success(self, dem_data, extent, min_e, max_e):
-        self.current_dem_crop = dem_data
-        self.current_data_extent = extent
-        relief = max_e - min_e
+        worker = RenderWorker(self.active_planet, dem_path, self.current_view_extent, params, fresh=fresh)
+        worker.token = self._render_token
+        worker.result_ready.connect(self.on_render_success)
+        worker.error.connect(self.on_render_error)
+        worker.progress.connect(self.on_render_progress)
+        worker.finished.connect(self._on_worker_thread_finished)   # QThread's own finished signal
+        self._workers.add(worker)
+        self.worker = worker
+        worker.start()
 
-        selected_region = self.combo_region.currentText()
-        is_tahoe = (self.active_planet == 'Earth' and "Tahoe" in selected_region)
+    def _on_worker_thread_finished(self):
+        w = self.sender()
+        if w in self._workers:
+            self._workers.discard(w)
+            w.deleteLater()
 
-        if relief > 0 and not is_tahoe:
-            if relief < 200:
-                best_step = 5
-            elif relief <= 725:
-                best_step = 10
-            elif relief <= 2075:
-                best_step = 20
-            elif relief <= 3500:
-                best_step = 40
-            elif relief <= 5500:
-                best_step = 80
-            elif relief <= 7100:
-                best_step = 100
-            else:
-                best_step = 120
-            best_step*=100
-            self.interval_ft = best_step
-            self.lbl_usgs_interval.setText(f"Interval: Auto USGS ({best_step} ft)")
+    def on_render_progress(self, msg):
+        self.lbl_status.setText(msg)
+
+    def _finish_render(self, status):
+        self.btn_draw.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.lbl_status.setText(status)
+        self.is_calculating = False
+        if self.recalc_pending:
+            self.recalc_pending = False
+            self.recalc_timer.start(100)
+
+    def on_render_success(self, result):
+        sender = self.sender()
+        if sender is not None and getattr(sender, 'token', self._render_token) != self._render_token:
+            # Selection/planet changed while this was computing - discard it.
+            self._finish_render("Selection changed - click '1. DRAW MAP'.")
+            return
+        self.current_dem_crop = result['dem_data']
+        self.current_data_extent = result['extent']
+        self.dem_segments = result['segments']
+        fresh = result['fresh']
+
+        step = result.get('auto_interval')
+        if step:
             self.slider_int.blockSignals(True)
             self.txt_int.blockSignals(True)
-            self.slider_int.setValue(best_step)
-            self.txt_int.setText(str(best_step))
+            self.interval_ft = step
+            self.slider_int.setValue(min(max(step, self.slider_int.minimum()), self.slider_int.maximum()))
+            self.txt_int.setText(str(step))
+            self.lbl_usgs_interval.setText(f"Interval: Auto ({step} ft, relief {result['max_e'] - result['min_e']:,.0f} ft)")
             self.slider_int.blockSignals(False)
             self.txt_int.blockSignals(False)
 
         self.has_drawn = True
-        self.custom_items = []
-        self.undo_stack.clear()
-        self.redo_stack.clear()
-        self.update_undo_redo_btns()
-
-        self.lbl_status.setText("Generating topographical vectors...")
-        QApplication.processEvents()
-
-        self.calculate_dem_contours()
-        self.ax_prev.set_xlim(0.0, 1.0)
-        self.ax_prev.set_ylim(0.0, 1.0)
+        if fresh:
+            self.custom_items = []
+            self.undo_stack.clear()
+            self.redo_stack.clear()
+            self.update_undo_redo_btns()
+            self.ax_prev.set_xlim(0.0, 1.0)
+            self.ax_prev.set_ylim(0.0, 1.0)
         self.render_canvas()
 
-        self.btn_draw.setEnabled(True)
-        self.progress_bar.setVisible(False)
-        self.lbl_status.setText("Render complete!")
+        n = len(self.dem_segments)
+        self._finish_render(f"Render complete ({n:,} strokes)." if n else
+                            "Render complete - nothing to plot for these settings.")
 
-    def on_fetch_error(self, err_msg):
-        self.btn_draw.setEnabled(True)
-        self.progress_bar.setVisible(False)
-        self.lbl_status.setText("Ready.")
-        QMessageBox.critical(self, "Read Error", err_msg)
+    def on_render_error(self, err_msg):
+        self._finish_render("Ready.")
+        QMessageBox.critical(self, "Render Error", err_msg)
 
-    def calculate_dem_contours(self):
-        self.dem_segments = []
-        if not self.has_drawn or self.current_dem_crop is None: return
+    def closeEvent(self, event):
+        for w in list(self._workers):
+            w.wait()
+        super().closeEvent(event)
 
-        selected_region = self.combo_region.currentText()
-        is_tahoe = (self.active_planet == 'Earth' and "Tahoe" in selected_region)
-        is_circle = getattr(self, 'circle_mode_active', False)
-        mult = DATA_FILES[self.active_planet]['multiplier']
+    def current_paper_color(self):
+        mode = self.combo_mode.currentText()
+        if "Color Separation" in mode:
+            return INK_SETS.get(self.combo_ink_set.currentText(), INK_SETS[DEFAULT_INK_SET])['paper']
+        if "Monochrome" in mode:
+            return MONO_INK_SET['paper']
+        return '#FFFFFF'
 
-        crop_ft = self.current_dem_crop.copy() * mult
-
-        if np.isnan(crop_ft).all(): return
-        valid_mask = ~np.isnan(crop_ft)
-
-        sigma = self.slider_blur.value() / 10.0
-        if sigma > 0:
-            safe_crop = np.where(valid_mask, crop_ft, np.nanmax(crop_ft))
-            blurred = scipy.ndimage.gaussian_filter(safe_crop, sigma=sigma, mode='nearest')
-            crop_ft = np.where(valid_mask, blurred, np.nan)
-
-        min_e, max_e = np.nanmin(crop_ft), np.nanmax(crop_ft)
-
-        if is_tahoe:
-            shoreline = min_e + 1645.0
-            levels = np.arange(shoreline, min_e, -self.interval_ft)
-            levels = np.sort(levels).tolist()
-        else:
-            s_lvl = np.floor(min_e / self.interval_ft) * self.interval_ft
-            e_lvl = np.ceil(max_e / self.interval_ft) * self.interval_ft
-            levels = np.arange(s_lvl, e_lvl + self.interval_ft, self.interval_ft).tolist()
-
-            # --- OCEAN THINNING LOGIC ---
-            if self.active_planet == 'Earth':
-                if not self.show_ocean:
-                    levels = [l for l in levels if l >= 0]
-                elif is_circle:
-                    # Oceans drop drastically. Thin out negative contours to perfectly match
-                    # the Index SpinBox multiplier (e.g., 5x sparser) so it doesn't turn into a blue blob.
-                    ocean_step = self.interval_ft * self.spin_idx.value()
-                    levels = [l for l in levels if l >= 0 or (l < 0 and l % ocean_step == 0)]
-
-        if len(levels) == 0: return
-        levels = np.unique(np.sort(levels))
-
-        if self.active_planet == 'Earth':
-            R_planet = 6371000.0
-        elif self.active_planet == 'Moon':
-            R_planet = 1737400.0
-        elif self.active_planet == 'Mars':
-            R_planet = 3389500.0
-
-        mid_lat = np.radians((self.current_data_extent[2] + self.current_data_extent[3]) / 2)
-        mid_lon = (self.current_data_extent[0] + self.current_data_extent[1]) / 2
-        cos_lat = np.cos(mid_lat)
-        deg2rad = np.pi / 180.0
-
-        simp_tol = self.slider_simp.value() / 10.0
-        smooth_val = self.slider_smooth.value() / 10.0
-
-        chaikin_iters = 0
-        if smooth_val > 10.0: chaikin_iters = 1
-        if smooth_val > 40.0: chaikin_iters = 2
-        if smooth_val > 150.0: chaikin_iters = 3
-
-        def generalize_line(line_seg):
-            xs = (line_seg[:, 0] - mid_lon) * deg2rad * R_planet * cos_lat
-            ys = (line_seg[:, 1] - mid_lat) * deg2rad * R_planet
-            m_seg = np.column_stack((xs, ys))
-            if simp_tol > 0:
-                ls = LineString(m_seg)
-                m_seg = np.array(ls.simplify(simp_tol, preserve_topology=True).coords)
-            if chaikin_iters > 0 and len(m_seg) >= 3:
-                m_seg = chaikin_smooth(m_seg, chaikin_iters)
-            out_seg = np.empty_like(m_seg)
-            out_seg[:, 0] = mid_lon + m_seg[:, 0] / (deg2rad * R_planet * cos_lat)
-            out_seg[:, 1] = mid_lat + m_seg[:, 1] / (deg2rad * R_planet)
-            return out_seg
-
-        def ortho_project(coords):
-            c = np.array(coords)
-            lam = c[:, 0] * deg2rad
-            phi = c[:, 1] * deg2rad
-            lam0 = mid_lon * deg2rad
-            x = R_planet * np.cos(phi) * np.sin(lam - lam0)
-            y = R_planet * np.sin(phi)
-            return np.column_stack((x, y))
-
-        mask_polygon = None
-        if HAS_GPD and self.active_planet == 'Earth' and not is_tahoe and "None" not in selected_region:
-            w_col = 'NAME' if 'NAME' in world_borders.columns else 'name' if 'name' in world_borders.columns else None
-            s_col = 'name' if 'name' in state_borders.columns else None
-
-            geom = None
-            if s_col and selected_region in state_borders[s_col].values:
-                geom = state_borders[state_borders[s_col] == selected_region].geometry.union_all()
-            elif w_col and selected_region in world_borders[w_col].values:
-                geom = world_borders[world_borders[w_col] == selected_region].geometry.union_all()
-
-            if geom:
-                view_box = shp_box(self.current_data_extent[0], self.current_data_extent[2],
-                                   self.current_data_extent[1], self.current_data_extent[3])
-                mask_polygon = geom.intersection(view_box)
-
-        fig_temp = Figure();
-        ax_temp = fig_temp.add_subplot(111)
-        cs = ax_temp.contour(crop_ft, levels=levels, extent=self.current_data_extent, origin='upper')
-
-        for lvl_idx, level in enumerate(cs.levels):
-            segs = cs.allsegs[lvl_idx]
-            is_index = False
-
-            is_water = self.active_planet == 'Earth' and level < 0 and self.chk_blue_water.isChecked()
-
-            if is_tahoe:
-                max_level = np.max(levels)
-                if level == max_level:
-                    is_index = True
-                elif self.chk_auto_index.isChecked() and round(
-                        (max_level - level) / self.interval_ft) % self.spin_idx.value() == 0:
-                    is_index = True
-            else:
-                if self.chk_auto_index.isChecked() and round(level / self.interval_ft) % self.spin_idx.value() == 0:
-                    is_index = True
-
-            if is_water:
-                pen_id = 'blue_038'
-            else:
-                pen_id = 'pen_1' if is_index else 'base'
-
-            for seg in segs:
-                if len(seg) < 2: continue
-                smoothed_seg = generalize_line(seg)
-
-                if mask_polygon and not mask_polygon.is_empty:
-                    line_geom = LineString(smoothed_seg)
-                    clipped = line_geom.intersection(mask_polygon)
-                    valid_lines = []
-
-                    if clipped.is_empty:
-                        continue
-                    elif clipped.geom_type == 'LineString':
-                        valid_lines.append(clipped)
-                    elif clipped.geom_type == 'MultiLineString':
-                        valid_lines.extend(list(clipped.geoms))
-                    elif clipped.geom_type == 'GeometryCollection':
-                        for g in clipped.geoms:
-                            if g.geom_type == 'LineString':
-                                valid_lines.append(g)
-                            elif g.geom_type == 'MultiLineString':
-                                valid_lines.extend(list(g.geoms))
-
-                    for v_line in valid_lines:
-                        if len(v_line.coords) >= 2:
-                            c = np.array(v_line.coords)
-                            if is_circle: c = ortho_project(c)
-                            self.dem_segments.append({'type': 'dem', 'seg': c, 'level': level, 'pen_id': pen_id})
-                else:
-                    c = smoothed_seg
-                    if is_circle: c = ortho_project(c)
-                    self.dem_segments.append({'type': 'dem', 'seg': c, 'level': level, 'pen_id': pen_id})
-
-                # Render Geopolitical Borders ONLY if checkbox is checked
-        if self.chk_plot_borders.isChecked() and self.active_planet == 'Earth' and not is_tahoe:
-            def append_border(coords):
-                c = np.array(coords)
-
-                # If wrapped, shift border coordinates so they stitch perfectly with the contiguous map space
-                if self.current_data_extent[1] > 180:
-                    c[:, 0] = np.where(c[:, 0] < 0, c[:, 0] + 360, c[:, 0])
-                elif self.current_data_extent[0] < -180:
-                    c[:, 0] = np.where(c[:, 0] > 0, c[:, 0] - 360, c[:, 0])
-
-                if is_circle: c = ortho_project(c)
-                self.dem_segments.append({'type': 'border', 'seg': c, 'level': 0, 'pen_id': 'pen_1'})
-
-            if mask_polygon and not mask_polygon.is_empty:
-                bound_geom = mask_polygon.boundary
-                if bound_geom.geom_type == 'LineString':
-                    append_border(bound_geom.coords)
-                elif bound_geom.geom_type == 'MultiLineString':
-                    for line in bound_geom.geoms: append_border(line.coords)
-
-            elif HAS_GPD and "None" in selected_region:
-                # Create dual clipping boxes if wrapped
-                view_boxes = []
-                if self.current_data_extent[0] < -180:
-                    view_boxes.append(shp_box(self.current_data_extent[0] + 360, -90, 180, 90))
-                    view_boxes.append(shp_box(-180, -90, self.current_data_extent[1], 90))
-                elif self.current_data_extent[1] > 180:
-                    view_boxes.append(shp_box(self.current_data_extent[0], -90, 180, 90))
-                    view_boxes.append(shp_box(-180, -90, self.current_data_extent[1] - 360, 90))
-                else:
-                    view_boxes.append(
-                        shp_box(self.current_data_extent[0], -90, self.current_data_extent[1], 90))
-
-                for v_box in view_boxes:
-                    for gdf in [world_borders, state_borders]:
-                        try:
-                            clipped = gpd.clip(gdf, v_box)
-                            for geom in clipped.geometry:
-                                if geom.geom_type == 'Polygon':
-                                    append_border(geom.exterior.coords)
-                                    for ring in geom.interiors: append_border(ring.coords)
-                                elif geom.geom_type == 'MultiPolygon':
-                                    for poly in geom.geoms:
-                                        append_border(poly.exterior.coords)
-                                        for ring in poly.interiors: append_border(ring.coords)
-                                elif geom.geom_type == 'LineString':
-                                    append_border(geom.coords)
-                                elif geom.geom_type == 'MultiLineString':
-                                    for line in geom.geoms: append_border(line.coords)
-                        except Exception:
-                            pass
-        if hasattr(self, 'chk_apollo') and self.chk_apollo.isChecked() and self.active_planet == 'Moon':
-            apollo_sites = {
-                "Apollo 11": (0.67416, 23.47314), "Apollo 12": (-3.0128, -23.4219),
-                "Apollo 14": (-3.64589, -17.47194), "Apollo 15": (26.13239, 3.63330),
-                "Apollo 16": (-8.9734, 15.5011), "Apollo 17": (20.1911, 30.7723)
-            }
-            rad = 0.5  # Physical size of the X from center (0.5 degrees)
-            for name, (lat, lon) in apollo_sites.items():
-                c1 = np.array([[lon - rad, lat - rad], [lon + rad, lat + rad]])
-                c2 = np.array([[lon - rad, lat + rad], [lon + rad, lat - rad]])
-
-                if is_circle:
-                    lon_diff = (lon - mid_lon + 180) % 360 - 180
-                    # Only append to G-Code vectors if it's on the visible side of the sphere
-                    if abs(lon_diff) <= 90:
-                        self.dem_segments.append(
-                            {'type': 'border', 'seg': ortho_project(c1), 'level': 0, 'pen_id': 'red_038'})
-                        self.dem_segments.append(
-                            {'type': 'border', 'seg': ortho_project(c2), 'level': 0, 'pen_id': 'red_038'})
-                else:
-                    self.dem_segments.append({'type': 'border', 'seg': c1, 'level': 0, 'pen_id': 'red_038'})
-                    self.dem_segments.append({'type': 'border', 'seg': c2, 'level': 0, 'pen_id': 'red_038'})
-
-
-        # ALWAYS draw the physical Globe Outline when in Circle Mode
-        if is_circle:
-            theta = np.linspace(0, 2 * np.pi, 200)
-            globe_circle = np.column_stack((R_planet * np.cos(theta), R_planet * np.sin(theta)))
-            self.dem_segments.append({'type': 'border', 'seg': globe_circle, 'level': 0, 'pen_id': 'pen_1'})
     # --- HIGH PERFORMANCE RENDERER ---
     def render_canvas(self):
         xlim, ylim = self.ax_prev.get_xlim(), self.ax_prev.get_ylim()
         is_fresh = (xlim == (0.0, 1.0) and ylim == (0.0, 1.0))
 
-        self.ax_prev.clear();
+        self.ax_prev.clear()
         self.ax_prev.set_xticks([]);
         self.ax_prev.set_yticks([])
-        if not getattr(self, 'has_drawn', False): return
+
+        # Show the paper colour of the active ink set
+        self.ax_prev.set_facecolor(self.current_paper_color())
+
+        if not self.has_drawn or not self.current_view_extent:
+            self.canvas_prev.draw_idle()
+            return
 
         mid_lat = np.radians((self.current_view_extent[2] + self.current_view_extent[3]) / 2)
         self.ax_prev.set_aspect(1 / np.cos(mid_lat))
 
         if getattr(self, 'dem_segments', []):
             segs = [item['seg'] for item in self.dem_segments]
-            colors = [self.pens[item['pen_id']]['color'] for item in self.dem_segments]
-            lws = [self.pens[item['pen_id']]['width'] * PT_PER_MM for item in self.dem_segments]
+            colors = [self.pens.get(item['pen_id'], self.pens['base'])['color'] for item in self.dem_segments]
+            if "Topography" in self.combo_mode.currentText():
+                lws = [self.pens.get(item['pen_id'], self.pens['base'])['width'] * PT_PER_MM
+                       for item in self.dem_segments]
+            else:
+                # Hatching: draw strokes at true paper scale (for the full-page view) so the
+                # preview's tone matches what the pens will actually lay down.
+                bbox = self.ax_prev.get_window_extent()
+                pt_per_paper_mm = (bbox.width / self.pw) * 72.0 / self.fig_prev.dpi if bbox.width > 0 else PT_PER_MM
+                lws = []
+                for item in self.dem_segments:
+                    pen = self.pens.get(item['pen_id'], self.pens['base'])
+                    lws.append(float(pen.get('line_mm', pen['width'])) * pt_per_paper_mm)
 
-            # zorder=10 keeps DEM lines behind Text Masks (zorder=14)
             self.dem_collection = LineCollection(segs, colors=colors, linewidths=lws, picker=True, pickradius=5,
                                                  zorder=10)
             self.ax_prev.add_collection(self.dem_collection)
 
         for idx, item in enumerate(getattr(self, 'custom_items', [])):
-            pen = self.pens[item['pen_id']]
+            pen = self.pens.get(item['pen_id'], self.pens['base'])
             if item['type'] == 'line':
                 seg = np.array(item['points'])
                 line, = self.ax_prev.plot(seg[:, 0], seg[:, 1], color=pen['color'],
@@ -1186,55 +930,21 @@ class PlotterApp(QMainWindow):
                 tp = TextPath((0, 0), item['text'], size=1)
                 trans = Affine2D().scale(item['scale']).rotate_deg(item['rot']).translate(item['x'], item['y'])
 
-                # Draw Visual Blanking Mask Behind Text
-                if hasattr(self, 'chk_mask_text') and self.chk_mask_text.isChecked():
+                if self.chk_mask_text.isChecked():
                     bbox = tp.transformed(trans).get_extents()
                     pad = item['scale'] * 0.2
                     rect = patches.Rectangle((bbox.x0 - pad, bbox.y0 - pad),
                                              bbox.width + 2 * pad, bbox.height + 2 * pad,
-                                             facecolor='white', edgecolor='none', zorder=14)
+                                             facecolor=self.ax_prev.get_facecolor(), edgecolor='none', zorder=14)
                     self.ax_prev.add_patch(rect)
 
-                polys = tp.transformed(trans).to_polygons()
-                for poly in polys:
+                for poly in tp.transformed(trans).to_polygons():
                     line, = self.ax_prev.plot(poly[:, 0], poly[:, 1], color=pen['color'],
                                               linewidth=pen['width'] * PT_PER_MM, picker=True, pickradius=5, zorder=15)
                     line.item_ref = ('custom', idx)
-        # --- RENDER APOLLO SITES ---
-        if hasattr(self, 'chk_apollo') and self.chk_apollo.isChecked() and self.active_planet == 'Moon':
-            apollo_sites = {
-                "Apollo 11": (0.67416, 23.47314), "Apollo 12": (-3.0128, -23.4219),
-                "Apollo 14": (-3.64589, -17.47194), "Apollo 15": (26.13239, 3.63330),
-                "Apollo 16": (-8.9734, 15.5011), "Apollo 17": (20.1911, 30.7723)
-            }
-            is_circle = getattr(self, 'circle_mode_active', False)
-            R_planet = 1737400.0
-            deg2rad = np.pi / 180.0
-            mid_lon = (self.current_data_extent[0] + self.current_data_extent[
-                1]) / 2 if self.current_data_extent else 0
-
-            for name, (lat, lon) in apollo_sites.items():
-                if is_circle:
-                    lon_diff = (lon - mid_lon + 180) % 360 - 180
-                    # Only plot the landing site if it is on the visible hemisphere
-                    if abs(lon_diff) <= 90:
-                        lam = lon * deg2rad
-                        phi = lat * deg2rad
-                        lam0 = mid_lon * deg2rad
-                        x = R_planet * np.cos(phi) * np.sin(lam - lam0)
-                        y = R_planet * np.sin(phi)
-                        self.ax_prev.plot(x, y, marker='X', markersize=6, color='blue', zorder=20)
-                        # self.ax_prev.text(x + (R_planet * 0.03), y, name, color='red', fontsize=8,
-                        #                   fontweight='bold', zorder=20)
-                else:
-                    self.ax_prev.plot(lon, lat, marker='X', markersize=6, color='red', zorder=20)
-                    offset = (self.current_view_extent[1] - self.current_view_extent[
-                        0]) * 0.02 if self.current_view_extent else 2.0
-                    self.ax_prev.text(lon + offset, lat, name, color='red', fontsize=8, fontweight='bold',
-                                      zorder=20)
 
         if is_fresh and self.current_view_extent:
-            if getattr(self, 'circle_mode_active', False):
+            if self.chk_circle.isChecked():
                 if self.active_planet == 'Earth':
                     R = 6371000.0
                 elif self.active_planet == 'Moon':
@@ -1253,15 +963,14 @@ class PlotterApp(QMainWindow):
             self.ax_prev.set_xlim(xlim)
             self.ax_prev.set_ylim(ylim)
 
-
         self.canvas_prev.draw_idle()
 
     # --- PREVIEW ZOOM & PAN ---
     def reset_prev_view(self):
         if not self.has_drawn: return
-        self.ax_prev.set_xlim(self.current_view_extent[0], self.current_view_extent[1])
-        self.ax_prev.set_ylim(self.current_view_extent[2], self.current_view_extent[3])
-        self.canvas_prev.draw_idle()
+        self.ax_prev.set_xlim(0.0, 1.0)
+        self.ax_prev.set_ylim(0.0, 1.0)
+        self.render_canvas()
 
     def toggle_prev_zoom(self, checked):
         if checked:
@@ -1305,8 +1014,9 @@ class PlotterApp(QMainWindow):
             text, ok = QInputDialog.getText(self, "Add Text", "Enter text to plot:")
             if ok and text:
                 self.push_undo_state()
-                vp_width = self.current_view_extent[1] - self.current_view_extent[0]
-                init_scale = vp_width * 0.05
+                # Use the preview axes width so this also works in circle mode (metres, not degrees).
+                xl = self.ax_prev.get_xlim()
+                init_scale = abs(xl[1] - xl[0]) * 0.05
                 self.custom_items.append({'type': 'text', 'text': text, 'x': event.xdata, 'y': event.ydata,
                                           'rot': 0.0, 'scale': init_scale, 'pen_id': self.active_pen_id})
                 self.render_canvas()
@@ -1318,8 +1028,7 @@ class PlotterApp(QMainWindow):
                 if item['type'] == 'text':
                     dx = event.xdata - item['x'];
                     dy = event.ydata - item['y']
-                    dist = dx * dx + dy * dy
-                    if dist < min_dist: min_dist = dist; target = idx
+                    if (dx * dx + dy * dy) < min_dist: min_dist = dx * dx + dy * dy; target = idx
             if target is not None:
                 self.transform_target_idx = target
                 self.transform_start_state = copy.deepcopy(self.custom_items[target])
@@ -1429,33 +1138,31 @@ class PlotterApp(QMainWindow):
         self.canvas_map.draw_idle()
 
     def clear_selection(self):
+        self._render_token += 1
         self.last_drag_coords = None
+        self.current_view_extent = None
         self.has_drawn = False
-        # Push the red selector box completely out of bounds so it doesn't render at 0,0
         self.selector.extents = (-200, -200, -100, -100)
-        self.ax_prev.clear()
-        self.ax_prev.set_xticks([])
+        self.ax_prev.clear();
+        self.ax_prev.set_xticks([]);
         self.ax_prev.set_yticks([])
         self.canvas_prev.draw_idle()
         self.canvas_map.draw_idle()
         self.custom_items = []
         self.dem_segments = []
-        self.undo_stack.clear()
+        self.undo_stack.clear();
         self.redo_stack.clear()
         self.update_undo_redo_btns()
 
     def toggle_circle_mode(self, checked):
-        self.circle_mode_active = checked
         if checked:
             self.selector.set_active(False)
-            # Push the red selector box off-screen
             self.selector.extents = (-200, -200, -100, -100)
             self.zoom_selector.set_active(False)
             self.canvas_map.setCursor(Qt.CursorShape.OpenHandCursor)
-
             self.circle_center_lon = getattr(self, 'circle_center_lon', 0.0)
             self.update_circle_patches()
-            self.ax_map.set_xlim(-180, 180)
+            self.ax_map.set_xlim(-180, 180);
             self.ax_map.set_ylim(-90, 90)
             self.has_drawn = False
         else:
@@ -1467,9 +1174,9 @@ class PlotterApp(QMainWindow):
         self.canvas_map.draw_idle()
 
     def toggle_zoom_tool(self, checked):
-        if getattr(self, 'circle_mode_active', False):
+        if self.chk_circle.isChecked():
             self.btn_zoom_tool.setChecked(False)
-            return # Block the zoom tool in Circle Mode
+            return
         self.selector.set_active(not checked)
         self.zoom_selector.set_active(checked)
         self.btn_zoom_tool.setStyleSheet("background-color: lightblue;" if checked else "")
@@ -1487,16 +1194,15 @@ class PlotterApp(QMainWindow):
             self.pan_active = True
             self.pan_start_x, self.pan_start_y = event.x, event.y
             self.pan_xlim, self.pan_ylim = self.ax_map.get_xlim(), self.ax_map.get_ylim()
-        elif event.button == 1 and getattr(self, 'circle_mode_active', False) and event.inaxes == self.ax_map:
+        elif event.button == 1 and self.chk_circle.isChecked() and event.inaxes == self.ax_map:
             self.circle_dragging = True
             self.circle_drag_start = event.xdata
             self.circle_start_lon = getattr(self, 'circle_center_lon', 0.0)
             self.canvas_map.setCursor(Qt.CursorShape.ClosedHandCursor)
 
-            # --- BLITTING SETUP (Cache the heavy background map) ---
             self.circle_patch_1.set_visible(False)
             self.circle_patch_2.set_visible(False)
-            self.canvas_map.draw()  # Force a clean draw of just the map/borders
+            self.canvas_map.draw()
             self.bg_cache = self.canvas_map.copy_from_bbox(self.ax_map.bbox)
 
             self.circle_patch_1.set_visible(True)
@@ -1515,26 +1221,21 @@ class PlotterApp(QMainWindow):
             self.canvas_map.draw_idle()
         elif getattr(self, 'circle_dragging', False) and event.inaxes == self.ax_map:
             dx = event.xdata - self.circle_drag_start
-            new_lon = (self.circle_start_lon + dx + 180) % 360 - 180
-            self.circle_center_lon = new_lon
-
-            # --- BLITTING UPDATE (Draw only the patches over the cache) ---
+            self.circle_center_lon = (self.circle_start_lon + dx + 180) % 360 - 180
             if hasattr(self, 'bg_cache'):
                 self.canvas_map.restore_region(self.bg_cache)
                 self.update_circle_patches()
-                if self.circle_patch_1.get_visible():
-                    self.ax_map.draw_artist(self.circle_patch_1)
-                if self.circle_patch_2.get_visible():
-                    self.ax_map.draw_artist(self.circle_patch_2)
+                if self.circle_patch_1.get_visible(): self.ax_map.draw_artist(self.circle_patch_1)
+                if self.circle_patch_2.get_visible(): self.ax_map.draw_artist(self.circle_patch_2)
                 self.canvas_map.blit(self.ax_map.bbox)
 
     def on_mouse_release_map(self, event):
         if event.button == 2:
             self.pan_active = False
-        elif event.button == 1 and getattr(self, 'circle_mode_active', False):
+        elif event.button == 1 and self.chk_circle.isChecked():
             self.circle_dragging = False
             self.canvas_map.setCursor(Qt.CursorShape.OpenHandCursor)
-            self.canvas_map.draw_idle()  # Final sync draw to clean up
+            self.canvas_map.draw_idle()
 
     def update_paper_dims(self):
         if self.paper_name == 'Custom (mm)':
@@ -1562,22 +1263,23 @@ class PlotterApp(QMainWindow):
 
     def switch_planet(self):
         self.active_planet = 'Earth' if self.radio_earth.isChecked() else 'Moon'
-        self.current_dem_src, base_img = load_planet_data(self.active_planet)
+        self.context_ui_update()
+
+        _, base_img = load_planet_data(self.active_planet)
         self.ax_map.clear()
         self.ax_map.imshow(base_img, extent=[-180, 180, -90, 90], origin='upper', zorder=0)
         self.ax_map.set_title(f"Select Region on {self.active_planet}")
 
-        # 1. Preload Color Map Borders
+        # Preload Geopandas Borders invisibly
         self.border_artists = []
         if HAS_GPD and self.active_planet == 'Earth':
-            b1 = world_borders.boundary.plot(ax=self.ax_map, edgecolor='cyan', linewidth=0.6, alpha=0.5, zorder=2)
-            b2 = state_borders.boundary.plot(ax=self.ax_map, edgecolor='cyan', linewidth=0.2, alpha=0.3, zorder=2)
-            self.border_artists.extend(b1.collections + b2.collections)
-
+            world_borders.boundary.plot(ax=self.ax_map, edgecolor='cyan', linewidth=0.6, alpha=0.5, zorder=2)
+            state_borders.boundary.plot(ax=self.ax_map, edgecolor='cyan', linewidth=0.2, alpha=0.3, zorder=2)
+            self.border_artists.extend(self.ax_map.collections)
         for artist in self.border_artists:
             artist.set_visible(self.chk_borders.isChecked())
 
-        # 2. Preload Apollo Landing Sites
+        # Preload Apollo Sites invisibly
         self.apollo_artists = []
         if self.active_planet == 'Moon':
             apollo_sites = {
@@ -1588,25 +1290,19 @@ class PlotterApp(QMainWindow):
             for name, (lat, lon) in apollo_sites.items():
                 marker, = self.ax_map.plot(lon, lat, marker='X', markersize=6, color='yellow', markeredgecolor='black',
                                            zorder=10)
-                # txt = self.ax_map.text(lon + 2.0, lat, name, color='yellow', fontsize=9, fontweight='bold', zorder=10,
-                #                        bbox=dict(boxstyle='round,pad=0.2', facecolor='black', alpha=0.5,
-                #                                  edgecolor='none'))
-                # self.apollo_artists.extend([marker, txt])
                 self.apollo_artists.append(marker)
-
-        for artist in getattr(self, 'apollo_artists', []):
-            artist.set_visible(hasattr(self, 'chk_apollo') and self.chk_apollo.isChecked())
+        for artist in self.apollo_artists:
+            artist.set_visible(self.chk_apollo.isChecked())
 
         self.circle_patch_1 = patches.Rectangle((0, 0), 0, 0, facecolor='blue', alpha=0.2, edgecolor='blue',
                                                 linewidth=1.5, zorder=5)
         self.circle_patch_2 = patches.Rectangle((0, 0), 0, 0, facecolor='blue', alpha=0.2, edgecolor='blue',
                                                 linewidth=1.5, zorder=5)
-        self.ax_map.add_patch(self.circle_patch_1)
+        self.ax_map.add_patch(self.circle_patch_1);
         self.ax_map.add_patch(self.circle_patch_2)
 
         self.clear_selection()
-        if getattr(self, 'circle_mode_active', False):
-            self.update_circle_patches()
+        if self.chk_circle.isChecked(): self.update_circle_patches()
         self.reset_home_view()
 
     def update_circle_patches(self):
@@ -1616,34 +1312,29 @@ class PlotterApp(QMainWindow):
         if l_min < -180:
             self.circle_patch_1.set_bounds(l_min + 360, -90, -180 - l_min, 180)
             self.circle_patch_2.set_bounds(-180, -90, l_max - (-180), 180)
-            self.circle_patch_1.set_visible(True)
+            self.circle_patch_1.set_visible(True);
             self.circle_patch_2.set_visible(True)
         elif l_max > 180:
             self.circle_patch_1.set_bounds(l_min, -90, 180 - l_min, 180)
             self.circle_patch_2.set_bounds(-180, -90, l_max - 180, 180)
-            self.circle_patch_1.set_visible(True)
+            self.circle_patch_1.set_visible(True);
             self.circle_patch_2.set_visible(True)
         else:
             self.circle_patch_1.set_bounds(l_min, -90, 180, 180)
-            self.circle_patch_1.set_visible(True)
+            self.circle_patch_1.set_visible(True);
             self.circle_patch_2.set_visible(False)
 
         self.current_view_extent = [l_min, l_max, -90, 90]
 
-    def toggle_ocean(self, checked):
-        self.show_ocean = checked;
-        self.trigger_recalc()
-
     def toggle_borders(self, checked):
-        for artist in getattr(self, 'border_artists', []):
-            artist.set_visible(checked)
+        for artist in self.border_artists: artist.set_visible(checked)
         self.canvas_map.draw_idle()
 
     def toggle_apollo(self, checked):
-        for artist in getattr(self, 'apollo_artists', []):
-            artist.set_visible(checked)
+        for artist in self.apollo_artists: artist.set_visible(checked)
         self.canvas_map.draw_idle()
-        self.render_canvas()  # Re-render Topo map to show/hide sites
+        # Apollo crosshairs are real plot vectors built by the contour engine -> re-render.
+        self.trigger_recalc()
 
     def zoom_map(self, event):
         if event.inaxes != self.ax_map: return
@@ -1664,11 +1355,10 @@ class PlotterApp(QMainWindow):
         self.process_selection(x1, x2, y1, y2)
 
     def process_selection(self, x1, x2, y1, y2):
-        if self.current_dem_src is None: return
         gw, gh = x2 - x1, y2 - y1
         if gw == 0 or gh == 0: return
         mid_lat = np.radians((y1 + y2) / 2)
-        tw = gw * np.cos(mid_lat)
+        tw = gw * np.cos(mid_lat);
         ta = tw / gh
         cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
         if ta > self.paper_aspect:
@@ -1678,14 +1368,7 @@ class PlotterApp(QMainWindow):
         ex1, ex2 = cx - pad_geo_w / 2, cx + pad_geo_w / 2
         ey1, ey2 = cy - pad_geo_h / 2, cy + pad_geo_h / 2
         self.current_view_extent = [ex1, ex2, ey1, ey2]
-
-        h, w = self.current_dem_src.shape
-        px_x1, px_x2 = int((ex1 + 180) / 360 * w), int((ex2 + 180) / 360 * w)
-        px_y1, px_y2 = int((90 - ey2) / 180 * h), int((90 - ey1) / 180 * h)
-        c_x1, c_x2 = max(0, px_x1), min(w, px_x2)
-        c_y1, c_y2 = max(0, px_y1), min(h, px_y2)
-        if c_x2 <= c_x1 or c_y2 <= c_y1: return
-        self.pending_bounds = [c_x1, c_y1, c_x2, c_y2]
+        self._render_token += 1
         self.has_drawn = False
         self.ax_prev.clear();
         self.ax_prev.set_xticks([]);
@@ -1694,6 +1377,68 @@ class PlotterApp(QMainWindow):
         self.lbl_status.setText("Selection captured. Click '1. DRAW MAP'.")
 
     # --- EXPORT PIPELINES ---
+    def _text_mask_boxes(self):
+        boxes = []
+        if self.chk_mask_text.isChecked():
+            for item in getattr(self, 'custom_items', []):
+                if item['type'] == 'text':
+                    tp = TextPath((0, 0), item['text'], size=1)
+                    trans = Affine2D().scale(item['scale']).rotate_deg(item['rot']).translate(item['x'], item['y'])
+                    bbox = tp.transformed(trans).get_extents()
+                    pad = item['scale'] * 0.2
+                    boxes.append(shp_box(bbox.x0 - pad, bbox.y0 - pad, bbox.x1 + pad, bbox.y1 + pad))
+        return boxes
+
+    @staticmethod
+    def _mask_line(coords, text_boxes):
+        coords = np.asarray(coords, dtype=float)
+        if len(coords) < 2: return []
+        if not text_boxes: return [coords]
+        geoms = [LineString(coords)]
+        for tbox in text_boxes:
+            nxt = []
+            for g in geoms:
+                diff = g.difference(tbox)
+                if diff.is_empty: continue
+                if diff.geom_type == 'LineString':
+                    nxt.append(diff)
+                elif diff.geom_type == 'MultiLineString':
+                    nxt.extend(diff.geoms)
+            geoms = nxt
+        return [np.asarray(g.coords) for g in geoms if len(g.coords) >= 2]
+
+    def _lines_for_pen(self, p_id, text_boxes):
+        """All plot lines (in data coords) for one pen, with text blanking applied."""
+        lines = []
+        for item in getattr(self, 'dem_segments', []):
+            if item.get('pen_id') == p_id:
+                lines.extend(self._mask_line(item['seg'], text_boxes))
+        for item in getattr(self, 'custom_items', []):
+            if item.get('pen_id') != p_id: continue
+            if item['type'] == 'line':
+                lines.extend(self._mask_line(item['points'], text_boxes))
+            elif item['type'] == 'text':
+                tp = TextPath((0, 0), item['text'], size=1)
+                trans = Affine2D().scale(item['scale']).rotate_deg(item['rot']).translate(item['x'], item['y'])
+                lines.extend(np.asarray(poly) for poly in tp.transformed(trans).to_polygons())
+        return lines
+
+    def _make_export_axes(self):
+        export_fig = Figure(figsize=(self.pw / 25.4, self.ph / 25.4))
+        export_ax = export_fig.add_axes([0, 0, 1, 1])
+        export_ax.axis('off')
+        if self.chk_circle.isChecked():
+            R_p = PLANET_RADII.get(self.active_planet, 6371000.0)
+            export_ax.set_aspect('equal')
+            export_ax.set_xlim(-R_p * 1.05, R_p * 1.05)
+            export_ax.set_ylim(-R_p * 1.05, R_p * 1.05)
+        else:
+            mid_lat = np.radians((self.current_view_extent[2] + self.current_view_extent[3]) / 2)
+            export_ax.set_aspect(1 / np.cos(mid_lat))
+            export_ax.set_xlim(self.current_view_extent[0], self.current_view_extent[1])
+            export_ax.set_ylim(self.current_view_extent[2], self.current_view_extent[3])
+        return export_fig, export_ax
+
     def export_svg_action(self):
         if not self.has_drawn:
             QMessageBox.warning(self, "Not Ready", "Draw a map first!")
@@ -1706,89 +1451,15 @@ class PlotterApp(QMainWindow):
         self.lbl_status.setText("Generating Master SVG...")
         QApplication.processEvents()
 
-        export_fig = Figure(figsize=(self.pw / 25.4, self.ph / 25.4))
-        export_ax = export_fig.add_axes([0, 0, 1, 1]);
-        export_ax.axis('off')
-        # mid_lat = np.radians((self.current_view_extent[2] + self.current_view_extent[3]) / 2)
-        # export_ax.set_aspect(1 / np.cos(mid_lat))
-        # export_ax.set_xlim(self.current_view_extent[0], self.current_view_extent[1])
-        # export_ax.set_ylim(self.current_view_extent[2], self.current_view_extent[3])
-        if getattr(self, 'circle_mode_active', False):
-            if self.active_planet == 'Earth':
-                R_p = 6371000.0
-            elif self.active_planet == 'Moon':
-                R_p = 1737400.0
-            else:
-                R_p = 3389500.0
-            export_ax.set_aspect('equal')
-            export_ax.set_xlim(-R_p * 1.05, R_p * 1.05)
-            export_ax.set_ylim(-R_p * 1.05, R_p * 1.05)
-        else:
-            mid_lat = np.radians((self.current_view_extent[2] + self.current_view_extent[3]) / 2)
-            export_ax.set_aspect(1 / np.cos(mid_lat))
-            export_ax.set_xlim(self.current_view_extent[0], self.current_view_extent[1])
-            export_ax.set_ylim(self.current_view_extent[2], self.current_view_extent[3])
-
-        # Prepare Text Subtraction Masks
-        text_boxes = []
-        if hasattr(self, 'chk_mask_text') and self.chk_mask_text.isChecked():
-            for item in getattr(self, 'custom_items', []):
-                if item['type'] == 'text':
-                    tp = TextPath((0, 0), item['text'], size=1)
-                    trans = Affine2D().scale(item['scale']).rotate_deg(item['rot']).translate(item['x'], item['y'])
-                    bbox = tp.transformed(trans).get_extents()
-                    pad = item['scale'] * 0.2
-                    text_boxes.append(shp_box(bbox.x0 - pad, bbox.y0 - pad, bbox.x1 + pad, bbox.y1 + pad))
-
+        export_fig, export_ax = self._make_export_axes()
+        text_boxes = self._text_mask_boxes()
         for p_id, pen in self.pens.items():
-            for item in self.dem_segments:
-                if item['pen_id'] == p_id:
-                    line_geom = LineString(item['seg'])
-                    valid_geoms = [line_geom]
-                    for tbox in text_boxes:
-                        next_geoms = []
-                        for g in valid_geoms:
-                            diff = g.difference(tbox)
-                            if diff.is_empty: continue
-                            if diff.geom_type == 'LineString':
-                                next_geoms.append(diff)
-                            elif diff.geom_type == 'MultiLineString':
-                                next_geoms.extend(list(diff.geoms))
-                        valid_geoms = next_geoms
-                    for g in valid_geoms:
-                        if len(g.coords) >= 2:
-                            export_ax.plot(np.array(g.coords)[:, 0], np.array(g.coords)[:, 1], color=pen['color'],
-                                           linewidth=pen['width'] * PT_PER_MM)
-
-            for item in self.custom_items:
-                if item['pen_id'] == p_id:
-                    if item['type'] == 'line':
-                        line_geom = LineString(item['points'])
-                        valid_geoms = [line_geom]
-                        for tbox in text_boxes:
-                            next_geoms = []
-                            for g in valid_geoms:
-                                diff = g.difference(tbox)
-                                if diff.is_empty: continue
-                                if diff.geom_type == 'LineString':
-                                    next_geoms.append(diff)
-                                elif diff.geom_type == 'MultiLineString':
-                                    next_geoms.extend(list(diff.geoms))
-                            valid_geoms = next_geoms
-                        for g in valid_geoms:
-                            if len(g.coords) >= 2:
-                                export_ax.plot(np.array(g.coords)[:, 0], np.array(g.coords)[:, 1], color=pen['color'],
-                                               linewidth=pen['width'] * PT_PER_MM)
-                    elif item['type'] == 'text':
-                        tp = TextPath((0, 0), item['text'], size=1)
-                        trans = Affine2D().scale(item['scale']).rotate_deg(item['rot']).translate(item['x'], item['y'])
-                        for poly in tp.transformed(trans).to_polygons():
-                            export_ax.plot(poly[:, 0], poly[:, 1], color=pen['color'],
-                                           linewidth=pen['width'] * PT_PER_MM)
+            lines = self._lines_for_pen(p_id, text_boxes)
+            if lines:
+                export_ax.add_collection(LineCollection(lines, colors=pen['color'],
+                                                        linewidths=pen['width'] * PT_PER_MM, label=pen['name']))
 
         export_fig.savefig(out_svg, format='svg')
-        import matplotlib.pyplot as plt
-        plt.close(export_fig)
         self.lbl_status.setText("SVG Generated Successfully!")
         QMessageBox.information(self, "Success", f"Master SVG saved to:\n{out_svg}")
 
@@ -1796,7 +1467,7 @@ class PlotterApp(QMainWindow):
         if not HAS_VPYPE:
             QMessageBox.critical(self, "Missing Library", "Please run: pip install vpype vpype-gcode")
             return
-        if not getattr(self, 'has_drawn', False):
+        if not self.has_drawn:
             QMessageBox.warning(self, "Not Ready", "Draw a map first!")
             return
 
@@ -1816,16 +1487,7 @@ class PlotterApp(QMainWindow):
         temp_dir = tempfile.gettempdir()
         exported_files = []
 
-        # Prepare Text Masks
-        text_boxes = []
-        if hasattr(self, 'chk_mask_text') and self.chk_mask_text.isChecked():
-            for item in getattr(self, 'custom_items', []):
-                if item['type'] == 'text':
-                    tp = TextPath((0, 0), item['text'], size=1)
-                    trans = Affine2D().scale(item['scale']).rotate_deg(item['rot']).translate(item['x'], item['y'])
-                    bbox = tp.transformed(trans).get_extents()
-                    pad = item['scale'] * 0.2
-                    text_boxes.append(shp_box(bbox.x0 - pad, bbox.y0 - pad, bbox.x1 + pad, bbox.y1 + pad))
+        text_boxes = self._text_mask_boxes()
 
         for p_id, pen in self.pens.items():
             safe_pen_name = "".join([c if c.isalnum() else "_" for c in pen['name']])
@@ -1835,102 +1497,27 @@ class PlotterApp(QMainWindow):
             t_svg = os.path.join(temp_dir, f"temp_{p_id}.svg").replace("\\", "/")
             t_gcode = os.path.join(temp_dir, f"temp_{p_id}.gcode").replace("\\", "/")
 
-            export_fig = Figure(figsize=(self.pw / 25.4, self.ph / 25.4))
-            export_ax = export_fig.add_axes([0, 0, 1, 1])
-            export_ax.axis('off')
-
-            # --- SVG PROJECTION BOUNDS ---
-            if getattr(self, 'circle_mode_active', False):
-                if self.active_planet == 'Earth':
-                    R_p = 6371000.0
-                elif self.active_planet == 'Moon':
-                    R_p = 1737400.0
-                else:
-                    R_p = 3389500.0
-                export_ax.set_aspect('equal')
-                export_ax.set_xlim(-R_p * 1.05, R_p * 1.05)
-                export_ax.set_ylim(-R_p * 1.05, R_p * 1.05)
-            else:
-                mid_lat = np.radians((self.current_view_extent[2] + self.current_view_extent[3]) / 2)
-                export_ax.set_aspect(1 / np.cos(mid_lat))
-                export_ax.set_xlim(self.current_view_extent[0], self.current_view_extent[1])
-                export_ax.set_ylim(self.current_view_extent[2], self.current_view_extent[3])
-
-            has_data = False
-
-            # Mask and Plot DEM & Borders
-            for item in getattr(self, 'dem_segments', []):
-                if item.get('pen_id') == p_id:
-                    line_geom = LineString(item['seg'])
-                    valid_geoms = [line_geom]
-                    for tbox in text_boxes:
-                        next_geoms = []
-                        for g in valid_geoms:
-                            diff = g.difference(tbox)
-                            if diff.is_empty: continue
-                            if diff.geom_type == 'LineString':
-                                next_geoms.append(diff)
-                            elif diff.geom_type == 'MultiLineString':
-                                next_geoms.extend(list(diff.geoms))
-                        valid_geoms = next_geoms
-                    for g in valid_geoms:
-                        if len(g.coords) >= 2:
-                            export_ax.plot(np.array(g.coords)[:, 0], np.array(g.coords)[:, 1], color='black',
-                                           linewidth=1)
-                            has_data = True
-
-            # Mask and Plot Custom Items
-            for item in getattr(self, 'custom_items', []):
-                if item.get('pen_id') == p_id:
-                    if item['type'] == 'line':
-                        line_geom = LineString(item['points'])
-                        valid_geoms = [line_geom]
-                        for tbox in text_boxes:
-                            next_geoms = []
-                            for g in valid_geoms:
-                                diff = g.difference(tbox)
-                                if diff.is_empty: continue
-                                if diff.geom_type == 'LineString':
-                                    next_geoms.append(diff)
-                                elif diff.geom_type == 'MultiLineString':
-                                    next_geoms.extend(list(diff.geoms))
-                            valid_geoms = next_geoms
-                        for g in valid_geoms:
-                            if len(g.coords) >= 2:
-                                export_ax.plot(np.array(g.coords)[:, 0], np.array(g.coords)[:, 1], color='black',
-                                               linewidth=1)
-                                has_data = True
-                    elif item['type'] == 'text':
-                        tp = TextPath((0, 0), item['text'], size=1)
-                        trans = Affine2D().scale(item['scale']).rotate_deg(item['rot']).translate(item['x'], item['y'])
-                        for poly in tp.transformed(trans).to_polygons():
-                            export_ax.plot(poly[:, 0], poly[:, 1], color='black', linewidth=1)
-                            has_data = True
-
-            if not has_data:
-                import matplotlib.pyplot as plt
-                plt.close(export_fig)
+            lines = self._lines_for_pen(p_id, text_boxes)
+            if not lines:
                 continue
 
+            self.lbl_status.setText(f"Optimising {pen['name']} ({len(lines):,} strokes)...")
+            QApplication.processEvents()
+            export_fig, export_ax = self._make_export_axes()
+            export_ax.add_collection(LineCollection(lines, colors='black', linewidths=1))
             export_fig.savefig(t_svg, format='svg')
-            import matplotlib.pyplot as plt
-            plt.close(export_fig)
 
             try:
-                vpype_cmd = f'read "{t_svg}" linesimplify -t 0.1mm linemerge -t 0.3mm filter --min-length 2mm linesort gwrite --profile gcodemm "{t_gcode}"'
+                vpype_cmd = (f'read "{t_svg}" linesimplify -t 0.1mm linemerge -t 0.3mm '
+                             f'filter --min-length {MIN_SEGMENT_MM:g}mm linesort gwrite --profile gcodemm "{t_gcode}"')
                 vpype_cli.execute(vpype_cmd)
             except Exception as e:
                 print(f"Skipping {pen['name']} optimization: {e}")
                 continue
 
             master_gcode = [
-                f"; --- START ROUTINE: {pen['name']} ---",
-                "G21",
-                "G90",
-                "G28",
-                "G92 X-50.0 Y-50.0 Z-4.0",
-                "G0 Z1.0 F1500",
-                "M400"
+                f"; --- START ROUTINE: {pen['name']} ---", "G21", "G90", "G28", "G92 X-50.0 Y-50.0 Z-4.0",
+                "G0 Z1.0 F1500", "M400"
             ]
 
             with open(t_gcode, "r") as f:
@@ -1938,36 +1525,23 @@ class PlotterApp(QMainWindow):
                     line = line.strip()
                     if not line: continue
                     if line.startswith("G0 X") or line.startswith("G00 X"):
-                        master_gcode.extend([
-                            "G0 Z1.0 F1500", "M400",
-                            f"{line} F3000", "M400",
-                            "G1 Z0.0 F1000", "M400"
-                        ])
+                        master_gcode.extend(["G0 Z1.0 F1500", "M400", f"{line} F3000", "M400", "G1 Z0.0 F1000", "M400"])
                     elif line.startswith("G1 X") or line.startswith("G01 X"):
                         master_gcode.append(f"{line} F1500")
 
-            master_gcode.extend([
-                "G0 Z1.0 F1500",  # Immediate 1mm vertical hop
-                "M400",  # Wait for physical lift to complete
-                "; --- END OF PLOT ---",
-                "G0 X0 Y0 F3000",  # Slide back to origin
-                "G0 Z25.0 F1500",  # Final clearance lift
-                f"M117 {pen['name']} Complete!",
-                "M84"
-            ])
+            master_gcode.extend(["G0 Z1.0 F1500", "M400", "; --- END OF PLOT ---", "G0 X0 Y0 F3000", "G0 Z25.0 F1500",
+                                 f"M117 {pen['name']} Complete!", "M84"])
 
             try:
                 with open(final_out_gcode, "w") as f:
                     f.write("\n".join(master_gcode))
 
-                # --- TIME ESTIMATION ALGORITHM ---
                 total_time_min = 0.0
-                # Coordinate tracker starts at the exact offset injected by G92 above
                 cx, cy, cz = -50.0, -50.0, -4.0
-                cf = 1500.0  # Default fallback feedrate
+                cf = 1500.0
 
                 for line in master_gcode:
-                    line = line.split(';')[0].strip()  # Strip comments
+                    line = line.split(';')[0].strip()
                     if not line: continue
                     parts = line.split()
                     cmd = parts[0]
@@ -1984,28 +1558,18 @@ class PlotterApp(QMainWindow):
                             elif p.startswith('F'):
                                 cf = float(p[1:])
 
-                        # Euclidean distance of this specific move in mm
                         dist = np.sqrt((nx - cx) ** 2 + (ny - cy) ** 2 + (nz - cz) ** 2)
-
-                        if cf > 0:
-                            # Time in minutes = Distance (mm) / Feedrate (mm/min)
-                            total_time_min += dist / cf
-
+                        if cf > 0: total_time_min += dist / cf
                         cx, cy, cz = nx, ny, nz
 
-                # Add a 15% penalty to account for physical motor acceleration/deceleration curves
                 total_time_min *= 1.15
-                h = int(total_time_min // 60)
-                m = int(total_time_min % 60)
+                h = int(total_time_min // 60);
+                m = int(total_time_min % 60);
                 s = int((total_time_min * 60) % 60)
                 time_str = f"{h}h {m}m {s}s" if h > 0 else f"{m}m {s}s"
 
-                exported_files.append({
-                    'path': final_out_gcode,
-                    'name': pen['name'],
-                    'time': time_str,
-                    'mins': total_time_min
-                })
+                exported_files.append(
+                    {'path': final_out_gcode, 'name': pen['name'], 'time': time_str, 'mins': total_time_min})
 
             except Exception as e:
                 print(f"Error saving {final_out_gcode}: {e}")
@@ -2018,18 +1582,14 @@ class PlotterApp(QMainWindow):
 
         if exported_files:
             total_mins = sum(f['mins'] for f in exported_files)
-            th = int(total_mins // 60)
-            tm = int(total_mins % 60)
+            th = int(total_mins // 60);
+            tm = int(total_mins % 60);
             ts = int((total_mins * 60) % 60)
             total_time_str = f"{th}h {tm}m {ts}s" if th > 0 else f"{tm}m {ts}s"
 
             self.lbl_status.setText(f"Successfully generated {len(exported_files)} files. (Est: {total_time_str})")
-
-            # Print the total time and a per-file breakdown
             msg = f"Generated {len(exported_files)} G-Code files (Total Est. Time: {total_time_str}):\n\n"
-            for f in exported_files:
-                msg += f"• {os.path.basename(f['path'])}  ->  {f['time']}\n"
-
+            for f in exported_files: msg += f"• {os.path.basename(f['path'])}  ->  {f['time']}\n"
             QMessageBox.information(self, "Success", msg)
         else:
             QMessageBox.warning(self, "No Data", "No vector elements found for any active pen!")
@@ -2039,7 +1599,8 @@ class PlotterApp(QMainWindow):
 if __name__ == '__main__':
     if platform.system() == 'Windows':
         import ctypes
-        myappid = 'tps.cartographer.studio.1'  # Arbitrary unique ID string
+
+        myappid = 'tps.cartographer.studio.1'
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
     app = QApplication(sys.argv)
     app.setWindowIcon(QIcon("icon.jpg"))
