@@ -24,7 +24,12 @@ canyons and volcanoes. (Copernicus DEM on AWS Open Data: <i>registry.opendata.aw
 <i>download.gebco.net</i> draw a box and choose <b>GeoTIFF</b>, then <b>Import GeoTIFF</b> (units: metres).</li>
 <li><b>OpenTopography</b> (<i>portal.opentopography.org</i>, free account) - GUI subsetting of GLO-30, NASADEM,
 SRTM and high-resolution lidar; export GeoTIFF, then <b>Import</b>.</li>
-<li>Colour: NASA Blue Marble / Sentinel-2 cloudless GeoTIFFs can be imported as <i>colour</i>.</li>
+<li><b>Colour, Sentinel-2 cloudless 10 m</b> (EOX, global, no clouds) - built into <i>Fetch</i>. Free for
+personal / non-commercial use (CC BY-NC-SA 4.0); credit: <i>EOxCloudless by EOX IT Services GmbH (contains
+modified Copernicus Sentinel data 2024)</i>.</li>
+<li><b>Colour, USGS orthoimagery ~1 m</b> (NAIP aerial photos, USA only, public domain) - built into <i>Fetch</i>.</li>
+<li>Note: elevation and colour are separate downloads - fetch one of each for the same selection. Colour only
+changes the plot when the fill's tone source uses the colour map.</li>
 </ul>
 <h4>Moon</h4>
 <ul>

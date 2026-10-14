@@ -1,8 +1,39 @@
 """Reusable widgets: collapsible sidebar sections and the preview layer list."""
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal, QObject, QEvent, QCoreApplication
 from PyQt6.QtGui import QPixmap, QColor, QIcon, QPainter, QPen
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QToolButton, QCheckBox, QFrame,
-                             QListWidget, QListWidgetItem, QLabel)
+                             QListWidget, QListWidgetItem, QLabel, QComboBox, QAbstractSpinBox, QSlider)
+
+
+class WheelGuard(QObject):
+    """Stops the mouse wheel from changing drop-downs, number boxes and sliders inside a scroll area:
+    the wheel scrolls the panel instead. Click a control (or use the keyboard) to change its value."""
+    GUARDED = (QComboBox, QAbstractSpinBox, QSlider)
+
+    def __init__(self, scroll_area):
+        super().__init__(scroll_area)
+        self.scroll = scroll_area
+
+    def _guarded(self, obj):
+        body = self.scroll.widget()
+        w = obj
+        while isinstance(w, QWidget) and w is not body:
+            if isinstance(w, self.GUARDED):
+                return body is not None and body.isAncestorOf(w)
+            w = w.parentWidget()
+        return False
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.Wheel and self._guarded(obj):
+            QCoreApplication.sendEvent(self.scroll.verticalScrollBar(), event)
+            return True
+        return False
+
+    @classmethod
+    def install(cls, scroll_area):
+        guard = cls(scroll_area)
+        QCoreApplication.instance().installEventFilter(guard)
+        return guard
 
 
 class CollapsibleSection(QWidget):

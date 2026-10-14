@@ -175,6 +175,44 @@ def test_regions_helpers():
     assert regions.safe_name("Grand Canyon (AZ)") == "Grand_Canyon_AZ"
 
 
+def test_xyz_fetch_geometry():
+    """Fake tiles encode their global Mercator pixel row; check the lat/lon re-gridding lands on it."""
+    z_used = {}
+
+    def fake_tile(url):
+        z, y, x = (int(v) for v in url.split('/')[-3:])
+        z_used['z'] = z
+        rows = (y * 256 + np.arange(256)).astype(np.int64)
+        img = np.zeros((256, 256, 3), dtype=np.uint8)
+        img[..., 0] = (rows % 256)[:, None]
+        img[..., 1] = ((rows // 256) % 256)[:, None]
+        img[..., 2] = 7
+        return img
+
+    captured = {}
+    orig_get, orig_write = regions._get_tile, regions._write
+    regions._get_tile = fake_tile
+    regions._write = lambda name, arr, bounds, meta, crs_epsg4326=False: captured.update(arr=arr, bounds=bounds,
+                                                                                          meta=meta) or "x.tif"
+    try:
+        src = {'url': "https://t/{z}/{y}/{x}", 'tiles': 'xyz', 'max_zoom': 14, 'kind': 'color',
+               'extent': (-180, -85, 180, 85), 'units': '', 'source': 'test'}
+        ext = (-120.3, -119.9, 38.9, 39.3)
+        regions.fetch_region(src, 'Earth', ext, 'tahoe_test')
+    finally:
+        regions._get_tile, regions._write = orig_get, orig_write
+    arr, z = captured['arr'], z_used['z']
+    assert arr.shape[0] == 3 and max(arr.shape[1:]) <= regions.MAX_OUT_PX
+    assert np.all(arr[2] == 7)                                   # no blank (unfilled) pixels
+    h = arr.shape[1]
+    for i in (0, h // 2, h - 1):
+        lat = ext[3] - (i + 0.5) / h * (ext[3] - ext[2])
+        want = regions._merc_y(lat, z)
+        got = int(arr[1, i, 0]) * 256 + int(arr[0, i, 0])
+        assert abs((got % 65536) - (int(want) % 65536)) <= 1, (i, got, want)
+    assert captured['bounds'] == (ext[0], ext[2], ext[1], ext[3])
+
+
 def test_project_roundtrip():
     st = {'planet': 'Moon', 'selection': [1.0, 2.0, 3.0, 4.0], 'custom_items': [{'points': np.zeros((2, 2))}],
           'selected_sites': {'Moon': ['Apollo 11']}}

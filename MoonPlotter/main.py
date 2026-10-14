@@ -37,7 +37,7 @@ from config import (DATA_FILES, PAPER_SIZES, PT_PER_MM, PLANET_RADII, INK_SETS, 
 from workers import RenderWorker
 from hatch_engine import composite_ink_layers, STRATEGIES
 from theme import apply_theme, style_axes, SEPIA, ACCENT, TEXT, MUTED
-from ui_widgets import CollapsibleSection, LayerPanel, swatch_icon
+from ui_widgets import CollapsibleSection, LayerPanel, swatch_icon, WheelGuard
 from sites import sites_for, CATEGORY_STYLE
 import exporter
 import regions
@@ -314,6 +314,7 @@ class PlotterApp(QMainWindow):
         vbox.setAlignment(Qt.AlignmentFlag.AlignTop)
         scroll.setWidget(body)
         side_v.addWidget(scroll, 1)
+        self._wheel_guard = WheelGuard.install(scroll)     # wheel scrolls the panel, never the drop-downs
 
         # ---------- STYLE PRESETS ----------
         preset_row = QHBoxLayout()
@@ -1236,7 +1237,11 @@ class PlotterApp(QMainWindow):
         self.refresh_layer_panel()
 
         n = len(self.dem_segments)
-        self._finish_render(f"Render complete ({n:,} strokes)." if n else
+        used = [f"{k} '{r['name']}'" for k, r in (('elevation', (getattr(sender, 'params', None) or {}).get('regional_dem')),
+                                                  ('colour', (getattr(sender, 'params', None) or {}).get('regional_color')))
+                if r]
+        reg_note = (" Using regional " + " + ".join(used) + ".") if used else ""
+        self._finish_render((f"Render complete ({n:,} strokes)." + reg_note) if n else
                             "Render complete - nothing to plot for these settings.")
 
     def on_render_error(self, err_msg):
@@ -1898,6 +1903,9 @@ class PlotterApp(QMainWindow):
         for artist in self.border_artists:
             artist.set_visible(self.chk_borders.isChecked())
 
+        # Sharper regional data (Tools > Data sources): colour drawn on top, elevation coverage outlined
+        self.draw_regional_overlays(redraw=False)
+
         # Points of interest (hover = details, click = plot it, double-click = frame it)
         self.build_site_markers()
 
@@ -1911,6 +1919,43 @@ class PlotterApp(QMainWindow):
         self.clear_selection()
         if self.chk_circle.isChecked(): self.update_circle_patches()
         self.reset_home_view()
+
+    def draw_regional_overlays(self, redraw=True):
+        for a in getattr(self, 'region_artists', []):
+            try:
+                a.remove()
+            except Exception:
+                pass
+        self.region_artists = []
+        try:
+            metas = regions.list_regions(self.active_planet)
+        except Exception as e:
+            print(f"Regional overlay skipped: {e}")
+            metas = []
+        for meta in metas:
+            l, b, r, t = meta['bounds']
+            if meta['kind'] == 'color':
+                try:
+                    import rasterio
+                    with rasterio.open(meta['path']) as src:
+                        k = max(1, int(np.ceil(max(src.width, src.height) / 2000.0)))
+                        img = src.read([1, 2, 3] if src.count >= 3 else [1, 1, 1],
+                                       out_shape=(3, max(1, src.height // k), max(1, src.width // k)))
+                    img = np.transpose(img, (1, 2, 0))
+                    if img.dtype != np.uint8:
+                        img = np.clip(img / (257.0 if img.dtype == np.uint16 else 1.0), 0, 255).astype(np.uint8)
+                    self.region_artists.append(self.ax_map.imshow(img, extent=[l, r, b, t], origin='upper',
+                                                                  zorder=1, interpolation='bilinear'))
+                except Exception as e:
+                    print(f"Could not draw regional colour '{meta['name']}': {e}")
+            rect = patches.Rectangle((l, b), r - l, t - b, fill=False, linewidth=0.9, zorder=3,
+                                     edgecolor='#F4E9CF' if meta['kind'] == 'color' else '#7FD3FF',
+                                     linestyle='-' if meta['kind'] == 'color' else '--')
+            self.ax_map.add_patch(rect)
+            self.region_artists.append(rect)
+        # imshow can reset limits - keep the user's view
+        if redraw:
+            self.canvas_map.draw_idle()
 
     def update_circle_patches(self):
         lon = getattr(self, 'circle_center_lon', 0.0)
@@ -2422,8 +2467,14 @@ class PlotterApp(QMainWindow):
                                            and not self.calibration_mode) else None
         dlg = DataDialog(self.active_planet, ext, self)
         dlg.exec()
-        if dlg.changed and self.has_drawn and not self.calibration_mode:
-            self.trigger_recalc()
+        if dlg.changed:
+            xl, yl = self.ax_map.get_xlim(), self.ax_map.get_ylim()
+            self.draw_regional_overlays(redraw=False)
+            self.ax_map.set_xlim(xl)
+            self.ax_map.set_ylim(yl)
+            self.canvas_map.draw_idle()
+            if self.has_drawn and not self.calibration_mode:
+                self.trigger_recalc()
 
     # --- EXPORT PIPELINES ---
     def _text_mask_boxes(self):

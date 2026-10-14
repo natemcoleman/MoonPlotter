@@ -1,0 +1,13 @@
+{
+  "planet": "Earth",
+  "kind": "color",
+  "units": "",
+  "source": "EOxCloudless https://cloudless.eox.at by EOX IT Services GmbH (Contains modified Copernicus Sentinel data 2024)",
+  "bounds": [
+    -27.137972884650086,
+    12.762278678016699,
+    -20.738066623094003,
+    18.919143910368312
+  ],
+  "res_deg": 0.0013733704423940093
+}

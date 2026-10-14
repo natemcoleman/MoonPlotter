@@ -48,6 +48,15 @@ REMOTE_SOURCES = {
         {'label': "Earth elevation 30 m - Copernicus GLO-30 (land)", 'kind': 'dem', 'tiles': 'copernicus30',
          'url': "https://copernicus-dem-30m.s3.amazonaws.com", 'extent': (-180.0, -90.0, 180.0, 90.0),
          'units': 'm', 'source': "Copernicus GLO-30 (ESA), 1 arc-second"},
+        {'label': "Earth colour 10 m - Sentinel-2 cloudless 2024 (EOX, global)", 'kind': 'color', 'tiles': 'xyz',
+         'url': "https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2024_3857/default/g/{z}/{y}/{x}.jpg",
+         'max_zoom': 14, 'extent': (-180.0, -85.0, 180.0, 85.0), 'units': '',
+         'source': "EOxCloudless https://cloudless.eox.at by EOX IT Services GmbH "
+                   "(Contains modified Copernicus Sentinel data 2024)"},
+        {'label': "Earth colour ~1 m - USGS orthoimagery / NAIP (USA only)", 'kind': 'color', 'tiles': 'xyz',
+         'url': "https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}",
+         'max_zoom': 16, 'extent': (-180.0, -85.0, 180.0, 85.0), 'units': '',
+         'source': "USDA, USGS The National Map: Orthoimagery (public domain)"},
     ],
 }
 
@@ -181,6 +190,8 @@ def fetch_region(source, planet, extent, name, progress=lambda m: None, max_px=M
 
     if source.get('tiles') == 'copernicus30':
         return _fetch_copernicus(source, planet, (lon_min, lon_max, lat_min, lat_max), name, progress, max_px)
+    if source.get('tiles') == 'xyz':
+        return _fetch_xyz(source, planet, (lon_min, lon_max, lat_min, lat_max), name, progress, max_px)
 
     url = "/vsicurl/" + source['url']
     progress("Opening remote dataset (reads only the part you selected)...")
@@ -257,6 +268,114 @@ def _fetch_copernicus(source, planet, extent, name, progress, max_px):
                 progress(f"  (no tile - treated as sea level: {type(e).__name__})")
     meta = {'planet': planet, 'kind': 'dem', 'units': 'm', 'source': source['source']}
     return _write(name, dst, (lon_min, lat_min, lon_max, lat_max), meta, crs_epsg4326=True)
+
+
+# ---------------------------------------------------------------- web-mercator imagery tiles (z/y/x)
+MAX_XYZ_TILES = 900
+_UA = "TopoPlotterStudio/1.0 (personal pen-plotter maps)"
+
+
+def _merc_y(lat, z):
+    """Global pixel row (256-px tiles) of a latitude at zoom z."""
+    lat = np.clip(lat, -85.05112878, 85.05112878)
+    s = np.sin(np.radians(lat))
+    return (0.5 - np.log((1 + s) / (1 - s)) / (4 * np.pi)) * 256.0 * 2 ** z
+
+
+def _merc_x(lon, z):
+    return (np.asarray(lon) + 180.0) / 360.0 * 256.0 * 2 ** z
+
+
+def xyz_plan(extent, max_zoom, max_px=MAX_OUT_PX, max_tiles=MAX_XYZ_TILES):
+    """Picks the deepest zoom whose crop stays within max_px and max_tiles. Returns (z, tx0, tx1, ty0, ty1)."""
+    lon_min, lon_max, lat_min, lat_max = extent
+    for z in range(max_zoom, -1, -1):
+        x0, x1 = _merc_x(lon_min, z), _merc_x(lon_max, z)
+        y0, y1 = _merc_y(lat_max, z), _merc_y(lat_min, z)
+        tx0, tx1 = int(x0 // 256), int((x1 - 1e-9) // 256)
+        ty0, ty1 = int(y0 // 256), int((y1 - 1e-9) // 256)
+        n = (tx1 - tx0 + 1) * (ty1 - ty0 + 1)
+        if max(x1 - x0, y1 - y0) <= max_px and n <= max_tiles:
+            return z, tx0, tx1, ty0, ty1
+    return 0, 0, 0, 0, 0
+
+
+def _get_tile(url):
+    import io
+    import urllib.request
+    from PIL import Image
+    req = urllib.request.Request(url, headers={'User-Agent': _UA})
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = r.read()
+            return np.asarray(Image.open(io.BytesIO(data)).convert('RGB'))
+        except Exception as e:
+            code = getattr(e, 'code', None)
+            if code in (400, 404):
+                return None                          # no imagery here (e.g. outside the USA)
+            if attempt == 2:
+                raise
+    return None
+
+
+def _fetch_xyz(source, planet, extent, name, progress, max_px):
+    """Downloads Web-Mercator image tiles covering the selection and re-grids them to plain lat/lon."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    lon_min, lon_max, lat_min, lat_max = extent
+    z, tx0, tx1, ty0, ty1 = xyz_plan(extent, source.get('max_zoom', 14), max_px)
+    jobs = [(tx, ty) for ty in range(ty0, ty1 + 1) for tx in range(tx0, tx1 + 1)]
+    mpp = 40075016.686 * math.cos(math.radians((lat_min + lat_max) / 2)) / (256 * 2 ** z)
+    progress(f"Zoom {z} (~{mpp:.1f} m/px): downloading {len(jobs)} image tiles...")
+    mosaic = np.full(((ty1 - ty0 + 1) * 256, (tx1 - tx0 + 1) * 256, 3), 255, dtype=np.uint8)
+    got = [0]
+
+    def work(job):
+        tx, ty = job
+        return job, _get_tile(source['url'].format(z=z, x=tx, y=ty))
+
+    errors = []
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        for (tx, ty), img in pool.map(lambda j: _safe(work, j, errors), jobs):
+            got[0] += 1
+            if got[0] % 20 == 0 or got[0] == len(jobs):
+                progress(f"Tiles {got[0]}/{len(jobs)}...")
+            if img is None:
+                continue
+            h, w = img.shape[:2]
+            if (h, w) != (256, 256):
+                from PIL import Image
+                img = np.asarray(Image.fromarray(img).resize((256, 256)))
+            r0, c0 = (ty - ty0) * 256, (tx - tx0) * 256
+            mosaic[r0:r0 + 256, c0:c0 + 256] = img
+    if errors and len(errors) == len(jobs):
+        raise IOError(f"No tiles could be downloaded ({errors[0]}). Check your internet connection.")
+    if errors:
+        progress(f"{len(errors)} tiles failed and were left blank.")
+
+    # re-grid: columns are already linear in longitude; rows are Mercator -> sample to linear latitude
+    gx0, gx1 = _merc_x(lon_min, z) - tx0 * 256, _merc_x(lon_max, z) - tx0 * 256
+    out_w = max(1, int(round(gx1 - gx0)))
+    lat_span_px = _merc_y(lat_min, z) - _merc_y(lat_max, z)
+    out_h = max(1, int(round(out_w * (lat_max - lat_min) / (lon_max - lon_min))))
+    out_h = min(out_h, int(round(lat_span_px * 1.5)) + 1)
+    cols = np.clip(np.round(np.linspace(gx0, gx1 - 1, out_w)).astype(int), 0, mosaic.shape[1] - 1)
+    lats = lat_max - (np.arange(out_h) + 0.5) / out_h * (lat_max - lat_min)
+    rows = np.clip(np.round(_merc_y(lats, z) - ty0 * 256 - 0.5).astype(int), 0, mosaic.shape[0] - 1)
+    out = mosaic[rows][:, cols]                                    # (h, w, 3)
+    progress("Writing regional file...")
+    meta = {'planet': planet, 'kind': 'color', 'units': '', 'source': source['source']}
+    return _write(name, np.ascontiguousarray(out.transpose(2, 0, 1)), (lon_min, lat_min, lon_max, lat_max), meta,
+                  crs_epsg4326=True)
+
+
+def _safe(fn, job, errors):
+    try:
+        return fn(job)
+    except Exception as e:
+        errors.append(f"{type(e).__name__}: {e}")
+        return job, None
 
 
 def import_geotiff(src_path, planet, kind, units, name, progress=lambda m: None, max_px=MAX_OUT_PX):
