@@ -8,6 +8,7 @@ approximate centre.
 """
 import numpy as np
 from matplotlib.textpath import TextPath
+from stroke_font import stroke_text
 from matplotlib.font_manager import FontProperties
 
 from config import PLANET_RADII
@@ -123,7 +124,6 @@ def site_segments(planet, names, view_extent, params, pen_id='red_038', label=Tr
         mm_per_unit_x = pw / (lon_max - lon_min)
         mm_per_unit_y = ph / (lat_max - lat_min)
     arm_x, arm_y = 1.8 / mm_per_unit_x, 1.8 / mm_per_unit_y        # 1.8 mm crosshair arms
-    text_h_mm = 2.2
 
     out = []
     for name, lat, lon, cat, span, note in chosen:
@@ -142,14 +142,17 @@ def site_segments(planet, names, view_extent, params, pen_id='red_038', label=Tr
         segs = [np.array([[cx - arm_x, cy], [cx + arm_x, cy]]),
                 np.array([[cx, cy - arm_y], [cx, cy + arm_y]])]
         if label:
-            tp = TextPath((0, 0), name, size=1.0, prop=FontProperties(family='DejaVu Sans'))
-            sx = text_h_mm / mm_per_unit_x
-            sy = text_h_mm / mm_per_unit_y
+            cap = float(params.get('site_label_cap_mm', 2.4))
+            res = stroke_text(name, 0.0, 0.0, cap)
+            if res is not None:
+                polys_mm = res[0]
+            else:
+                tp = TextPath((0, 0), name, size=cap / 0.73, prop=FontProperties(family='DejaVu Sans'))
+                polys_mm = [p for p in tp.to_polygons() if len(p) >= 2]
             ox = cx + arm_x * 1.6
-            oy = cy - 0.35 * sy
-            for poly in tp.to_polygons():
-                if len(poly) >= 2:
-                    segs.append(np.column_stack([ox + poly[:, 0] * sx, oy + poly[:, 1] * sy]))
+            oy = cy - 0.45 * cap / mm_per_unit_y
+            for poly in polys_mm:
+                segs.append(np.column_stack([ox + poly[:, 0] / mm_per_unit_x, oy + poly[:, 1] / mm_per_unit_y]))
         for s in segs:
             out.append({'type': 'border', 'layer': 'sites', 'seg': s, 'level': 0, 'pen_id': pen_id})
     return out

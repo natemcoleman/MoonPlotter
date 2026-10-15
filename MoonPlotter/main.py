@@ -14,9 +14,10 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QRadioButton, QCheckBox, QComboBox, QSplitter,
                              QFileDialog, QMessageBox, QFrame, QButtonGroup,
                              QInputDialog, QColorDialog, QSlider, QScrollArea, QSpinBox, QCompleter,
-                             QProgressBar, QDoubleSpinBox, QGridLayout, QDialog)
+                             QProgressBar, QDoubleSpinBox, QGridLayout, QDialog, QListWidget,
+                             QListWidgetItem)
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
-from PyQt6.QtGui import QDoubleValidator, QIntValidator, QShortcut, QKeySequence, QIcon, QAction
+from PyQt6.QtGui import QDoubleValidator, QIntValidator, QShortcut, QKeySequence, QIcon, QAction, QColor
 
 # Matplotlib Imports
 import matplotlib
@@ -32,8 +33,9 @@ import matplotlib.patches as patches
 
 # Geometry & Local Imports
 from shapely.geometry import box as shp_box, LineString
-from config import (DATA_FILES, PAPER_SIZES, PT_PER_MM, PLANET_RADII, INK_SETS, DEFAULT_INK_SET, MONO_INK_SETS,
-                    DEFAULT_MONO_INK_SET, TAHOE, MIN_SEGMENT_MM, DEFAULT_HATCH_SPACING_MM, load_pens, save_pens)
+from config import (DATA_FILES, PAPER_SIZES, PT_PER_MM, PLANET_RADII, PAPER_COLORS, DEFAULT_PAPER, DEFAULT_MONO_PEN,
+                    TAHOE, MIN_SEGMENT_MM, DEFAULT_HATCH_SPACING_MM, load_pens, save_pens, pen_available,
+                    pen_opacity, ink_lightness, TOOL_PEN_IDS)
 from workers import RenderWorker
 from hatch_engine import composite_ink_layers, STRATEGIES
 from theme import apply_theme, style_axes, SEPIA, ACCENT, TEXT, MUTED
@@ -41,7 +43,8 @@ from ui_widgets import CollapsibleSection, LayerPanel, swatch_icon, WheelGuard
 from sites import sites_for, CATEGORY_STYLE
 import exporter
 import regions
-from decorations import build_decorations
+from decorations import build_decorations, TEXT_SCALES, min_cap_for_pen
+from stroke_font import stroke_text
 from calibration import build_calibration_sheet
 from export_dialog import ExportDialog
 from pen_dialog import PenManagerDialog
@@ -409,6 +412,16 @@ class PlotterApp(QMainWindow):
         h_paper.addWidget(self.combo_paper, 1)
         h_paper.addWidget(self.btn_orientation)
         sec_paper.add(self._field("Bed / paper size", h_paper))
+        self.combo_paper_color = QComboBox()
+        for name, hx in PAPER_COLORS.items():
+            self.combo_paper_color.addItem(swatch_icon([hx]), name, hx)
+        self.combo_paper_color.addItem(swatch_icon(['#FFFFFF']), "Custom colour\u2026", None)
+        self.combo_paper_color.setCurrentText(DEFAULT_PAPER)
+        self.combo_paper_color.setToolTip("The sheet you will plot on. The preview shows it, and the colour\n"
+                                          "fill works out the best ink mix for this paper colour.")
+        self._paper_color_index = self.combo_paper_color.currentIndex()
+        self.combo_paper_color.currentIndexChanged.connect(self.on_paper_color_changed)
+        sec_paper.add(self._field("Paper colour", self.combo_paper_color))
         self.widget_custom = QWidget()
         h_custom = QHBoxLayout(self.widget_custom)
         h_custom.setContentsMargins(0, 0, 0, 0)
@@ -479,6 +492,45 @@ class PlotterApp(QMainWindow):
         self.spin_idx.valueChanged.connect(self.trigger_recalc)
         self.sec_contours.add(self.widget_index)
 
+        # Which pen draws what (pick light pens for dark paper)
+        self.widget_contour_pens = QWidget()
+        g = QGridLayout(self.widget_contour_pens)
+        g.setContentsMargins(0, 0, 0, 0)
+        g.setHorizontalSpacing(8)
+        g.setVerticalSpacing(4)
+        self.combo_contour_pen = QComboBox()
+        self.combo_index_pen = QComboBox()
+        self.combo_water_pen = QComboBox()
+        self.combo_border_pen = QComboBox()
+        self.lbl_water_pen = QLabel("Below sea level")
+        self.lbl_border_pen = QLabel("Borders")
+        rows = [(QLabel("Contour lines"), self.combo_contour_pen), (QLabel("Index lines"), self.combo_index_pen),
+                (self.lbl_water_pen, self.combo_water_pen), (self.lbl_border_pen, self.combo_border_pen)]
+        for r, (lab, cb) in enumerate(rows):
+            lab.setObjectName("fieldLabel")
+            g.addWidget(lab, r, 0)
+            g.addWidget(cb, r, 1)
+            cb.currentIndexChanged.connect(lambda _: (self._update_contrast_warning(), self.trigger_recalc()))
+        g.setColumnStretch(1, 1)
+        self.combo_contour_pen.setToolTip("Regular contours (and the lit side of illuminated contours).")
+        self.combo_index_pen.setToolTip("Every Nth (index) contour and the shoreline (and the shadowed side of\n"
+                                        "illuminated contours).")
+        self.sec_contours.add(self._field("Pens", self.widget_contour_pens))
+        self.widget_contrast = QWidget()
+        h_warn = QHBoxLayout(self.widget_contrast)
+        h_warn.setContentsMargins(0, 0, 0, 0)
+        self.lbl_contrast = QLabel("")
+        self.lbl_contrast.setObjectName("hint")
+        self.lbl_contrast.setWordWrap(True)
+        self.btn_light_pens = QPushButton("Use light pens")
+        self.btn_light_pens.setObjectName("ghost")
+        self.btn_light_pens.setToolTip("Switch the contour pens to the lightest pens you have in stock.")
+        self.btn_light_pens.clicked.connect(self.use_light_contour_pens)
+        h_warn.addWidget(self.lbl_contrast, 1)
+        h_warn.addWidget(self.btn_light_pens)
+        self.widget_contrast.setVisible(False)
+        self.sec_contours.add(self.widget_contrast)
+
         self.lbl_smooth_hdr = QLabel("Generalisation")
         self.lbl_smooth_hdr.setObjectName("fieldLabel")
         self.sec_contours.add(self.lbl_smooth_hdr)
@@ -525,9 +577,9 @@ class PlotterApp(QMainWindow):
         self.chk_ocean.setChecked(True)
         self.chk_ocean.toggled.connect(self.trigger_recalc)
         self.sec_contours.add(self.chk_ocean)
-        self.chk_blue_water = QCheckBox("Blue pen below sea level")
+        self.chk_blue_water = QCheckBox("Separate pen below sea level")
         self.chk_blue_water.setChecked(True)
-        self.chk_blue_water.toggled.connect(self.trigger_recalc)
+        self.chk_blue_water.toggled.connect(lambda _: (self.context_ui_update(), self.trigger_recalc()))
         self.sec_contours.add(self.chk_blue_water)
         self.chk_plot_borders = QCheckBox("Plot country / state borders")
         self.chk_plot_borders.setChecked(True)
@@ -557,16 +609,41 @@ class PlotterApp(QMainWindow):
         self.lbl_inks = self.sec_fill.add(self._field("Inks", self.combo_inks))
 
         self.combo_mono_pen = QComboBox()
-        self.combo_mono_pen.addItems(list(MONO_INK_SETS.keys()))
-        self.combo_mono_pen.setCurrentText(DEFAULT_MONO_INK_SET)
-        self.combo_mono_pen.currentTextChanged.connect(lambda _: self.recalc_timer.start(150))
+        self.combo_mono_pen.currentIndexChanged.connect(lambda _: self.recalc_timer.start(150))
         self.lbl_mono_pen = self.sec_fill.add(self._field("Pen", self.combo_mono_pen))
 
-        self.combo_ink_set = QComboBox()
-        self.combo_ink_set.addItems(list(INK_SETS.keys()))
-        self.combo_ink_set.setCurrentText(DEFAULT_INK_SET)
-        self.combo_ink_set.currentTextChanged.connect(lambda _: self.recalc_timer.start(150))
-        self.lbl_ink_set = self.sec_fill.add(self._field("Ink set / paper", self.combo_ink_set))
+        self.list_inks = QListWidget()
+        self.list_inks.setObjectName("inkList")
+        self.list_inks.setMinimumHeight(150)
+        self.list_inks.setToolTip("Tick the pens the colour fill may use. It finds the best mix of the ticked\n"
+                                  "inks for the paper colour - tick everything, or just a few for a simpler look.")
+        self.list_inks.itemChanged.connect(lambda _: (self._update_ink_count(), self.recalc_timer.start(400)))
+        ink_box = QWidget()
+        ink_v = QVBoxLayout(ink_box)
+        ink_v.setContentsMargins(0, 0, 0, 0)
+        ink_v.setSpacing(4)
+        ink_v.addWidget(self.list_inks)
+        ink_btns = QHBoxLayout()
+        b_all = QPushButton("All")
+        b_all.setObjectName("ghost")
+        b_all.setToolTip("Use every pen you have in stock")
+        b_all.clicked.connect(lambda: self._set_all_inks(True))
+        b_none = QPushButton("None")
+        b_none.setObjectName("ghost")
+        b_none.clicked.connect(lambda: self._set_all_inks(False))
+        self.lbl_ink_count = QLabel("")
+        self.lbl_ink_count.setObjectName("hint")
+        ink_btns.addWidget(b_all)
+        ink_btns.addWidget(b_none)
+        ink_btns.addStretch()
+        ink_btns.addWidget(self.lbl_ink_count)
+        ink_v.addLayout(ink_btns)
+        stock_hint = QLabel("Pen out of ink? Untick \u2018In stock\u2019 in Tools \u203a Pens\u2026 and it disappears here.")
+        stock_hint.setObjectName("hint")
+        stock_hint.setWordWrap(True)
+        ink_v.addWidget(stock_hint)
+        self.lbl_ink_set = self.sec_fill.add(self._field("Inks to use", ink_box))
+        self.rebuild_ink_widgets(select_all=True)
 
         self.spin_spacing = QDoubleSpinBox()
         self.spin_spacing.setRange(0.3, 5.0)
@@ -631,6 +708,15 @@ class PlotterApp(QMainWindow):
         self.combo_deco_pen.currentIndexChanged.connect(self.update_decorations)
         sec_deco.add(self._field("Pen", self.combo_deco_pen, "Map lines are blanked behind the title, scale bar "
                                                              "and north arrow."))
+        self.combo_text_size = QComboBox()
+        self.combo_text_size.addItems(list(TEXT_SCALES.keys()))
+        self.combo_text_size.setCurrentText("Medium")
+        self.combo_text_size.setToolTip("Lettering size for the title, scale bar, grid and site labels.\n"
+                                        "Text never goes smaller than the chosen pen can letter cleanly.")
+        self.combo_text_size.currentIndexChanged.connect(
+            lambda _: (self.update_decorations(), self.trigger_recalc() if self.selected_sites.get(self.active_planet)
+                       else None))
+        sec_deco.add(self._field("Text size", self.combo_text_size))
         vbox.addWidget(sec_deco)
         self.decor_timer = QTimer()
         self.decor_timer.setSingleShot(True)
@@ -878,6 +964,10 @@ class PlotterApp(QMainWindow):
         self.chk_borders.setVisible(is_earth)
         self.chk_plot_borders.setVisible(is_earth)
         self.chk_blue_water.setVisible(is_earth)
+        self.lbl_water_pen.setVisible(is_earth and self.chk_blue_water.isChecked())
+        self.combo_water_pen.setVisible(is_earth and self.chk_blue_water.isChecked())
+        self.lbl_border_pen.setVisible(is_earth)
+        self.combo_border_pen.setVisible(is_earth)
         self.chk_ocean.setText("Plot ocean depths" if is_earth else "Plot all depths (below datum)")
 
         self.lbl_source.setVisible(not is_hachure)
@@ -886,6 +976,7 @@ class PlotterApp(QMainWindow):
         self.lbl_mono_pen.setVisible(not is_color)
         self.chk_auto_contrast.setVisible(not is_hachure)
         self.chk_join.setVisible(not ("Stipp" in strategy or is_hachure))
+        self._update_contrast_warning()
 
     def on_region_changed(self, text):
         if "Tahoe" in text:
@@ -971,7 +1062,9 @@ class PlotterApp(QMainWindow):
             if item.widget():
                 self.pen_btn_group.removeButton(item.widget())
                 item.widget().deleteLater()
-        for i, (p_id, pen) in enumerate(self.pens.items()):
+        shown = [(p_id, pen) for p_id, pen in self.pens.items()
+                 if pen_available(p_id, pen) or p_id in TOOL_PEN_IDS or p_id == self.active_pen_id]
+        for i, (p_id, pen) in enumerate(shown):
             btn = QRadioButton(f"{pen['name']}")
             btn.setIcon(swatch_icon([pen['color']]))
             btn.setToolTip(f"{pen['name']} - {pen['width']} mm")
@@ -1018,7 +1111,7 @@ class PlotterApp(QMainWindow):
             self.lbl_status.setText("Transform Mode: Click & Drag to move. Scroll to Rotate. Shift+Scroll to Scale.")
         else:
             self.lbl_status.setText(
-                "Paint Mode: Click a contour to change its pen (Shift+Click to change all at elevation).")
+                "Paint Mode: click or drag across lines to give them the active pen (Shift = whole elevation level).")
 
     # --- MAP & DATA CALCULATION ---
     def on_layers_changed(self, _checked=None):
@@ -1096,6 +1189,7 @@ class PlotterApp(QMainWindow):
             'show_apollo': False,
             'sites': sorted(self.selected_sites.get(self.active_planet, set())),
             'site_labels': self.chk_site_labels.isChecked(),
+            'site_label_cap_mm': self.site_label_cap_mm(),
             'contour_target_lines': self.contour_target_lines(),
             'blue_water': self.chk_blue_water.isChecked(),
             'interval_ft': self.interval_ft,
@@ -1113,8 +1207,13 @@ class PlotterApp(QMainWindow):
             'tone_gamma': self.tone_gamma(),
             'join_lines': self.chk_join.isChecked(),
             'hatch_strategy': self.combo_hatch.currentText(),
-            'ink_set': self.combo_ink_set.currentText(),
-            'mono_ink_set': self.combo_mono_pen.currentText(),
+            'fill_pens': self.selected_fill_pens(),
+            'contour_pen': self.combo_contour_pen.currentData() or 'base',
+            'index_pen': self.combo_index_pen.currentData() or 'pen_1',
+            'water_pen': self.combo_water_pen.currentData() or 'blue_038',
+            'border_pen': self.combo_border_pen.currentData() or 'pen_1',
+            'mono_pen': self.combo_mono_pen.currentData() or DEFAULT_MONO_PEN,
+            'paper_color': self.current_paper_color(),
             'hatch_spacing_mm': self.spin_spacing.value(),
             'auto_contrast': self.chk_auto_contrast.isChecked(),
             'paper_w_mm': self.pw,
@@ -1254,10 +1353,171 @@ class PlotterApp(QMainWindow):
         super().closeEvent(event)
 
     def current_paper_color(self):
-        if self.sec_fill.is_enabled() and self.combo_inks.currentText() == "Color separation" \
-                and "Hachure" not in self.combo_hatch.currentText():
-            return INK_SETS.get(self.combo_ink_set.currentText(), INK_SETS[DEFAULT_INK_SET])['paper']
-        return '#FFFFFF'
+        return self.combo_paper_color.currentData() or '#FFFFFF'
+
+    def on_paper_color_changed(self, index):
+        if self.combo_paper_color.itemData(index) is None:             # "Custom colour..."
+            prev = self.combo_paper_color.itemData(self._paper_color_index) or '#FFFFFF'
+            c = QColorDialog.getColor(QColor(prev), self, "Paper colour")
+            self.combo_paper_color.blockSignals(True)
+            if c.isValid():
+                self._set_custom_paper(c.name().upper())
+            else:
+                self.combo_paper_color.setCurrentIndex(self._paper_color_index)
+            self.combo_paper_color.blockSignals(False)
+        self._paper_color_index = self.combo_paper_color.currentIndex()
+        self._update_contrast_warning()
+        if self.has_drawn:
+            self.render_canvas()
+            if self.sec_fill.is_enabled():
+                self.recalc_timer.start(150)
+
+    def _set_custom_paper(self, hx):
+        """Adds/updates a 'Custom (#RRGGBB)' entry (kept just above 'Custom colour...') and selects it."""
+        cb = self.combo_paper_color
+        last = cb.count() - 1
+        if last > 0 and str(cb.itemText(last - 1)).startswith("Custom ("):
+            cb.setItemText(last - 1, f"Custom ({hx})")
+            cb.setItemData(last - 1, hx)
+            cb.setItemIcon(last - 1, swatch_icon([hx]))
+            cb.setCurrentIndex(last - 1)
+        else:
+            cb.insertItem(last, swatch_icon([hx]), f"Custom ({hx})", hx)
+            cb.setCurrentIndex(last)
+
+    def set_paper_color(self, hx):
+        if not hx:
+            return
+        i = self.combo_paper_color.findData(hx)
+        self.combo_paper_color.blockSignals(True)
+        if i >= 0:
+            self.combo_paper_color.setCurrentIndex(i)
+        else:
+            self._set_custom_paper(hx)
+        self.combo_paper_color.blockSignals(False)
+        self._paper_color_index = self.combo_paper_color.currentIndex()
+
+    # --- FILL INKS ---
+    def ink_pens(self):
+        """Pens offered as fill inks: in stock, not a tool."""
+        return [(pid, pen) for pid, pen in self.pens.items() if pen_available(pid, pen)]
+
+    def rebuild_ink_widgets(self, select_all=False):
+        prev_checked = set(self.selected_fill_pens()) if hasattr(self, 'list_inks') and self.list_inks.count() else None
+        known = {self.list_inks.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.list_inks.count())}
+        prev_mono = self.combo_mono_pen.currentData()
+        pens = sorted(self.ink_pens(), key=lambda kv: -ink_lightness(kv[1]['color']))
+        self.list_inks.blockSignals(True)
+        self.list_inks.clear()
+        for pid, pen in pens:
+            lw = pen.get('line_mm', pen['width'])
+            it = QListWidgetItem(swatch_icon([pen['color']]), f"{pen['name']}   \u00b7 {lw:g} mm")
+            it.setData(Qt.ItemDataRole.UserRole, pid)
+            it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            on = select_all or prev_checked is None or pid in prev_checked or pid not in known
+            it.setCheckState(Qt.CheckState.Checked if on else Qt.CheckState.Unchecked)
+            self.list_inks.addItem(it)
+        self.list_inks.blockSignals(False)
+        self.combo_mono_pen.blockSignals(True)
+        self.combo_mono_pen.clear()
+        for pid, pen in sorted(self.ink_pens(), key=lambda kv: ink_lightness(kv[1]['color'])):
+            self.combo_mono_pen.addItem(swatch_icon([pen['color']]), pen['name'], pid)
+        i = self.combo_mono_pen.findData(prev_mono if prev_mono else DEFAULT_MONO_PEN)
+        self.combo_mono_pen.setCurrentIndex(max(0, i))
+        self.combo_mono_pen.blockSignals(False)
+        for cb, default in ((self.combo_contour_pen, 'base'), (self.combo_index_pen, 'pen_1'),
+                            (self.combo_water_pen, 'blue_038'), (self.combo_border_pen, 'pen_1')):
+            self._fill_pen_combo(cb, default)
+        self._update_ink_count()
+        self._update_contrast_warning()
+
+    def _fill_pen_combo(self, cb, default):
+        """Fills a pen chooser with the in-stock pens, keeping the current choice when possible."""
+        cur = cb.currentData()
+        cb.blockSignals(True)
+        cb.clear()
+        for pid, pen in sorted(self.ink_pens(), key=lambda kv: ink_lightness(kv[1]['color'])):
+            cb.addItem(swatch_icon([pen['color']]), pen['name'], pid)
+        for want in (cur, default):
+            i = cb.findData(want) if want else -1
+            if i >= 0:
+                cb.setCurrentIndex(i)
+                break
+        else:
+            cb.setCurrentIndex(0)
+        cb.blockSignals(False)
+
+    def _update_contrast_warning(self):
+        """Warns when a contour pen will hardly show on the chosen paper colour."""
+        if not hasattr(self, 'lbl_contrast'):
+            return
+        paper_l = ink_lightness(self.current_paper_color())
+        weak = []
+        combos = [self.combo_contour_pen, self.combo_index_pen]
+        if self.active_planet == 'Earth':
+            combos.append(self.combo_border_pen)
+            if self.chk_blue_water.isChecked():
+                combos.append(self.combo_water_pen)
+        for cb in combos:
+            pid = cb.currentData()
+            pen = self.pens.get(pid)
+            if pen and abs(ink_lightness(pen['color']) - paper_l) < 0.3 and pen['name'] not in weak:
+                weak.append(pen['name'])
+        if weak and self.sec_contours.is_enabled():
+            paper = self.combo_paper_color.currentText()
+            self.lbl_contrast.setText(f"\u26a0 {', '.join(weak)} will barely show on {paper.lower()} paper.")
+            self.btn_light_pens.setVisible(paper_l < 0.5)
+            self.widget_contrast.setVisible(True)
+        else:
+            self.widget_contrast.setVisible(False)
+
+    def use_light_contour_pens(self):
+        """Dark paper: thinnest light pen for contours, a wider light pen for index lines."""
+        paper_l = ink_lightness(self.current_paper_color())
+        light = [(pid, pen) for pid, pen in self.ink_pens() if ink_lightness(pen['color']) - paper_l >= 0.4]
+        if not light:
+            QMessageBox.information(self, "Pens", "None of your in-stock pens is light enough for this paper.")
+            return
+        lightest = max(ink_lightness(p['color']) for _, p in light)
+        best = [(pid, p) for pid, p in light if ink_lightness(p['color']) >= lightest - 0.05] or light
+        best.sort(key=lambda kv: float(kv[1].get('line_mm', kv[1]['width'])))
+        thin, wide = best[0][0], best[-1][0]
+        for cb, pid in ((self.combo_contour_pen, thin), (self.combo_index_pen, wide),
+                        (self.combo_border_pen, wide)):
+            cb.blockSignals(True)
+            cb.setCurrentIndex(max(0, cb.findData(pid)))
+            cb.blockSignals(False)
+        self._update_contrast_warning()
+        self.trigger_recalc()
+
+    def selected_fill_pens(self):
+        if not hasattr(self, 'list_inks'):
+            return []
+        out = []
+        for i in range(self.list_inks.count()):
+            it = self.list_inks.item(i)
+            if it.checkState() == Qt.CheckState.Checked:
+                out.append(it.data(Qt.ItemDataRole.UserRole))
+        return out
+
+    def set_fill_pens(self, ids):
+        ids = set(ids or [])
+        self.list_inks.blockSignals(True)
+        for i in range(self.list_inks.count()):
+            it = self.list_inks.item(i)
+            it.setCheckState(Qt.CheckState.Checked if it.data(Qt.ItemDataRole.UserRole) in ids
+                             else Qt.CheckState.Unchecked)
+        self.list_inks.blockSignals(False)
+        self._update_ink_count()
+
+    def _set_all_inks(self, on):
+        self.set_fill_pens([self.list_inks.item(i).data(Qt.ItemDataRole.UserRole)
+                            for i in range(self.list_inks.count())] if on else [])
+        self.recalc_timer.start(150)
+
+    def _update_ink_count(self):
+        n = len(self.selected_fill_pens())
+        self.lbl_ink_count.setText(f"{n} of {self.list_inks.count()} pens" if n else "no pens ticked")
 
     # --- LAYERS ---
     @staticmethod
@@ -1429,18 +1689,16 @@ class PlotterApp(QMainWindow):
                 line.item_ref = ('custom', idx)
 
             elif item['type'] == 'text':
-                tp = TextPath((0, 0), item['text'], size=1)
-                trans = Affine2D().scale(item['scale']).rotate_deg(item['rot']).translate(item['x'], item['y'])
+                polys, bbox = self.text_item_polys(item)
 
-                if self.chk_mask_text.isChecked():
-                    bbox = tp.transformed(trans).get_extents()
+                if self.chk_mask_text.isChecked() and bbox:
                     pad = item['scale'] * 0.2
-                    rect = patches.Rectangle((bbox.x0 - pad, bbox.y0 - pad),
-                                             bbox.width + 2 * pad, bbox.height + 2 * pad,
+                    rect = patches.Rectangle((bbox[0] - pad, bbox[1] - pad),
+                                             bbox[2] - bbox[0] + 2 * pad, bbox[3] - bbox[1] + 2 * pad,
                                              facecolor=self.ax_prev.get_facecolor(), edgecolor='none', zorder=14)
                     self.ax_prev.add_patch(rect)
 
-                for poly in tp.transformed(trans).to_polygons():
+                for poly in polys:
                     line, = self.ax_prev.plot(poly[:, 0], poly[:, 1], color=pen['color'],
                                               linewidth=pen['width'] * PT_PER_MM, picker=True, pickradius=5, zorder=15)
                     line.item_ref = ('custom', idx)
@@ -1534,13 +1792,16 @@ class PlotterApp(QMainWindow):
         off_ax.set_xlim(xlim)
         off_ax.set_ylim(ylim)
         layers = []
-        for p_id, segs in by_pen.items():
+        order = sorted(by_pen, key=lambda p: -ink_lightness(self.pens.get(p, self.pens['base'])['color']))
+        for p_id in order:
             pen = self.pens.get(p_id, self.pens['base'])
             lw = float(pen.get('line_mm', pen['width'])) * pt_per_mm
-            coll = off_ax.add_collection(LineCollection(segs, colors=pen['color'], linewidths=lw,
+            # draw black-on-white to get this pen's coverage, then lay its ink over the paper
+            coll = off_ax.add_collection(LineCollection(by_pen[p_id], colors='black', linewidths=lw,
                                                         capstyle='round'))
             off_canvas.draw()
-            layers.append(np.asarray(off_canvas.buffer_rgba())[..., :3].copy())
+            cov = 1.0 - np.asarray(off_canvas.buffer_rgba())[..., 0].astype(np.float32) / 255.0
+            layers.append((cov, pen['color'], pen_opacity(pen)))
             coll.remove()
 
         img = composite_ink_layers(layers, self.current_paper_color())
@@ -1586,6 +1847,16 @@ class PlotterApp(QMainWindow):
             return
         if event.button != 1 or self.btn_prev_zoom.isChecked(): return
 
+        if self.canvas_mode == 'paint':
+            # Press and drag: every line the brush touches takes the active pen (Shift = whole level).
+            self.paint_active = True
+            self._paint_undo_pushed = False
+            self._paint_levels = set()
+            self._paint_done = set()
+            self._paint_shift = (event.key == 'shift')
+            self._paint_at(event)
+            return
+
         if self.canvas_mode == 'draw':
             self.drawing_active = True
             self.current_freehand = [(event.xdata, event.ydata)]
@@ -1629,6 +1900,10 @@ class PlotterApp(QMainWindow):
             self.canvas_prev.draw_idle()
             return
 
+        if self.canvas_mode == 'paint' and getattr(self, 'paint_active', False):
+            self._paint_at(event)
+            return
+
         if self.canvas_mode == 'draw' and self.drawing_active:
             self.current_freehand.append((event.xdata, event.ydata))
             xs, ys = zip(*self.current_freehand)
@@ -1647,6 +1922,13 @@ class PlotterApp(QMainWindow):
             self.schedule_ink_sim()
             return
         if event.button != 1: return
+
+        if getattr(self, 'paint_active', False):
+            self.paint_active = False
+            if self._paint_undo_pushed:
+                self.render_canvas()
+                self.refresh_layer_panel()
+            return
 
         if self.canvas_mode == 'draw' and self.drawing_active:
             self.drawing_active = False
@@ -1702,28 +1984,64 @@ class PlotterApp(QMainWindow):
         self.schedule_ink_sim(150)
 
     def on_prev_pick(self, event):
-        if event.mouseevent.button != 1 or self.canvas_mode != 'paint' or self.btn_prev_zoom.isChecked(): return
-        artist = event.artist
-        if self.dem_collection is not None and artist == self.dem_collection:
-            idx = self._visible_idx[event.ind[0]]
-            target = self.dem_segments[idx]
-            target_level, target_layer = target['level'], self.layer_key(target)
-            shift_held = event.mouseevent.key == 'shift'
-            self.push_undo_state()
-            for i, item in enumerate(self.dem_segments):
-                if (shift_held and item['level'] == target_level and self.layer_key(item) == target_layer) \
-                        or (not shift_held and i == idx):
-                    item['pen_id'] = self.active_pen_id
-            self.render_canvas()
-            self.refresh_layer_panel()
+        """Painting is handled on press/drag (see _paint_at), so a click and a drag behave the same."""
+        return
+
+    PAINT_SKIP_LAYERS = ('fill', 'decor', 'calibration')
+
+    def _paint_at(self, event):
+        """Gives every line under the cursor (within the pick radius) the active pen. Hatching is left
+        alone - it is regenerated from the image, so paint it via the fill's ink list instead."""
+        if event.inaxes != self.ax_prev or event.xdata is None:
             return
-        if hasattr(artist, 'item_ref'):
-            group, idx = artist.item_ref
-            if group == 'custom':
-                self.push_undo_state()
-                self.custom_items[idx]['pen_id'] = self.active_pen_id
-                self.render_canvas()
-                self.refresh_layer_panel()
+        pen_id = self.active_pen_id
+        targets = []                                      # dem_segments indices to repaint
+        if self.dem_collection is not None:
+            hit, info = self.dem_collection.contains(event)
+            for j in (info.get('ind', []) if hit else []):
+                idx = self._visible_idx[j]
+                item = self.dem_segments[idx]
+                if self.layer_key(item) in self.PAINT_SKIP_LAYERS:
+                    continue
+                if self._paint_shift:
+                    key = (item['level'], self.layer_key(item))
+                    if key in self._paint_levels:
+                        continue
+                    self._paint_levels.add(key)
+                    targets += [i for i, it in enumerate(self.dem_segments)
+                                if it['level'] == key[0] and self.layer_key(it) == key[1] and it['pen_id'] != pen_id]
+                elif item['pen_id'] != pen_id:
+                    targets.append(idx)
+        custom_hits = []
+        for artist in list(self.ax_prev.lines):
+            ref = getattr(artist, 'item_ref', None)
+            if ref and ref[0] == 'custom' and artist.contains(event)[0] \
+                    and self.custom_items[ref[1]]['pen_id'] != pen_id:
+                custom_hits.append((artist, ref[1]))
+        if not targets and not custom_hits:
+            return
+        if not self._paint_undo_pushed:
+            self.push_undo_state()
+            self._paint_undo_pushed = True
+        for i in targets:
+            self.dem_segments[i]['pen_id'] = pen_id
+        pen = self.pens.get(pen_id, self.pens['base'])
+        for artist, ci in custom_hits:
+            self.custom_items[ci]['pen_id'] = pen_id
+            artist.set_color(pen['color'])
+        # live feedback without a full redraw
+        if targets and self.dem_collection is not None:
+            from matplotlib.colors import to_rgba
+            sim = self.is_ink_sim_mode()
+            cols = []
+            self._paint_done.update(targets)
+            for idx in self._visible_idx:
+                it = self.dem_segments[idx]
+                c = to_rgba(self.pens.get(it['pen_id'], self.pens['base'])['color'])
+                cols.append(c if (not sim or idx in self._paint_done) else (0, 0, 0, 0))
+            self.dem_collection.set_alpha(None)
+            self.dem_collection.set_color(cols)
+        self.canvas_prev.draw_idle()
 
     # --- MAP LOGIC (Panning & Zooming) ---
     def reset_home_view(self):
@@ -2148,7 +2466,18 @@ class PlotterApp(QMainWindow):
         return {'title': self.chk_deco_title.isChecked(), 'title_text': self.txt_title.text().strip(),
                 'scale_bar': self.chk_deco_scale.isChecked(), 'north_arrow': self.chk_deco_north.isChecked(),
                 'graticule': self.combo_graticule.currentText(), 'frame': self.chk_deco_frame.isChecked(),
-                'pen': self.combo_deco_pen.currentData() or 'base'}
+                'pen': self.combo_deco_pen.currentData() or 'base',
+                'text_size': self.combo_text_size.currentText(),
+                'line_mm': self._pen_line_mm(self.combo_deco_pen.currentData() or 'base')}
+
+    def _pen_line_mm(self, pid):
+        pen = self.pens.get(pid, self.pens['base'])
+        return float(pen.get('line_mm', pen['width']))
+
+    def site_label_cap_mm(self):
+        k = TEXT_SCALES.get(self.combo_text_size.currentText(), 1.0) * \
+            float(np.clip(min(self.pw, self.ph) / 100.0, 1.0, 2.0)) ** 0.5
+        return max(min_cap_for_pen(self._pen_line_mm('red_038')), 2.4 * k)
 
     def _subtitle(self):
         e = self.current_view_extent
@@ -2194,14 +2523,18 @@ class PlotterApp(QMainWindow):
             'tanaka': (self.chk_tanaka, 'check'), 'ocean': (self.chk_ocean, 'check'),
             'blue_water': (self.chk_blue_water, 'check'), 'plot_borders': (self.chk_plot_borders, 'check'),
             'pattern': (self.combo_hatch, 'combo'), 'tone_source': (self.combo_source, 'combo'),
-            'inks': (self.combo_inks, 'combo'), 'mono_pen': (self.combo_mono_pen, 'combo'),
-            'ink_set': (self.combo_ink_set, 'combo'), 'spacing': (self.spin_spacing, 'value'),
+            'inks': (self.combo_inks, 'combo'), 'mono_pen': (self.combo_mono_pen, 'data'),
+            'fill_pens': (self.list_inks, 'checklist'), 'paper_color': (self.combo_paper_color, 'paper'),
+            'contour_pen': (self.combo_contour_pen, 'data'), 'index_pen': (self.combo_index_pen, 'data'),
+            'water_pen': (self.combo_water_pen, 'data'), 'border_pen': (self.combo_border_pen, 'data'),
+            'spacing': (self.spin_spacing, 'value'),
             'tone': (self.slider_tone, 'value'), 'auto_contrast': (self.chk_auto_contrast, 'check'),
             'join': (self.chk_join, 'check'),
             'deco_title': (self.chk_deco_title, 'check'), 'deco_title_text': (self.txt_title, 'text'),
             'deco_scale': (self.chk_deco_scale, 'check'), 'deco_north': (self.chk_deco_north, 'check'),
             'deco_graticule': (self.combo_graticule, 'combo'), 'deco_frame': (self.chk_deco_frame, 'check'),
             'deco_pen': (self.combo_deco_pen, 'data'), 'site_labels': (self.chk_site_labels, 'check'),
+            'deco_text_size': (self.combo_text_size, 'combo'),
             'show_sites': (self.chk_sites, 'check'), 'mask_text': (self.chk_mask_text, 'check'),
             'show_map_borders': (self.chk_borders, 'check'),
         }
@@ -2219,6 +2552,10 @@ class PlotterApp(QMainWindow):
                 out[key] = w.currentText()
             elif kind == 'data':
                 out[key] = w.currentData()
+            elif kind == 'checklist':
+                out[key] = self.selected_fill_pens()
+            elif kind == 'paper':
+                out[key] = self.current_paper_color()
         return out
 
     def _set_widget_state(self, state):
@@ -2241,6 +2578,10 @@ class PlotterApp(QMainWindow):
                     i = w.findData(val)
                     if i >= 0:
                         w.setCurrentIndex(i)
+                elif kind == 'checklist':
+                    self.set_fill_pens(val)
+                elif kind == 'paper':
+                    self.set_paper_color(val)
             except Exception as e:
                 print(f"Could not restore {key}: {e}")
 
@@ -2413,6 +2754,9 @@ class PlotterApp(QMainWindow):
         if self.active_pen_id not in self.pens:
             self.active_pen_id = 'base'
         self.rebuild_palette_ui()
+        self.rebuild_ink_widgets()
+        if self.has_drawn and self.sec_fill.is_enabled():
+            self.recalc_timer.start(150)
         cur = self.combo_deco_pen.currentData()
         self.combo_deco_pen.blockSignals(True)
         self.combo_deco_pen.clear()
@@ -2482,12 +2826,28 @@ class PlotterApp(QMainWindow):
         if self.chk_mask_text.isChecked():
             for item in getattr(self, 'custom_items', []):
                 if item['type'] == 'text':
-                    tp = TextPath((0, 0), item['text'], size=1)
-                    trans = Affine2D().scale(item['scale']).rotate_deg(item['rot']).translate(item['x'], item['y'])
-                    bbox = tp.transformed(trans).get_extents()
-                    pad = item['scale'] * 0.2
-                    boxes.append(shp_box(bbox.x0 - pad, bbox.y0 - pad, bbox.x1 + pad, bbox.y1 + pad))
+                    _, bbox = self.text_item_polys(item)
+                    if bbox:
+                        pad = item['scale'] * 0.2
+                        boxes.append(shp_box(bbox[0] - pad, bbox[1] - pad, bbox[2] + pad, bbox[3] + pad))
         return boxes
+
+    @staticmethod
+    def text_item_polys(item):
+        """'Add text' annotation -> polylines in data coords (single-stroke font, outline fallback) and
+        its bounding box (x0, y0, x1, y1). item['scale'] is the text size in data units (about 1 em)."""
+        trans = Affine2D().scale(item['scale']).rotate_deg(item['rot']).translate(item['x'], item['y'])
+        res = stroke_text(item['text'], 0.0, 0.0, 0.72)
+        if res is not None:
+            local = res[0]
+        else:
+            tp = TextPath((0, 0), item['text'], size=1)
+            local = [np.asarray(p) for p in tp.to_polygons() if len(p) >= 2]
+        polys = [trans.transform(np.asarray(p, dtype=float)) for p in local if len(p) >= 2]
+        if not polys:
+            return [], None
+        allp = np.vstack(polys)
+        return polys, (allp[:, 0].min(), allp[:, 1].min(), allp[:, 0].max(), allp[:, 1].max())
 
     @staticmethod
     def _mask_line(coords, text_boxes):
@@ -2521,9 +2881,7 @@ class PlotterApp(QMainWindow):
             if item['type'] == 'line':
                 lines.extend(self._mask_line(item['points'], text_boxes))
             elif item['type'] == 'text':
-                tp = TextPath((0, 0), item['text'], size=1)
-                trans = Affine2D().scale(item['scale']).rotate_deg(item['rot']).translate(item['x'], item['y'])
-                lines.extend(np.asarray(poly) for poly in tp.transformed(trans).to_polygons())
+                lines.extend(self.text_item_polys(item)[0])
         return lines
 
     def _make_export_axes(self):
@@ -2592,10 +2950,12 @@ class PlotterApp(QMainWindow):
                 f"(edit BED_MM in config.py if your bed differs).")
         if self.pw > mx + 1e-6 or self.ph > my + 1e-6:
             note = "⚠ " + note + " This paper size is larger than that - check the bed check after export."
-        dlg = ExportDialog(rows, lambda pid, feed: self.estimate_pen_minutes(pid, feed), note, self)
+        dlg = ExportDialog(rows, lambda pid, feed: self.estimate_pen_minutes(pid, feed), note, self,
+                           lift_mm=getattr(self, 'pen_lift_mm', None))
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         st = dlg.settings()
+        self.pen_lift_mm = st['lift_mm']           # remembered for the next export this session
         changed = False
         for pid, feed in st['feeds'].items():
             if self.pens[pid].get('feed') != feed:
@@ -2672,7 +3032,8 @@ class PlotterApp(QMainWindow):
             if not ok:
                 QMessageBox.warning(self, "Export", f"vpype could not optimise {pen['name']} - skipped.")
                 continue
-            per_pen.append((p_id, exporter.wrap_vpype_body(body, feed, exporter.TRAVEL_FEED, st['settle_ms'])))
+            per_pen.append((p_id, exporter.wrap_vpype_body(body, feed, exporter.TRAVEL_FEED, st['settle_ms'],
+                                                                    lift_mm=st['lift_mm'])))
 
         if not per_pen:
             QMessageBox.warning(self, "No Data", "No vector elements found for the selected pens.")
@@ -2682,9 +3043,9 @@ class PlotterApp(QMainWindow):
         files = []
         if st['combine']:
             names = [self.pens[p]['name'] for p, _ in per_pen]
-            g = exporter.header(f"COMBINED PLOT: {' -> '.join(names)}")
+            g = exporter.header(f"COMBINED PLOT: {' -> '.join(names)}", lift_mm=st['lift_mm'])
             for i, (p_id, body) in enumerate(per_pen):
-                g += exporter.pen_change(self.pens[p_id]['name']) if i > 0 else \
+                g += exporter.pen_change(self.pens[p_id]['name'], lift_mm=st['lift_mm']) if i > 0 else \
                     [f"M117 Load {self.pens[p_id]['name']}"[:40], f"M0 Load {self.pens[p_id]['name']}, then click"[:60]]
                 g += body
             g += exporter.footer("Plot complete!")
@@ -2694,7 +3055,7 @@ class PlotterApp(QMainWindow):
             for order_no, (p_id, body) in enumerate(per_pen, start=1):
                 pen = self.pens[p_id]
                 safe = re.sub(r'_+', '_', "".join(c if c.isalnum() else "_" for c in pen['name'])).strip('_')
-                g = exporter.header(f"START ROUTINE: {pen['name']}") + body + \
+                g = exporter.header(f"START ROUTINE: {pen['name']}", lift_mm=st['lift_mm']) + body + \
                     exporter.footer(f"{pen['name']} Complete!")
                 files.append((f"{dir_path}/{order_no:02d}_{safe}_{base_name}.gcode", pen['name'], g))
 

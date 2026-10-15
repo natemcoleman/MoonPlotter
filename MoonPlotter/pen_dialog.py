@@ -8,19 +8,22 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QTableWi
                              QPushButton, QDoubleSpinBox, QSpinBox, QCheckBox, QColorDialog, QDialogButtonBox,
                              QHeaderView, QAbstractItemView, QMessageBox)
 
-from config import DEFAULT_DRAW_FEED, default_pens
+from config import DEFAULT_DRAW_FEED, default_pens, pen_opacity, TOOL_PEN_IDS
 
 HELP = ("How to calibrate: plot the calibration sheet, scan it at 600 dpi (or photograph it flat in "
         "daylight). Measure one single line's width in mm and enter it as Line width. Sample the colour "
         "from the middle of the solid swatch and paste it as the pen colour. The colour separation, the "
-        "ink preview and the time estimates then match your real pens.")
+        "ink preview and the time estimates then match your real pens. 'In stock' = offered to the colour "
+        "fill (untick a pen that has run dry). 'Opacity' = how much the ink hides what is under it: ~0.1 for "
+        "normal gel / fineliner ink, ~0.85 for opaque white gel on dark paper.")
 
 
 class PenManagerDialog(QDialog):
     def __init__(self, pens, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Pens")
-        self.setMinimumWidth(760)
+        self.setMinimumWidth(900)
+        self.setMinimumHeight(520)
         self.pens = copy.deepcopy(pens)
         self.calibration_request = None
         v = QVBoxLayout(self)
@@ -29,14 +32,14 @@ class PenManagerDialog(QDialog):
         title.setObjectName("panelTitle")
         v.addWidget(title)
 
-        self.table = QTableWidget(0, 7)
-        self.table.setHorizontalHeaderLabels(["Cal.", "Name", "Colour", "Tip (mm)", "Line width (mm)",
-                                              "Feed (mm/min)", "ID"])
+        self.table = QTableWidget(0, 9)
+        self.table.setHorizontalHeaderLabels(["Cal.", "In stock", "Name", "Colour", "Tip (mm)", "Line width (mm)",
+                                              "Opacity", "Feed (mm/min)", "ID"])
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         hh = self.table.horizontalHeader()
-        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        for c in (0, 2, 3, 4, 5, 6):
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        for c in (0, 1, 3, 4, 5, 6, 7, 8):
             hh.setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
         v.addWidget(self.table, 1)
         self._fill()
@@ -73,23 +76,30 @@ class PenManagerDialog(QDialog):
         for pid, pen in self.pens.items():
             self._append_row(pid, pen)
 
+    COL_CAL, COL_STOCK, COL_NAME, COL_COLOR, COL_TIP, COL_LINE, COL_OPAC, COL_FEED, COL_ID = range(9)
+
     def _append_row(self, pid, pen):
         r = self.table.rowCount()
         self.table.insertRow(r)
         chk = QCheckBox()
-        self.table.setCellWidget(r, 0, chk)
-        self.table.setItem(r, 1, QTableWidgetItem(pen.get('name', pid)))
+        self.table.setCellWidget(r, self.COL_CAL, chk)
+        stock = QCheckBox()
+        stock.setChecked(bool(pen.get('available', True)))
+        stock.setEnabled(pid not in TOOL_PEN_IDS)
+        stock.setToolTip("Untick when this pen is empty or broken - the colour fill will stop using it.")
+        self.table.setCellWidget(r, self.COL_STOCK, stock)
+        self.table.setItem(r, self.COL_NAME, QTableWidgetItem(pen.get('name', pid)))
         btn = QPushButton(pen.get('color', '#000000'))
         btn.setProperty('color', pen.get('color', '#000000'))
         self._style_color_button(btn)
         btn.clicked.connect(lambda _=False, b=btn: self._pick_color(b))
-        self.table.setCellWidget(r, 2, btn)
+        self.table.setCellWidget(r, self.COL_COLOR, btn)
         tip = QDoubleSpinBox()
         tip.setRange(0.05, 5.0)
         tip.setDecimals(2)
         tip.setSingleStep(0.05)
         tip.setValue(float(pen.get('width', 0.5)))
-        self.table.setCellWidget(r, 3, tip)
+        self.table.setCellWidget(r, self.COL_TIP, tip)
         lw = QDoubleSpinBox()
         lw.setRange(0.0, 5.0)
         lw.setDecimals(2)
@@ -97,15 +107,22 @@ class PenManagerDialog(QDialog):
         lw.setSpecialValueText("= tip")
         lw.setValue(float(pen.get('line_mm', 0.0) or 0.0))
         lw.setToolTip("Measured width of a single stroke on paper. Leave at '= tip' to use the tip size.")
-        self.table.setCellWidget(r, 4, lw)
+        self.table.setCellWidget(r, self.COL_LINE, lw)
+        op = QDoubleSpinBox()
+        op.setRange(0.0, 1.0)
+        op.setDecimals(2)
+        op.setSingleStep(0.05)
+        op.setValue(pen_opacity(pen))
+        op.setToolTip("0 = see-through ink (colours mix by filtering), 1 = fully covers the paper / ink below.")
+        self.table.setCellWidget(r, self.COL_OPAC, op)
         fd = QSpinBox()
         fd.setRange(200, 6000)
         fd.setSingleStep(100)
         fd.setValue(int(pen.get('feed', DEFAULT_DRAW_FEED)))
-        self.table.setCellWidget(r, 5, fd)
+        self.table.setCellWidget(r, self.COL_FEED, fd)
         it = QTableWidgetItem(pid)
         it.setFlags(Qt.ItemFlag.ItemIsEnabled)
-        self.table.setItem(r, 6, it)
+        self.table.setItem(r, self.COL_ID, it)
 
     @staticmethod
     def _style_color_button(btn):
@@ -123,24 +140,26 @@ class PenManagerDialog(QDialog):
     def _read_table(self):
         pens = {}
         for r in range(self.table.rowCount()):
-            pid = self.table.item(r, 6).text()
-            lw = self.table.cellWidget(r, 4).value()
-            pen = {'id': pid, 'name': self.table.item(r, 1).text().strip() or pid,
-                   'color': self.table.cellWidget(r, 2).property('color'),
-                   'width': round(self.table.cellWidget(r, 3).value(), 3),
-                   'feed': int(self.table.cellWidget(r, 5).value())}
+            pid = self.table.item(r, self.COL_ID).text()
+            lw = self.table.cellWidget(r, self.COL_LINE).value()
+            pen = {'id': pid, 'name': self.table.item(r, self.COL_NAME).text().strip() or pid,
+                   'color': self.table.cellWidget(r, self.COL_COLOR).property('color'),
+                   'width': round(self.table.cellWidget(r, self.COL_TIP).value(), 3),
+                   'feed': int(self.table.cellWidget(r, self.COL_FEED).value()),
+                   'opacity': round(self.table.cellWidget(r, self.COL_OPAC).value(), 3),
+                   'available': self.table.cellWidget(r, self.COL_STOCK).isChecked()}
             if lw > 0:
                 pen['line_mm'] = round(lw, 3)
             pens[pid] = pen
         return pens
 
     def _checked_ids(self):
-        return [self.table.item(r, 6).text() for r in range(self.table.rowCount())
-                if self.table.cellWidget(r, 0).isChecked()]
+        return [self.table.item(r, self.COL_ID).text() for r in range(self.table.rowCount())
+                if self.table.cellWidget(r, self.COL_CAL).isChecked()]
 
     def _add(self):
         n = 1
-        while f"custom_{n}" in self.pens or any(self.table.item(r, 6).text() == f"custom_{n}"
+        while f"custom_{n}" in self.pens or any(self.table.item(r, self.COL_ID).text() == f"custom_{n}"
                                                 for r in range(self.table.rowCount())):
             n += 1
         pid = f"custom_{n}"
@@ -150,9 +169,9 @@ class PenManagerDialog(QDialog):
         rows = sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True)
         protected = set(default_pens())
         for r in rows:
-            if self.table.item(r, 6).text() in protected:
-                QMessageBox.information(self, "Built-in pen", "Built-in pens are used by the ink sets and can't be "
-                                        "removed - edit them instead.")
+            if self.table.item(r, self.COL_ID).text() in protected:
+                QMessageBox.information(self, "Built-in pen", "Built-in pens can't be removed - untick 'In stock' "
+                                        "to stop using one, or edit it.")
                 continue
             self.table.removeRow(r)
 

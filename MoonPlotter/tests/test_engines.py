@@ -27,7 +27,7 @@ PENS = default_pens()
 def _params(**kw):
     p = {'active_planet': 'Moon', 'selected_region': 'None (Plot Full Selection)', 'circle_mode': False,
          'paper_w_mm': 100.0, 'paper_h_mm': 100.0, 'pens': PENS, 'hatch_spacing_mm': 1.0, 'auto_contrast': True,
-         'tone_gamma': 1.0, 'join_lines': True, 'fill_inks': 'mono', 'mono_ink_set': 'Thick Black G2 (0.7)',
+         'tone_gamma': 1.0, 'join_lines': True, 'fill_inks': 'mono', 'mono_pen': 'pen_1',
          'hatch_strategy': 'Multi-Pass Crosshatch', 'interval_ft': 1000, 'simp_tol': 0.0, 'smooth_val': 0.0,
          'show_borders': False}
     p.update(kw)
@@ -61,6 +61,17 @@ def test_contours_cone():
     assert segs and all(s['layer'] == 'contours' for s in segs)
     levels = sorted({s['level'] for s in segs})
     assert all(abs(l % 1000) < 1e-6 for l in levels)
+
+
+def test_contour_pens_follow_choice():
+    y, x = np.mgrid[-1:1:200j, -1:1:200j]
+    dem = (1.0 - np.hypot(x, y)).astype(np.float32) * 3.0
+    segs = generate_contours(dem, EXTENT, EXTENT, _params(interval_ft=1000, contour_pen='white_gr05',
+                                                          index_pen='white_gr10'))
+    pens = {s['pen_id'] for s in segs}
+    assert pens <= {'white_gr05', 'white_gr10'} and 'white_gr05' in pens
+    idx = {s['level'] for s in segs if s['pen_id'] == 'white_gr10'}
+    assert idx and all(abs(l % 5000) < 1e-6 for l in idx)      # every 5th level is an index line
 
 
 # ---------------------------------------------------------------- hatching
@@ -129,6 +140,76 @@ def test_wrap_and_estimate():
     assert exporter.xy_bounds(g)[1] == 20.0
 
 
+def test_colour_fill_uses_only_ticked_pens():
+    ids = ['yellow_07', 'blue_07', 'red_07', 'pen_1']
+    img = np.zeros((60, 60, 3), np.float32)
+    img[:, :20] = (0.1, 0.6, 0.2)          # green
+    img[:, 20:40] = (0.9, 0.8, 0.1)        # yellow
+    img[:, 40:] = (0.1, 0.1, 0.6)          # dark blue
+    segs = he.generate_hatches(img, BOUNDS, EXTENT, _params(fill_inks='color', fill_pens=ids))
+    used = {s['pen_id'] for s in segs}
+    assert used and used <= set(ids)
+    assert {'yellow_07', 'blue_07'} <= used                  # green = yellow + blue here
+
+
+def test_green_pen_used_directly():
+    img = np.zeros((40, 40, 3), np.float32)
+    img[:] = (0.09, 0.58, 0.29)
+    segs = he.generate_hatches(img, BOUNDS, EXTENT, _params(fill_inks='color',
+                                                            fill_pens=['green_07', 'yellow_07', 'blue_07']))
+    n = {}
+    for s in segs:
+        n[s['pen_id']] = n.get(s['pen_id'], 0) + 1
+    assert max(n, key=n.get) == 'green_07'
+
+
+def test_duplicate_black_dropped():
+    img = np.tile(np.linspace(0, 1, 50, dtype=np.float32)[None, :, None], (50, 1, 3))
+    segs = he.generate_hatches(img, BOUNDS, EXTENT, _params(fill_inks='color', fill_pens=['base', 'pen_1', 'red_07']))
+    assert 'base' not in {s['pen_id'] for s in segs}         # same ink as pen_1 (wider) -> skipped
+
+
+def test_white_gel_on_black_paper():
+    """On black paper the LIGHT parts of the image need the most white ink."""
+    img = np.tile(np.linspace(0, 1, 60, dtype=np.float32)[None, :, None], (60, 1, 3))   # dark -> light
+    segs = he.generate_hatches(img, BOUNDS, EXTENT, _params(fill_inks='mono', mono_pen='white_gr08',
+                                                            paper_color='#1C1C1C', join_lines=False))
+    assert segs and {s['pen_id'] for s in segs} == {'white_gr08'}
+    left = sum(np.sum(np.hypot(*np.diff(s['seg'], axis=0).T)) for s in segs if s['seg'][:, 0].mean() < 5)
+    right = sum(np.sum(np.hypot(*np.diff(s['seg'], axis=0).T)) for s in segs if s['seg'][:, 0].mean() >= 5)
+    assert right > left * 1.5
+
+
+def test_opaque_ink_model():
+    black = he.srgb_to_linear(he.hex_to_srgb('#000000'))
+    white = he.srgb_to_linear(he.hex_to_srgb('#FFFFFF'))
+    assert np.allclose(he.lay_ink(black, 1.0, white, 0.0), 0.0)        # see-through ink can't lighten
+    assert he.lay_ink(black, 1.0, white, 0.85).mean() > 0.8             # opaque white covers black
+
+
+def test_safe_start_sequence():
+    """After homing: climb to SAFE_Z before any XY move, go to (0, 0), then drop to pen-up height."""
+    from config import SAFE_Z_MM, PEN_LIFT_MM, PEN_DOWN_ABOVE_HOME_MM
+    h = exporter.header("t")
+    i_g92 = next(i for i, l in enumerate(h) if l.startswith("G92"))
+    assert f"Z-{PEN_DOWN_ABOVE_HOME_MM:.1f}" in h[i_g92]
+    moves = [l for l in h[i_g92 + 1:] if l.startswith("G0")]
+    assert moves[0] == f"G0 Z{SAFE_Z_MM:.1f} F1500"
+    assert moves[1].startswith("G0 X0 Y0")
+    assert moves[2] == f"G0 Z{PEN_LIFT_MM:.1f} F1500"
+    for block in (exporter.footer("x"), exporter.pen_change("Pen")):
+        first_xy = next(i for i, l in enumerate(block) if " X" in l)
+        assert any(l.startswith(f"G0 Z{SAFE_Z_MM:.1f}") for l in block[:first_xy])
+
+
+def test_custom_lift_height():
+    body = ["G00 X5.0 Y5.0", "G01 X9.0 Y5.0"]
+    g = exporter.wrap_vpype_body(body, lift_mm=4.5)
+    assert g[0] == "G0 Z4.5 F1500" and "G1 Z0.0 F1000" in g
+    assert exporter.header("t", lift_mm=4.5)[-2] == "G0 Z4.5 F1500"
+    assert "G0 Z4.5 F1500" in exporter.pen_change("P", lift_mm=4.5)
+
+
 def test_bed_violation():
     assert exporter.bed_violation((0, 100, 0, 100)) is None
     assert "X reaches" in exporter.bed_violation((0, 300, 0, 100))
@@ -149,6 +230,35 @@ def test_vector_text_and_decorations():
                                     [-10, 30, 0, 40], 100, 100, False, 'Moon', subtitle='sub')
     assert segs and len(masks) == 3
     assert all(s['layer'] == 'decor' for s in segs)
+
+
+def test_single_stroke_text():
+    import stroke_font
+    here = os.path.dirname(os.path.abspath(__file__))
+    for d in ('/tmp/fontcheck', os.path.join(here, '..', 'fonts')):
+        if os.path.isdir(d):
+            stroke_font.FALLBACK_DIRS.append(d)
+    stroke_font._CACHE.clear()
+    if not stroke_font.available():
+        print("  (Hershey font not found - skipped)")
+        return
+    polys, box = stroke_font.stroke_text("H", 0, 0, 3.0)
+    assert abs((box[3] - box[1]) - 3.0) < 1e-6                 # capital height is exactly what was asked
+    assert len(polys) == 3                                      # H = two uprights + crossbar, single strokes
+    p2, b2 = stroke_font.stroke_text("10\u00b0N", 5, 5, 2.0, anchor='right')
+    assert abs(b2[2] - 5) < 0.3 and p2
+
+
+def test_furniture_text_never_below_pen_minimum():
+    from decorations import min_cap_for_pen
+    assert min_cap_for_pen(0.7) > min_cap_for_pen(0.38) >= 2.0
+    segs, masks = build_decorations({'title': True, 'title_text': 'A very long map title here', 'scale_bar': True,
+                                     'north_arrow': True, 'graticule': 'Edge ticks', 'frame': True, 'pen': 'base',
+                                     'line_mm': 0.7}, [-10, 30, 0, 40], 100, 100, False, 'Moon',
+                                    subtitle="MOON  \u00b7  20.00\u00b0N 10.00\u00b0E  \u00b7  4,000 ft contours")
+    # title block and scale bar masks must not overlap
+    from decorations import _overlaps
+    assert len(masks) == 3 and not _overlaps(masks[0], masks[1], gap=0.0)
 
 
 def test_calibration_sheet():

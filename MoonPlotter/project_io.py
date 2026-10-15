@@ -10,9 +10,9 @@ PRESETS_FILE = "presets.json"
 # Keys of the UI state that make up a *style* (not the place): applied by presets.
 STYLE_KEYS = [
     'contours_on', 'density', 'auto_index', 'index_every', 'blur', 'simplify', 'smooth', 'tanaka', 'ocean',
-    'blue_water', 'plot_borders',
-    'fill_on', 'pattern', 'tone_source', 'inks', 'mono_pen', 'ink_set', 'spacing', 'tone', 'auto_contrast', 'join',
-    'deco_title', 'deco_scale', 'deco_north', 'deco_graticule', 'deco_frame', 'site_labels',
+    'blue_water', 'plot_borders', 'contour_pen', 'index_pen', 'water_pen', 'border_pen',
+    'fill_on', 'pattern', 'tone_source', 'inks', 'mono_pen', 'spacing', 'tone', 'auto_contrast', 'join',
+    'deco_title', 'deco_scale', 'deco_north', 'deco_graticule', 'deco_frame', 'site_labels', 'deco_text_size',
 ]
 
 BUILTIN_PRESETS = {
@@ -24,15 +24,15 @@ BUILTIN_PRESETS = {
         'deco_title': True, 'deco_scale': True, 'deco_north': False, 'deco_graticule': 'Off', 'deco_frame': True},
     "Hachures + contours": {
         'contours_on': True, 'fill_on': True, 'density': -60, 'pattern': "Hachures (Slope)",
-        'mono_pen': "Thin Black G2 (0.38)", 'spacing': 1.2, 'tone': 0, 'tanaka': False,
+        'mono_pen': 'base', 'spacing': 1.2, 'tone': 0, 'tanaka': False,
         'deco_title': True, 'deco_scale': True, 'deco_north': True, 'deco_graticule': 'Edge ticks', 'deco_frame': True},
     "Hillshade crosshatch": {
         'contours_on': False, 'fill_on': True, 'pattern': "Multi-Pass Crosshatch", 'tone_source': "Hillshade",
-        'inks': "Monochrome", 'mono_pen': "Thin Black G2 (0.38)", 'spacing': 0.8, 'tone': 0, 'auto_contrast': True,
+        'inks': "Monochrome", 'mono_pen': 'base', 'spacing': 0.8, 'tone': 0, 'auto_contrast': True,
         'join': True, 'deco_title': True, 'deco_scale': True, 'deco_north': False, 'deco_frame': True},
     "Colour stipple": {
         'contours_on': False, 'fill_on': True, 'pattern': "Stippling", 'tone_source': "Color map × Hillshade",
-        'inks': "Color separation", 'ink_set': "Blue / Red / Orange + Thin Black (0.38) on White", 'spacing': 1.0,
+        'inks': "Color separation", 'spacing': 1.0,
         'tone': -20, 'auto_contrast': True, 'deco_title': True, 'deco_scale': False, 'deco_frame': False},
 }
 

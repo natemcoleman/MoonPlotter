@@ -6,9 +6,10 @@ feed rates, optional settle dwell and pen-change pauses.
 """
 import numpy as np
 
-from config import GCODE_OFFSET_MM, BED_MM, DEFAULT_DRAW_FEED, TRAVEL_FEED, PEN_LIFT_MM, MIN_SEGMENT_MM
+from config import (GCODE_OFFSET_MM, BED_MM, DEFAULT_DRAW_FEED, TRAVEL_FEED, PEN_LIFT_MM, MIN_SEGMENT_MM,
+                    PEN_DOWN_ABOVE_HOME_MM, SAFE_Z_MM)
 
-HOME_XYZ = (-GCODE_OFFSET_MM[0], -GCODE_OFFSET_MM[1], -4.0)
+HOME_XYZ = (-GCODE_OFFSET_MM[0], -GCODE_OFFSET_MM[1], -PEN_DOWN_ABOVE_HOME_MM)
 
 
 def vpype_command(svg_path, gcode_path, has_dots=False):
@@ -19,26 +20,31 @@ def vpype_command(svg_path, gcode_path, has_dots=False):
             f'filter --min-length {MIN_SEGMENT_MM:g}mm linesort gwrite --profile gcodemm "{gcode_path}"')
 
 
-def header(title):
+def header(title, lift_mm=PEN_LIFT_MM):
+    """Home, set the plot origin, then climb to a safe height BEFORE moving over the plate, go to the
+    start point (0, 0) and drop to pen-up height. The first stroke lowers the pen from there."""
     return [f"; --- {title} ---", "G21", "G90", "G28",
             f"G92 X{HOME_XYZ[0]:.1f} Y{HOME_XYZ[1]:.1f} Z{HOME_XYZ[2]:.1f}",
-            f"G0 Z{PEN_LIFT_MM:.1f} F1500", "M400"]
+            f"G0 Z{SAFE_Z_MM:.1f} F1500", "M400",                 # clear the plate edge
+            "G0 X0 Y0 F3000", "M400",                             # over the start point
+            f"G0 Z{max(lift_mm, 0.0):.1f} F1500", "M400"]          # down to pen-up height
 
 
 def footer(message):
-    return [f"G0 Z{PEN_LIFT_MM:.1f} F1500", "M400", "; --- END OF PLOT ---", "G0 X0 Y0 F3000",
+    return [f"G0 Z{SAFE_Z_MM:.1f} F1500", "M400", "; --- END OF PLOT ---", "G0 X0 Y0 F3000",
             "G0 Z25.0 F1500", f"M117 {message}", "M84"]
 
 
-def pen_change(pen_name):
-    """Park, raise and pause for a pen swap (Marlin M0 shows the message and waits for a click)."""
-    return [f"; --- PEN CHANGE: {pen_name} ---", f"G0 Z{PEN_LIFT_MM:.1f} F1500", "M400",
+def pen_change(pen_name, lift_mm=PEN_LIFT_MM):
+    """Climb, park, raise and pause for a pen swap (Marlin M0 shows the message and waits for a click)."""
+    return [f"; --- PEN CHANGE: {pen_name} ---", f"G0 Z{SAFE_Z_MM:.1f} F1500", "M400",
             "G0 X0 Y0 F3000", "G0 Z25.0 F1500", "M400",
             f"M117 Load {pen_name}"[:40], f"M0 Load {pen_name}, then click"[:60],
-            f"G0 Z{PEN_LIFT_MM:.1f} F1500", "M400"]
+            f"G0 Z{SAFE_Z_MM:.1f} F1500", "M400", f"G0 Z{lift_mm:.1f} F1500", "M400"]
 
 
-def wrap_vpype_body(vpype_lines, draw_feed=DEFAULT_DRAW_FEED, travel_feed=TRAVEL_FEED, settle_ms=0):
+def wrap_vpype_body(vpype_lines, draw_feed=DEFAULT_DRAW_FEED, travel_feed=TRAVEL_FEED, settle_ms=0,
+                    lift_mm=PEN_LIFT_MM):
     """Turns vpype gcodemm output into pen-plotter moves: every travel is lift -> move -> lower."""
     out = []
     for line in vpype_lines:
@@ -46,7 +52,7 @@ def wrap_vpype_body(vpype_lines, draw_feed=DEFAULT_DRAW_FEED, travel_feed=TRAVEL
         if not line:
             continue
         if line.startswith("G0 X") or line.startswith("G00 X"):
-            out.extend([f"G0 Z{PEN_LIFT_MM:.1f} F1500", "M400", f"{line} F{travel_feed:.0f}", "M400",
+            out.extend([f"G0 Z{lift_mm:.1f} F1500", "M400", f"{line} F{travel_feed:.0f}", "M400",
                         "G1 Z0.0 F1000", "M400"])
             if settle_ms > 0:
                 out.append(f"G4 P{int(settle_ms)}")          # let the ink start flowing before moving

@@ -25,8 +25,8 @@ import numpy as np
 import scipy.ndimage
 from scipy.spatial import cKDTree
 
-from config import PLANET_RADII, MIN_SEGMENT_MM, INK_SETS, DEFAULT_INK_SET, MONO_INK_SETS, \
-    DEFAULT_MONO_INK_SET, DEFAULT_HATCH_SPACING_MM
+from config import PLANET_RADII, MIN_SEGMENT_MM, DEFAULT_HATCH_SPACING_MM, DEFAULT_MONO_PEN, ink_lightness, \
+    pen_opacity
 
 DEG2RAD = np.pi / 180.0
 SAMPLE_STEP_MM = 0.2          # sampling step along straight hatch lines
@@ -73,21 +73,27 @@ def linear_to_srgb(c):
     return np.where(c <= 0.0031308, 12.92 * c, 1.055 * np.power(c, 1.0 / 2.4) - 0.055)
 
 
-def composite_ink_layers(layers, paper_hex):
-    """Subtractive preview: each layer is an sRGB uint8/float image of ONE pen's strokes on white.
+def lay_ink(base, coverage, ink_lin, opacity):
+    """Puts one ink over 'base' (linear RGB) with the given area coverage (0..1).
 
-    Layers are multiplied in linear light (each ink acts as a filter over the paper), which is how
-    overlapping translucent gel ink combines on paper - unlike normal alpha drawing, where the last
-    pen drawn simply covers the ones below it. Returns an sRGB uint8 image.
+    A translucent ink filters what is under it (multiply); an opaque one hides it. Real inks sit in
+    between: opacity 0.1 (gel / fineliner) is almost a pure filter, 0.85 (opaque white gel) mostly
+    covers - that is what lets white ink show on black paper.
     """
-    out = None
-    for layer in layers:
-        lin = srgb_to_linear(np.asarray(layer, dtype=np.float64)[..., :3] / 255.0)
-        out = lin if out is None else out * lin
-    paper = srgb_to_linear(hex_to_srgb(paper_hex))
-    if out is None:
+    covered = opacity * ink_lin + (1.0 - opacity) * base * ink_lin
+    return base + coverage * (covered - base)
+
+
+def composite_ink_layers(layers, paper_hex):
+    """Ink preview. layers: list of (coverage HxW float 0..1, ink hex, opacity), in plotting order.
+    Returns an sRGB uint8 image of the inks laid down one after another on the paper."""
+    if not layers:
         return None
-    return (linear_to_srgb(out * paper) * 255.0 + 0.5).astype(np.uint8)
+    h, w = layers[0][0].shape[:2]
+    out = np.ones((h, w, 3)) * srgb_to_linear(hex_to_srgb(paper_hex))
+    for cov, ink_hex, opacity in layers:
+        out = lay_ink(out, np.clip(cov, 0.0, 1.0)[..., None], srgb_to_linear(hex_to_srgb(ink_hex)), opacity)
+    return (linear_to_srgb(out) * 255.0 + 0.5).astype(np.uint8)
 
 
 # ------------------------------------------------------------------
@@ -272,8 +278,40 @@ def apply_tone_curve(d, gamma):
 # ------------------------------------------------------------------
 # Colour separation
 # ------------------------------------------------------------------
-def _separate(rgb, valid, inks, paper_hex, max_cov, auto_contrast, tone_gamma=1.0):
-    """Returns a list of density maps (0..1, one per ink) for an sRGB image."""
+def _candidate_grid(k):
+    """Coverage combinations to search. Up to 4 inks: the full grid. More inks: every combination of
+    at most 3 of them (no spot on the map needs more than 3 inks, and it keeps the search small)."""
+    from itertools import combinations
+    if k <= 4:
+        n = {1: 129, 2: 33, 3: 17, 4: 11}[k]
+        return np.stack(np.meshgrid(*[np.linspace(0.0, 1.0, n)] * k, indexing='ij'), axis=-1).reshape(-1, k)
+    parts = [np.zeros((1, k))]
+    for size, n in ((1, 65), (2, 17), (3, 9)):
+        levels = np.linspace(0.0, 1.0, n)[1:]                 # 0 is covered by the smaller subsets
+        sub = np.stack(np.meshgrid(*[levels] * size, indexing='ij'), axis=-1).reshape(-1, size)
+        for combo in combinations(range(k), size):
+            g = np.zeros((len(sub), k))
+            g[:, combo] = sub
+            parts.append(g)
+    return np.vstack(parts)
+
+
+def predict_colors(grid, max_cov, ink_lin, opacity, paper_lin):
+    """Linear RGB of each coverage combination, inks laid in list order (= plotting order)."""
+    pred = np.ones((grid.shape[0], 3)) * paper_lin
+    for i in range(grid.shape[1]):
+        pred = lay_ink(pred, grid[:, i:i + 1] * max_cov[i], ink_lin[i], opacity[i])
+    return pred
+
+
+def _separate(rgb, valid, inks, paper_hex, max_cov, auto_contrast, tone_gamma=1.0, opacity=None):
+    """Returns a list of density maps (0..1, one per ink, same order as 'inks') for an sRGB image.
+
+    inks: hex colours in plotting order. Works on any paper colour: on light paper image white maps
+    to bare paper; on dark paper (light/opaque inks) image white maps to the lightest the inks reach.
+    """
+    k = len(inks)
+    opacity = [0.1] * k if opacity is None else list(opacity)
     lo, hi = 0.0, 1.0
     if auto_contrast and valid.any():
         p_lo, p_hi = np.percentile(luminance(srgb_to_linear(rgb[valid])), [0.5, 99.5])
@@ -282,37 +320,24 @@ def _separate(rgb, valid, inks, paper_hex, max_cov, auto_contrast, tone_gamma=1.
 
     paper = srgb_to_linear(hex_to_srgb(paper_hex))
     ink_lin = [srgb_to_linear(hex_to_srgb(c)) for c in inks]
+    grid = _candidate_grid(k)
+    pred = predict_colors(grid, max_cov, ink_lin, opacity, paper)
+    Y = luminance(pred)
     Yp = max(float(luminance(paper)), 1e-6)
+    y_min, y_max = float(Y.min()), float(Y.max())
+    light_paper = y_max <= Yp * 1.02                     # nothing is lighter than bare paper
+    hi_col = pred[int(np.argmax(Y))]
 
-    # Black-point compensation: image black -> darkest colour these inks can reach, so dark
-    # tones keep their separation instead of all clipping to the same maximum-ink value.
-    if len(inks) == 1:
-        y_floor = 1.0 - max_cov[0] * (1.0 - float(luminance(ink_lin[0])) / Yp)
-    else:
-        k = len(inks)
-        n = {2: 33, 3: 17, 4: 11}.get(k, 7)
-        grid = np.stack(np.meshgrid(*[np.linspace(0.0, 1.0, n)] * k, indexing='ij'), axis=-1).reshape(-1, k)
-        pred = np.ones((grid.shape[0], 3)) * paper
-        for i in range(k):
-            c = grid[:, i:i + 1] * max_cov[i]
-            pred *= 1.0 - c * (1.0 - ink_lin[i])
-        y_floor = float(luminance(pred).min()) / Yp
-    y_floor = float(np.clip(y_floor, 0.0, 0.99))
-
-    def stretch(lin):
-        lin = np.clip((lin - lo) / (hi - lo), 0.0, 1.0)
+    def target(lin_img):
+        lin = np.clip((lin_img - lo) / (hi - lo), 0.0, 1.0)
         if abs(tone_gamma - 1.0) > 1e-6:
-            lin = np.power(lin, tone_gamma)        # tone curve (gamma > 1 = darker)
-        return y_floor + lin * (1.0 - y_floor)
-
-    if len(inks) == 1:
-        # Analytic single-ink solution on luminance (media-relative: image white -> bare paper).
-        Yi = luminance(ink_lin[0])
-        Yt = luminance(stretch(srgb_to_linear(rgb)) * paper)
-        cov = (1.0 - Yt / max(Yp, 1e-6)) / max(1.0 - Yi / max(Yp, 1e-6), 1e-6)
-        d = np.clip(cov / max_cov[0], 0.0, 1.0)
-        d[~valid] = 0.0
-        return [d.astype(np.float32)]
+            lin = np.power(lin, tone_gamma)              # tone curve (gamma > 1 = darker)
+        if light_paper:
+            # Black-point compensation: image black -> darkest these inks reach; white -> paper.
+            f = float(np.clip(y_min / Yp, 0.0, 0.99))
+            return (f + lin * (1.0 - f)) * paper
+        # Dark paper: image black -> bare paper, image white -> the lightest the inks reach.
+        return paper + lin * (hi_col - paper)
 
     feat = np.column_stack([linear_to_lab(pred), REG_WEIGHT * (grid * np.asarray(max_cov)).sum(axis=1)])
     tree = cKDTree(feat)
@@ -322,8 +347,7 @@ def _separate(rgb, valid, inks, paper_hex, max_cov, auto_contrast, tone_gamma=1.
     key = (q[..., 0] << 12) | (q[..., 1] << 6) | q[..., 2]
     uniq, inv = np.unique(key.ravel(), return_inverse=True)
     uq = np.stack([(uniq >> 12) & 63, (uniq >> 6) & 63, uniq & 63], axis=-1) / 63.0
-    u_lin = stretch(srgb_to_linear(uq))
-    u_feat = np.column_stack([linear_to_lab(u_lin * paper), np.zeros(len(uniq))])
+    u_feat = np.column_stack([linear_to_lab(target(srgb_to_linear(uq))), np.zeros(len(uniq))])
     _, idx = tree.query(u_feat)
     dens = grid[idx][inv.ravel()].reshape(rgb.shape[0], rgb.shape[1], k)
     dens[~valid] = 0.0
@@ -517,8 +541,26 @@ def _hachures(frame, elev, spacing, tone_gamma, rng, progress_callback=None):
 # ------------------------------------------------------------------
 # Main entry point
 # ------------------------------------------------------------------
+# Hatch angle per ink (in plotting order), spread so overlapping inks cross rather than stack.
+BASE_ANGLES = [15.0, 75.0, 45.0, 105.0, 0.0, 135.0, 30.0, 60.0, 90.0, 120.0, 150.0, 165.0]
+
 STRATEGIES = ["Multi-Pass Crosshatch", "Variable Spacing Scanlines", "Modulated Sine Squiggles",
               "Stippling", "Hachures (Slope)"]
+
+
+def _drop_duplicate_inks(ids, pens, progress_callback=None):
+    """Two pens with the same ink colour (e.g. 0.38 and 0.7 black) would just split the same work and
+    add a pen change - keep the wider one for fills."""
+    kept = []
+    for pid in sorted(ids, key=lambda p: -float(pens[p].get('line_mm', pens[p]['width']))):
+        lab = linear_to_lab(srgb_to_linear(hex_to_srgb(pens[pid]['color'])))
+        dup = next((k for k in kept if np.linalg.norm(lab - linear_to_lab(srgb_to_linear(hex_to_srgb(
+            pens[k]['color'])))) < 6.0 and abs(pen_opacity(pens[k]) - pen_opacity(pens[pid])) < 0.2), None)
+        if dup is None:
+            kept.append(pid)
+        elif progress_callback:
+            progress_callback(f"{pens[pid]['name']} skipped for the fill (same ink as {pens[dup]['name']}).")
+    return [p for p in ids if p in kept]
 
 
 def generate_hatches(rgb, rgb_bounds, view_extent, params, progress_callback=None, elev=None):
@@ -538,14 +580,17 @@ def generate_hatches(rgb, rgb_bounds, view_extent, params, progress_callback=Non
 
     use_mono = params.get('fill_inks', 'mono' if "Monochrome" in params.get('plot_mode', '') else 'color') == 'mono'
     if use_mono or is_hachure:
-        ink_set, n_passes = MONO_INK_SETS.get(params.get('mono_ink_set', DEFAULT_MONO_INK_SET),
-                                              MONO_INK_SETS[DEFAULT_MONO_INK_SET]), 3
+        ids, n_passes = [params.get('mono_pen') or DEFAULT_MONO_PEN], 3
     else:
-        ink_set, n_passes = INK_SETS.get(params.get('ink_set', DEFAULT_INK_SET), INK_SETS[DEFAULT_INK_SET]), 2
-
-    inks = [(pid, ang) for pid, ang in ink_set['inks'] if pid in pens]
-    if not inks:
-        raise ValueError("None of the pens in the selected ink set exist in the pen list.")
+        ids, n_passes = list(params.get('fill_pens') or []), 2
+    ids = [pid for pid in dict.fromkeys(ids) if pid in pens]
+    if not ids:
+        raise ValueError("No pens selected for the fill - tick at least one available pen.")
+    ids = _drop_duplicate_inks(ids, pens, progress_callback)
+    ids.sort(key=lambda pid: ink_lightness(pens[pid]['color']), reverse=True)    # plotting order
+    inks = [(pid, BASE_ANGLES[i % len(BASE_ANGLES)]) for i, pid in enumerate(ids)] if len(ids) > 1 \
+        else [(ids[0], 45.0)]
+    paper_hex = params.get('paper_color', '#FFFFFF')
 
     frame = _Frame(view_extent, params)
     if frame.pw <= 0 or frame.ph <= 0 or view_extent[1] <= view_extent[0]:
@@ -585,8 +630,8 @@ def generate_hatches(rgb, rgb_bounds, view_extent, params, progress_callback=Non
     sigma = 0.35 * spacing / max(mm_per_px, 1e-9)
     if sigma > 0.3:
         rgb = scipy.ndimage.gaussian_filter(rgb, sigma=(sigma, sigma, 0), mode='nearest')
-    dens_maps = _separate(rgb, valid, [pens[pid]['color'] for pid, _ in inks], ink_set['paper'],
-                          max_cov, auto_contrast, tone_gamma)
+    dens_maps = _separate(rgb, valid, [pens[pid]['color'] for pid, _ in inks], paper_hex,
+                          max_cov, auto_contrast, tone_gamma, [pen_opacity(pens[pid]) for pid, _ in inks])
 
     golden = 0.6180339887
     for ink_idx, ((pen_id, base_angle), dmap, lw, cmax) in enumerate(zip(inks, dens_maps, line_w, max_cov)):

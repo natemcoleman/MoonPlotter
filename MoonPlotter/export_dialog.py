@@ -1,7 +1,7 @@
 """Export dialog: per-pen plot list (order, strokes, estimate, feed rate) and plotting options."""
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QTableWidget, QTableWidgetItem,
-                             QCheckBox, QSpinBox, QDialogButtonBox, QHeaderView, QAbstractItemView)
+                             QCheckBox, QSpinBox, QDoubleSpinBox, QDialogButtonBox, QHeaderView, QAbstractItemView)
 
 from ui_widgets import swatch_icon
 
@@ -9,7 +9,7 @@ from ui_widgets import swatch_icon
 class ExportDialog(QDialog):
     """rows: list of dicts {pen_id, name, color, strokes, minutes, feed}. Read the result with settings()."""
 
-    def __init__(self, rows, estimate_fn, plot_area_note, parent=None):
+    def __init__(self, rows, estimate_fn, plot_area_note, parent=None, lift_mm=None):
         super().__init__(parent)
         self.setWindowTitle("Export G-code")
         self.setMinimumWidth(620)
@@ -72,6 +72,18 @@ class ExportDialog(QDialog):
         self.spin_settle.valueChanged.connect(self._update_all)
         h.addWidget(self.spin_settle)
         h.addSpacing(16)
+        h.addWidget(QLabel("Pen-up height:"))
+        self.spin_lift = QDoubleSpinBox()
+        self.spin_lift.setRange(0.5, 15.0)
+        self.spin_lift.setSingleStep(0.5)
+        self.spin_lift.setDecimals(1)
+        self.spin_lift.setSuffix(" mm")
+        from config import PEN_LIFT_MM
+        self.spin_lift.setValue(PEN_LIFT_MM if lift_mm is None else lift_mm)
+        self.spin_lift.setToolTip("How far the pen lifts off the paper for every travel move between strokes. "
+                                  "Higher clears clips and paper edges; each extra mm adds a little time per stroke.")
+        h.addWidget(self.spin_lift)
+        h.addSpacing(16)
         h.addWidget(QLabel("Prime with the"))
         self.spin_prime = QSpinBox()
         self.spin_prime.setRange(0, 200)
@@ -126,5 +138,6 @@ class ExportDialog(QDialog):
             'feeds': {row['pen_id']: self.feeds[r].value() for r, row in enumerate(self.rows)},
             'combine': self.chk_combine.isChecked(),
             'settle_ms': self.spin_settle.value(),
+            'lift_mm': self.spin_lift.value(),
             'prime': self.spin_prime.value(),
         }

@@ -169,6 +169,11 @@ def generate_contours(dem_crop, data_extent, view_extent, params, progress_callb
         az = np.radians(params.get('light_azimuth', 315.0))
         light_e, light_n = np.sin(az), np.cos(az)
 
+    pen_contour = params.get('contour_pen') or 'base'
+    pen_index = params.get('index_pen') or 'pen_1'
+    pen_water = params.get('water_pen') or 'blue_038'
+    pen_border = params.get('border_pen') or 'pen_1'
+
     def emit_contour(c, level, pen_id, is_water):
         pieces = [(c, pen_id)]
         if tanaka and not is_water and len(c) >= 2:
@@ -179,7 +184,7 @@ def generate_contours(dem_crop, data_extent, view_extent, params, progress_callb
             lit = (-grad_e[row, col] * light_e - grad_n[row, col] * light_n) >= 0
             cuts = np.nonzero(np.diff(lit.astype(np.int8)))[0] + 1
             bounds = np.concatenate([[0], cuts, [len(lit)]])
-            pieces = [(c[a:b + 1], 'base' if lit[a] else 'pen_1') for a, b in zip(bounds[:-1], bounds[1:])]
+            pieces = [(c[a:b + 1], pen_contour if lit[a] else pen_index) for a, b in zip(bounds[:-1], bounds[1:])]
         for pc, pid in pieces:
             if len(pc) < 2: continue
             if is_circle: pc = ortho_project(pc, R_planet, mid_lon, deg2rad)
@@ -198,7 +203,7 @@ def generate_contours(dem_crop, data_extent, view_extent, params, progress_callb
         elif params.get('auto_index', True) and round(level / interval_ft) % index_interval == 0:
             is_index = True
 
-        pen_id = 'blue_038' if is_water else ('pen_1' if is_index else 'base')
+        pen_id = pen_water if is_water else (pen_index if is_index else pen_contour)
 
         meter_segs = [np.column_stack(((seg[:, 0] - mid_lon) * kx, (seg[:, 1] - mid_lat_deg) * ky))
                       for seg in segs if len(seg) >= 2]
@@ -239,7 +244,7 @@ def generate_contours(dem_crop, data_extent, view_extent, params, progress_callb
             elif data_extent[0] < -180:
                 c[:, 0] = np.where(c[:, 0] > 0, c[:, 0] - 360, c[:, 0])
             if is_circle: c = ortho_project(c, R_planet, mid_lon, deg2rad)
-            segments.append({'type': 'border', 'layer': 'borders', 'seg': c, 'level': 0, 'pen_id': 'pen_1'})
+            segments.append({'type': 'border', 'layer': 'borders', 'seg': c, 'level': 0, 'pen_id': pen_border})
 
         if mask_polygon is not None:
             view_box = shp_box(data_extent[0], data_extent[2], data_extent[1], data_extent[3])
@@ -272,6 +277,7 @@ def generate_contours(dem_crop, data_extent, view_extent, params, progress_callb
     if is_circle:
         theta = np.linspace(0, 2 * np.pi, 200)
         globe_circle = np.column_stack((R_planet * np.cos(theta), R_planet * np.sin(theta)))
-        segments.append({'type': 'border', 'layer': 'borders', 'seg': globe_circle, 'level': 0, 'pen_id': 'pen_1'})
+        segments.append({'type': 'border', 'layer': 'borders', 'seg': globe_circle, 'level': 0,
+                         'pen_id': pen_border if planet == 'Earth' else pen_index})
 
     return segments

@@ -54,34 +54,48 @@ MAX_DEM_PX = 4000
 # ==========================================
 # HATCHING / COLOR SEPARATION
 # ==========================================
-# Each ink set: paper colour + list of (pen_id, base hatch angle in degrees).
-# Ink colours used for separation come from each pen's 'color' in the pen list,
-# so calibrate those hex values against a scan of real swatches for best results.
-INK_SETS = {
-    'Blue / Red / Orange on White': {
-        'paper': '#FFFFFF',
-        'inks': [('blue_038', 15.0), ('red_038', 75.0), ('orange_07', 45.0)],
-    },
-    'Blue / Red / Orange + Thin Black (0.38) on White': {
-        'paper': '#FFFFFF',
-        'inks': [('blue_038', 15.0), ('red_038', 75.0), ('orange_07', 45.0), ('base', 0.0)],
-    },
-    'Blue / Red / Orange + Thick Black (0.7) on White': {
-        'paper': '#FFFFFF',
-        'inks': [('blue_038', 15.0), ('red_038', 75.0), ('orange_07', 45.0), ('pen_1', 0.0)],
-    },
-    'Cyan / Magenta on Yellow (Legacy)': {
-        'paper': '#FFE14D',
-        'inks': [('cyan_07', 15.0), ('pink_07', 75.0)],
-    },
+# Colour mode no longer uses fixed ink sets: you tick which pens are available and pick the paper
+# colour, and the separation finds the best mix of those inks on that paper. Ink colours come from
+# each pen's 'color' (calibrate against a scan), and 'opacity' says how much an ink hides what is
+# under it: ~0.1 for translucent gel/fineliner ink, ~0.85 for opaque white gel on dark paper.
+PAPER_COLORS = {
+    'White': '#FFFFFF',
+    'Black': '#1C1C1C',
+    'Cream / Ivory': '#F2EAD3',
+    'Tan / Kraft': '#C9A97C',
+    'Light gray': '#C8C8C8',
+    'Dark gray': '#555555',
+    'Red': '#D7282F',
+    'Orange': '#F27022',
+    'Yellow': '#FFE234',
+    'Green': '#3FAE49',
+    'Light blue': '#8ECDEB',
+    'Blue': '#1F6FC5',
+    'Navy': '#1E2A5A',
+    'Purple': '#6E3FA0',
+    'Pink': '#EC4E9A',
 }
-DEFAULT_INK_SET = 'Blue / Red / Orange on White'
+DEFAULT_PAPER = 'White'
+DEFAULT_MONO_PEN = 'pen_1'
+TOOL_PEN_IDS = {'cutter'}            # never offered as an ink
 
-MONO_INK_SETS = {
-    'Thick Black G2 (0.7)': {'paper': '#FFFFFF', 'inks': [('pen_1', 45.0)]},
-    'Thin Black G2 (0.38)': {'paper': '#FFFFFF', 'inks': [('base', 45.0)]},
-}
-DEFAULT_MONO_INK_SET = 'Thick Black G2 (0.7)'
+
+def ink_lightness(hex_color):
+    """Plot-order key (Rec.709 luma on sRGB): lightest inks are plotted first."""
+    h = hex_color.lstrip('#')
+    r, g, b = (int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def pen_opacity(pen):
+    if 'opacity' in pen:
+        return float(pen['opacity'])
+    return 0.85 if 'white' in pen.get('name', '').lower() else 0.1
+
+
+def pen_available(pen_id, pen):
+    return pen_id not in TOOL_PEN_IDS and bool(pen.get('available', True))
+
 
 DEFAULT_HATCH_SPACING_MM = 1.0
 
@@ -95,7 +109,13 @@ BED_MM = (235.0, 235.0)
 GCODE_OFFSET_MM = (50.0, 50.0)
 DEFAULT_DRAW_FEED = 1500.0      # mm/min, pen down
 TRAVEL_FEED = 3000.0            # mm/min, pen up
-PEN_LIFT_MM = 1.0
+PEN_LIFT_MM = 3.0               # pen-up height above the paper between strokes (was 1.0); the export dialog can override it
+# Height of the drawing plane (pen down, Z0) above the homed Z position. The header declares the homed
+# head to be at Z = -PEN_DOWN_ABOVE_HOME_MM. Raise it if the pen drags or hits the plate; lower it if
+# lines come out faint. (Was 4.0; raised 1.5 mm after the pen caught the plate edge.)
+PEN_DOWN_ABOVE_HOME_MM = 5.5
+# Clearance used for long moves: leaving home for the start point, parking and pen changes.
+SAFE_Z_MM = 5.0
 
 # Folder for high-resolution regional data (DEMs and colour maps) - see regions.py
 REGIONS_DIR = "regions"
@@ -113,6 +133,19 @@ def default_pens():
         'pink_07': {'id': 'pink_07', 'name': 'Thick Pink G2 (0.7)', 'color': '#FF1493', 'width': 0.70},
         'orange_07': {'id': 'orange_07', 'name': 'Thick Orange G2 (0.7)', 'color': '#FF6600', 'width': 0.70},
         'cyan_07': {'id': 'cyan_07', 'name': 'Thick Cyan G2 (0.7)', 'color': '#00A3CC', 'width': 0.70},
+        # G2 0.7 assorted 8-pack (new colours; black/pink/orange already above)
+        'blue_07': {'id': 'blue_07', 'name': 'Thick Blue G2 (0.7)', 'color': '#1D3FBF', 'width': 0.70},
+        'red_07': {'id': 'red_07', 'name': 'Thick Red G2 (0.7)', 'color': '#D9213A', 'width': 0.70},
+        'green_07': {'id': 'green_07', 'name': 'Thick Green G2 (0.7)', 'color': '#16934A', 'width': 0.70},
+        'yellow_07': {'id': 'yellow_07', 'name': 'Thick Yellow G2 (0.7)', 'color': '#F3DA2C', 'width': 0.70},
+        'purple_07': {'id': 'purple_07', 'name': 'Thick Purple G2 (0.7)', 'color': '#6A2C9E', 'width': 0.70},
+        # Sakura Gelly Roll Classic White - opaque, for dark paper
+        'white_gr05': {'id': 'white_gr05', 'name': 'White Gelly Roll 05 (0.3)', 'color': '#F6F6F2',
+                       'width': 0.30, 'opacity': 0.85},
+        'white_gr08': {'id': 'white_gr08', 'name': 'White Gelly Roll 08 (0.4)', 'color': '#F6F6F2',
+                       'width': 0.40, 'opacity': 0.85},
+        'white_gr10': {'id': 'white_gr10', 'name': 'White Gelly Roll 10 (0.5)', 'color': '#F6F6F2',
+                       'width': 0.50, 'opacity': 0.85},
         'cutter': {'id': 'cutter', 'name': 'Cutter Blade', 'color': '#0000FF', 'width': 0.1}
     }
 
