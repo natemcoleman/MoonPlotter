@@ -1,5 +1,6 @@
 import sys
 import os
+import json
 import tempfile
 import copy
 import re
@@ -15,7 +16,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QFileDialog, QMessageBox, QFrame, QButtonGroup,
                              QInputDialog, QColorDialog, QSlider, QScrollArea, QSpinBox, QCompleter,
                              QProgressBar, QDoubleSpinBox, QGridLayout, QDialog, QListWidget,
-                             QListWidgetItem)
+                             QListWidgetItem, QToolButton, QMenu)
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from PyQt6.QtGui import QDoubleValidator, QIntValidator, QShortcut, QKeySequence, QIcon, QAction, QColor
 
@@ -231,6 +232,8 @@ class PlotterApp(QMainWindow):
         m_file = mb.addMenu("&File")
         act(m_file, "New project", self.new_project, "Ctrl+N")
         act(m_file, "Open project\u2026", self.open_project, "Ctrl+O")
+        self.menu_recent = m_file.addMenu("Open recent")
+        self.menu_recent.aboutToShow.connect(lambda: self._fill_recent_menu(self.menu_recent))
         act(m_file, "Save project", self.save_project, "Ctrl+S")
         act(m_file, "Save project as\u2026", lambda: self.save_project(save_as=True), "Ctrl+Shift+S")
         m_file.addSeparator()
@@ -304,6 +307,27 @@ class PlotterApp(QMainWindow):
         st.setObjectName("appSubtitle")
         hv.addWidget(t)
         hv.addWidget(st)
+        proj_row = QHBoxLayout()
+        proj_row.setContentsMargins(0, 8, 0, 0)
+        proj_row.setSpacing(6)
+        b_open = QPushButton("Open project\u2026")
+        b_open.setToolTip("Open a saved .topo.json project (Ctrl+O)")
+        b_open.clicked.connect(self.open_project)
+        b_save = QPushButton("Save project")
+        b_save.setToolTip("Save area, paper, pens, colours, map furniture, sites, annotations and painted lines (Ctrl+S)")
+        b_save.clicked.connect(lambda: self.save_project())
+        self.btn_recent = QToolButton()
+        self.btn_recent.setText("Recent \u25be")
+        self.btn_recent.setToolTip("Recently opened or saved projects")
+        self.btn_recent.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.menu_recent_btn = QMenu(self)
+        self.menu_recent_btn.aboutToShow.connect(lambda: self._fill_recent_menu(self.menu_recent_btn))
+        self.btn_recent.setMenu(self.menu_recent_btn)
+        proj_row.addWidget(b_open)
+        proj_row.addWidget(b_save)
+        proj_row.addWidget(self.btn_recent)
+        proj_row.addStretch()
+        hv.addLayout(proj_row)
         side_v.addWidget(header)
 
         scroll = QScrollArea()
@@ -717,6 +741,12 @@ class PlotterApp(QMainWindow):
             lambda _: (self.update_decorations(), self.trigger_recalc() if self.selected_sites.get(self.active_planet)
                        else None))
         sec_deco.add(self._field("Text size", self.combo_text_size))
+        self.combo_scale_units = QComboBox()
+        self.combo_scale_units.addItems(["Miles", "Kilometres", "Miles + km"])
+        self.combo_scale_units.setCurrentText("Miles")
+        self.combo_scale_units.setToolTip("Units for the scale bar (short bars switch to feet / metres).")
+        self.combo_scale_units.currentIndexChanged.connect(self.update_decorations)
+        sec_deco.add(self._field("Scale bar units", self.combo_scale_units))
         vbox.addWidget(sec_deco)
         self.decor_timer = QTimer()
         self.decor_timer.setSingleShot(True)
@@ -1332,6 +1362,7 @@ class PlotterApp(QMainWindow):
             self.update_undo_redo_btns()
             self.ax_prev.set_xlim(0.0, 1.0)
             self.ax_prev.set_ylim(0.0, 1.0)
+        self._apply_pending_restore()
         self.render_canvas()
         self.refresh_layer_panel()
 
@@ -2436,6 +2467,7 @@ class PlotterApp(QMainWindow):
         self.calibration_mode = False
         gw, gh = x2 - x1, y2 - y1
         if gw == 0 or gh == 0: return
+        self.last_drag_coords = (x1, x2, y1, y2)          # remembered for re-framing and project files
         mid_lat = np.radians((y1 + y2) / 2)
         tw = gw * np.cos(mid_lat);
         ta = tw / gh
@@ -2468,6 +2500,7 @@ class PlotterApp(QMainWindow):
                 'graticule': self.combo_graticule.currentText(), 'frame': self.chk_deco_frame.isChecked(),
                 'pen': self.combo_deco_pen.currentData() or 'base',
                 'text_size': self.combo_text_size.currentText(),
+                'scale_units': self.combo_scale_units.currentText(),
                 'line_mm': self._pen_line_mm(self.combo_deco_pen.currentData() or 'base')}
 
     def _pen_line_mm(self, pid):
@@ -2535,6 +2568,7 @@ class PlotterApp(QMainWindow):
             'deco_graticule': (self.combo_graticule, 'combo'), 'deco_frame': (self.chk_deco_frame, 'check'),
             'deco_pen': (self.combo_deco_pen, 'data'), 'site_labels': (self.chk_site_labels, 'check'),
             'deco_text_size': (self.combo_text_size, 'combo'),
+            'deco_scale_units': (self.combo_scale_units, 'combo'),
             'show_sites': (self.chk_sites, 'check'), 'mask_text': (self.chk_mask_text, 'check'),
             'show_map_borders': (self.chk_borders, 'check'),
         }
@@ -2649,6 +2683,8 @@ class PlotterApp(QMainWindow):
             'layer_visible': self.layer_visible, 'custom_items': self.custom_items,
             'has_drawn': self.has_drawn and not self.calibration_mode,
             'map_view': [list(self.ax_map.get_xlim()), list(self.ax_map.get_ylim())],
+            'segment_pens': self._painted_pens_state(),
+            'preview_view': [list(self.ax_prev.get_xlim()), list(self.ax_prev.get_ylim())] if self.has_drawn else None,
         })
         return st
 
@@ -2704,6 +2740,7 @@ class PlotterApp(QMainWindow):
             self.custom_items = list(st.get('custom_items', []))
             self.ax_prev.set_xlim(0.0, 1.0)
             self.ax_prev.set_ylim(0.0, 1.0)
+            self._pending_restore = {'pens': st.get('segment_pens'), 'view': st.get('preview_view')}
             self._start_render(fresh=False)
         self.lbl_status.setText("Project loaded.")
 
@@ -2728,12 +2765,20 @@ class PlotterApp(QMainWindow):
             QMessageBox.critical(self, "Save project", f"Could not save:\n{e}")
             return
         self.project_path = path
+        self._add_recent(path)
         self.setWindowTitle(f"Topo Plotter Studio - {os.path.basename(path)}")
         self.lbl_status.setText(f"Saved {os.path.basename(path)}.")
 
-    def open_project(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Open project", "", "Topo projects (*.topo.json);;JSON (*.json)")
+    def open_project(self, path=None):
         if not path:
+            start = os.path.dirname(self.project_path) if self.project_path else ""
+            path, _ = QFileDialog.getOpenFileName(self, "Open project", start,
+                                                  "Topo projects (*.topo.json);;JSON (*.json)")
+        if not path:
+            return
+        if not os.path.exists(path):
+            QMessageBox.warning(self, "Open project", f"Can't find:\n{path}")
+            self._remove_recent(path)
             return
         try:
             st = project_io.load_project(path)
@@ -2742,7 +2787,79 @@ class PlotterApp(QMainWindow):
             return
         self.apply_project_state(st)
         self.project_path = path
+        self._add_recent(path)
         self.setWindowTitle(f"Topo Plotter Studio - {os.path.basename(path)}")
+
+    # --- recent projects / painted lines ---
+    RECENT_FILE = "recent_projects.json"
+
+    def _recent(self):
+        try:
+            with open(self.RECENT_FILE) as f:
+                items = json.load(f)
+            return [p for p in items if isinstance(p, str)]
+        except Exception:
+            return []
+
+    def _write_recent(self, items):
+        try:
+            with open(self.RECENT_FILE, 'w') as f:
+                json.dump(items[:10], f, indent=2)
+        except Exception as e:
+            print(f"Could not save recent projects: {e}")
+
+    def _add_recent(self, path):
+        path = os.path.abspath(path)
+        self._write_recent([path] + [p for p in self._recent() if os.path.abspath(p) != path])
+
+    def _remove_recent(self, path):
+        self._write_recent([p for p in self._recent() if os.path.abspath(p) != os.path.abspath(path)])
+
+    def _fill_recent_menu(self, menu):
+        menu.clear()
+        items = self._recent()
+        if not items:
+            a = menu.addAction("No recent projects")
+            a.setEnabled(False)
+            return
+        for p in items:
+            a = menu.addAction(os.path.basename(p))
+            a.setToolTip(p)
+            a.setStatusTip(p)
+            a.triggered.connect(lambda _=False, path=p: self.open_project(path))
+        menu.addSeparator()
+        menu.addAction("Clear list").triggered.connect(lambda: self._write_recent([]))
+
+    def _painted_pens_state(self):
+        """Pen of every map stroke, run-length encoded, so Paint-tool edits survive save / load."""
+        if not self.has_drawn or self.calibration_mode or not self.map_segments:
+            return None
+        runs = []
+        for it in self.map_segments:
+            pid = it.get('pen_id')
+            if runs and runs[-1][0] == pid:
+                runs[-1][1] += 1
+            else:
+                runs.append([pid, 1])
+        return {'count': len(self.map_segments), 'runs': runs}
+
+    def _apply_pending_restore(self):
+        pend = getattr(self, '_pending_restore', None)
+        self._pending_restore = None
+        if not pend:
+            return
+        sp = pend.get('pens')
+        if sp and sp.get('count') == len(self.map_segments):
+            pens = [pid for pid, n in sp['runs'] for _ in range(int(n))]
+            for it, pid in zip(self.map_segments, pens):
+                if pid in self.pens:
+                    it['pen_id'] = pid
+        elif sp:
+            self.lbl_status.setText("Map data changed since this project was saved - painted line colours not restored.")
+        view = pend.get('view')
+        if view:
+            self.ax_prev.set_xlim(*view[0])
+            self.ax_prev.set_ylim(*view[1])
 
     # --- PENS / CALIBRATION / DATA ---
     def open_pen_manager(self):

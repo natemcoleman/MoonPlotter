@@ -167,24 +167,26 @@ def build_decorations(opts, view_extent, pw, ph, circle, planet, subtitle=""):
         first = len(lines_mm)
         kmpm = fr.km_per_mm()
         if np.isfinite(kmpm) and kmpm > 0:
-            km = _nice(pw * 0.22 * kmpm)
-            length = km / kmpm
-            label = f"{km:g} km" if km >= 1 else f"{km * 1000:g} m"
-            length = max(length, 0.0)
+            units = opts.get('scale_units', 'Miles')
+            bars = {'Miles': ['mi'], 'Kilometres': ['km'], 'Miles + km': ['mi', 'km']}.get(units, ['mi'])
             x1 = pw - m
-            x0 = x1 - length
-            y = m + cap_label + 1.6
             h = max(1.2, 0.5 * cap_label)
-            lines_mm.append(np.array([[x0, y], [x1, y]]))
-            for xx in (x0, (x0 + x1) / 2, x1):
-                lines_mm.append(np.array([[xx, y], [xx, y + (h if xx != (x0 + x1) / 2 else h * 0.6)]]))
-            polys, box = vector_text(label, (x0 + x1) / 2, y - cap_label - 1.4, cap_label, anchor='center')
-            if box and box[0] < x0 - 0.5:              # wider than the bar: right-align under it
-                polys, box = vector_text(label, x1, y - cap_label - 1.4, cap_label, anchor='right')
-            add(polys)
-            boxes = [box, (x0, y, x1, y + h)]
+            y = m + cap_label + 1.6
+            boxes = []
+            for unit in reversed(bars):                # build upward: the last bar sits at the bottom
+                length, label = _scale_bar_for(unit, kmpm, pw * 0.22)
+                x0 = x1 - length
+                lines_mm.append(np.array([[x0, y], [x1, y]]))
+                for xx in (x0, (x0 + x1) / 2, x1):
+                    lines_mm.append(np.array([[xx, y], [xx, y + (h if xx != (x0 + x1) / 2 else h * 0.6)]]))
+                polys, box = vector_text(label, (x0 + x1) / 2, y - cap_label - 1.4, cap_label, anchor='center')
+                if box and box[0] < x0 - 0.5:          # wider than the bar: right-align under it
+                    polys, box = vector_text(label, x1, y - cap_label - 1.4, cap_label, anchor='right')
+                add(polys)
+                boxes += [box, (x0, y, x1, y + h)]
+                y += h + cap_label + 3.0
             if circle:
-                p2, b2 = vector_text("(at centre)", x1, y + h + 1.0, floor, anchor='right')
+                p2, b2 = vector_text("(at centre)", x1, y - cap_label - 1.4, floor, anchor='right')
                 add(p2)
                 boxes.append(b2)
             scale_box = bbox_of(boxes)
@@ -301,6 +303,25 @@ def build_decorations(opts, view_extent, pw, ph, circle, planet, subtitle=""):
         d = fr.to_data(np.array([[x0, y0], [x1, y1]]))
         masks.append((min(d[0, 0], d[1, 0]), min(d[0, 1], d[1, 1]), max(d[0, 0], d[1, 0]), max(d[0, 1], d[1, 1])))
     return segments, masks
+
+
+MI_KM = 1.609344
+
+
+def _scale_bar_for(unit, km_per_mm, target_mm):
+    """(bar length mm, label) for a round distance close to target_mm long, in 'mi' or 'km'.
+    Short miles bars switch to feet, short km bars to metres."""
+    if unit == 'mi':
+        mi_per_mm = km_per_mm / MI_KM
+        mi = _nice(target_mm * mi_per_mm, steps=(1, 2, 2.5, 5))
+        if mi >= 0.25:
+            return mi / mi_per_mm, (f"{mi:g} mile" if mi == 1 else f"{mi:g} miles")
+        ft = _nice(target_mm * mi_per_mm * 5280.0)
+        return ft / 5280.0 / mi_per_mm, f"{ft:,.0f} ft"
+    km = _nice(target_mm * km_per_mm)
+    if km >= 1:
+        return km / km_per_mm, f"{km:g} km"
+    return km / km_per_mm, f"{km * 1000:g} m"
 
 
 def _text_w(text, cap):

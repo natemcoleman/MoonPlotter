@@ -12,7 +12,7 @@ STYLE_KEYS = [
     'contours_on', 'density', 'auto_index', 'index_every', 'blur', 'simplify', 'smooth', 'tanaka', 'ocean',
     'blue_water', 'plot_borders', 'contour_pen', 'index_pen', 'water_pen', 'border_pen',
     'fill_on', 'pattern', 'tone_source', 'inks', 'mono_pen', 'spacing', 'tone', 'auto_contrast', 'join',
-    'deco_title', 'deco_scale', 'deco_north', 'deco_graticule', 'deco_frame', 'site_labels', 'deco_text_size',
+    'deco_title', 'deco_scale', 'deco_north', 'deco_graticule', 'deco_frame', 'site_labels', 'deco_text_size', 'deco_scale_units',
 ]
 
 BUILTIN_PRESETS = {
