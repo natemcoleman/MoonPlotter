@@ -13,7 +13,8 @@ HOME_XYZ = (-GCODE_OFFSET_MM[0], -GCODE_OFFSET_MM[1], -PEN_DOWN_ABOVE_HOME_MM)
 
 
 def vpype_command(svg_path, gcode_path, has_dots=False):
-    """vpype pipeline. Stipple dots must not be merged or length-filtered (they are tiny circles)."""
+    """vpype pipeline. has_dots=True ("fine" mode) only re-orders strokes: used for stipple dots and for
+    lettering / map furniture, whose short strokes must not be simplified, merged or length-filtered."""
     if has_dots:
         return f'read "{svg_path}" linesort gwrite --profile gcodemm "{gcode_path}"'
     return (f'read "{svg_path}" linesimplify -t 0.1mm linemerge -t 0.3mm '

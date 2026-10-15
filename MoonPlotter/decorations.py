@@ -16,12 +16,15 @@ _FONT_BOLD = FontProperties(family='DejaVu Sans', weight='bold')
 
 
 TEXT_SCALES = {'Small': 0.8, 'Medium': 1.0, 'Large': 1.3, 'Extra large': 1.7}
+LABEL_CAP_MM = 1.9                 # Medium sizes on a 100 mm sheet (capital height)
+SUB_CAP_MM = 1.9
+TITLE_CAP_MM = 3.4
 
 
 def min_cap_for_pen(line_mm):
     """Smallest capital height (mm) a pen of this line width can letter cleanly: the open parts of
     an 'e' or 'a' need several line widths of space or they fill in."""
-    return max(2.0, 5.5 * float(line_mm or 0.5))
+    return max(1.5, 4.0 * float(line_mm or 0.5))
 
 
 def vector_text(text, x, y, height, anchor='left', bold=False):
@@ -137,9 +140,9 @@ def build_decorations(opts, view_extent, pw, ph, circle, planet, subtitle=""):
     # never go below what this pen can letter legibly.
     k = TEXT_SCALES.get(opts.get('text_size', 'Medium'), 1.0) * float(np.clip(min(pw, ph) / 100.0, 1.0, 2.0)) ** 0.5
     floor = min_cap_for_pen(opts.get('line_mm', 0.5))
-    cap_label = max(floor, 2.4 * k)                    # graticule / scale-bar labels
-    cap_sub = max(floor, 2.6 * k)
-    cap_title = max(floor * 1.4, 4.5 * k)
+    cap_label = max(floor, LABEL_CAP_MM * k)           # graticule / scale-bar labels
+    cap_sub = max(floor, SUB_CAP_MM * k)
+    cap_title = max(floor * 1.4, TITLE_CAP_MM * k)
     line_gap = 0.55                                    # line spacing as a fraction of cap height
 
     def add(polys):
@@ -215,7 +218,10 @@ def build_decorations(opts, view_extent, pw, ph, circle, planet, subtitle=""):
             y = (box[3] if box else y + th) + line_gap * th
         tb = bbox_of(boxes)
         if tb:
-            masks_mm.append((tb[0] - pad, tb[1] - pad, tb[2] + pad, tb[3] + pad))
+            # one blanking box per text line, so a short title doesn't hide the map beside it
+            for b in boxes:
+                if b:
+                    masks_mm.append((b[0] - pad, b[1] - pad * 0.6, b[2] + pad, b[3] + pad * 0.6))
             if scale_box and _overlaps(tb, scale_box, gap=1.0):
                 # an unbreakable long word still reaches the scale bar: lift the bar above the title block
                 dy = tb[3] + 3.0 * pad - scale_box[1]
@@ -226,7 +232,7 @@ def build_decorations(opts, view_extent, pw, ph, circle, planet, subtitle=""):
 
     # ---- north arrow (top right; not meaningful for the globe view)
     if opts.get('north_arrow') and not circle:
-        n_cap = max(floor, 3.0 * k)
+        n_cap = max(floor, 2.4 * k)
         s = max(6.0, min(12.0, pw * 0.06 * k), n_cap * 2.2)
         cx, top = pw - m - s * 0.35, ph - m
         base = top - s

@@ -43,7 +43,7 @@ from ui_widgets import CollapsibleSection, LayerPanel, swatch_icon, WheelGuard
 from sites import sites_for, CATEGORY_STYLE
 import exporter
 import regions
-from decorations import build_decorations, TEXT_SCALES, min_cap_for_pen
+from decorations import build_decorations, TEXT_SCALES, LABEL_CAP_MM, min_cap_for_pen
 from stroke_font import stroke_text
 from calibration import build_calibration_sheet
 from export_dialog import ExportDialog
@@ -712,7 +712,7 @@ class PlotterApp(QMainWindow):
         self.combo_text_size.addItems(list(TEXT_SCALES.keys()))
         self.combo_text_size.setCurrentText("Medium")
         self.combo_text_size.setToolTip("Lettering size for the title, scale bar, grid and site labels.\n"
-                                        "Text never goes smaller than the chosen pen can letter cleanly.")
+                                        "Text never goes smaller than the chosen pen can letter cleanly (about 4x its line width).")
         self.combo_text_size.currentIndexChanged.connect(
             lambda _: (self.update_decorations(), self.trigger_recalc() if self.selected_sites.get(self.active_planet)
                        else None))
@@ -2477,7 +2477,7 @@ class PlotterApp(QMainWindow):
     def site_label_cap_mm(self):
         k = TEXT_SCALES.get(self.combo_text_size.currentText(), 1.0) * \
             float(np.clip(min(self.pw, self.ph) / 100.0, 1.0, 2.0)) ** 0.5
-        return max(min_cap_for_pen(self._pen_line_mm('red_038')), 2.4 * k)
+        return max(min_cap_for_pen(self._pen_line_mm('red_038')), LABEL_CAP_MM * k)
 
     def _subtitle(self):
         e = self.current_view_extent
@@ -2867,13 +2867,20 @@ class PlotterApp(QMainWindow):
             geoms = nxt
         return [np.asarray(g.coords) for g in geoms if len(g.coords) >= 2]
 
-    def _lines_for_pen(self, p_id, text_boxes):
-        """All plot lines (in data coords) for one pen, with text blanking applied."""
-        lines = []
+    # Layers made of lettering / fine marks: exported without vpype's simplify, merge and 2 mm length filter
+    # (those would delete the short strokes that make up small letters, dots and degree signs).
+    FINE_LAYERS = ('decor', 'sites', 'calibration')
+
+    def _lines_for_pen(self, p_id, text_boxes, split=False):
+        """All plot lines (in data coords) for one pen, with text blanking applied.
+        split=True returns (map_lines, fine_lines) where fine_lines are lettering and map furniture."""
+        lines, fine = [], []
         for item in getattr(self, 'dem_segments', []):
             if item.get('pen_id') == p_id and self.is_visible(item):
-                if item.get('type') == 'stipple' or item.get('layer') == 'decor':
-                    lines.append(np.asarray(item['seg']))        # dots / map furniture are never blanked
+                if item.get('layer') in self.FINE_LAYERS:
+                    fine.append(np.asarray(item['seg']))         # furniture / labels are never blanked
+                elif item.get('type') == 'stipple':
+                    lines.append(np.asarray(item['seg']))
                 else:
                     lines.extend(self._mask_line(item['seg'], text_boxes))
         for item in (getattr(self, 'custom_items', []) if self.annotations_visible() else []):
@@ -2881,8 +2888,8 @@ class PlotterApp(QMainWindow):
             if item['type'] == 'line':
                 lines.extend(self._mask_line(item['points'], text_boxes))
             elif item['type'] == 'text':
-                lines.extend(self.text_item_polys(item)[0])
-        return lines
+                fine.extend(self.text_item_polys(item)[0])
+        return (lines, fine) if split else lines + fine
 
     def _make_export_axes(self):
         export_fig = Figure(figsize=(self.pw / 25.4, self.ph / 25.4))
@@ -2975,7 +2982,8 @@ class PlotterApp(QMainWindow):
         t_gcode = os.path.join(temp_dir, f"topo_{tag}.gcode").replace("\\", "/")
         export_fig, export_ax = self._make_export_axes()
         export_ax.add_collection(LineCollection(lines, colors='black', linewidths=1))
-        export_fig.savefig(t_svg, format='svg')
+        with matplotlib.rc_context({'path.simplify': False}):      # keep every tiny letter stroke
+            export_fig.savefig(t_svg, format='svg')
         try:
             vpype_cli.execute(exporter.vpype_command(t_svg, t_gcode, has_dots))
             with open(t_gcode) as f:
@@ -3008,7 +3016,7 @@ class PlotterApp(QMainWindow):
             pen = self.pens[p_id]
             self.lbl_status.setText(f"Optimising {pen['name']}...")
             QApplication.processEvents()
-            lines = self._lines_for_pen(p_id, text_boxes)
+            lines, fine = self._lines_for_pen(p_id, text_boxes, split=True)
             has_dots = any(it.get('type') == 'stipple' and it['pen_id'] == p_id and self.is_visible(it)
                            for it in self.dem_segments)
             lengths = [float(np.sum(np.hypot(np.diff(np.asarray(ln)[:, 0]) * sx, np.diff(np.asarray(ln)[:, 1]) * sy)))
@@ -3018,13 +3026,15 @@ class PlotterApp(QMainWindow):
                         if (len(ln) == 7 and np.allclose(ln[0], ln[-1])) or lengths[i] >= MIN_SEGMENT_MM]
                 lines = [lines[i] for i in keep]
                 lengths = [lengths[i] for i in keep]
-            if not lines:
+            if not lines and not fine:
                 continue
             prime, rest = exporter.split_for_priming(lines, lengths, st['prime'] if not has_dots else 0)
             body = []
             ok = True
-            for part, tag in ((prime, f"{p_id}_prime"), (rest, p_id)):
-                b = self._vpype_body(part, has_dots, tag)
+            # map lines (primed, cleaned up), then lettering last - by then the ink is flowing well
+            for part, tag, dots in ((prime, f"{p_id}_prime", has_dots), (rest, p_id, has_dots),
+                                    (fine, f"{p_id}_text", True)):
+                b = self._vpype_body(part, dots, tag)
                 if b is None:
                     ok = False
                     break

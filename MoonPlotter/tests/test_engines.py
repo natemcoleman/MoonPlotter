@@ -228,7 +228,7 @@ def test_vector_text_and_decorations():
     segs, masks = build_decorations({'title': True, 'title_text': 'X', 'scale_bar': True, 'north_arrow': True,
                                      'graticule': 'Edge ticks', 'frame': True, 'pen': 'base'},
                                     [-10, 30, 0, 40], 100, 100, False, 'Moon', subtitle='sub')
-    assert segs and len(masks) == 3
+    assert segs and len(masks) == 4                            # scale bar, title, subtitle, north arrow
     assert all(s['layer'] == 'decor' for s in segs)
 
 
@@ -251,14 +251,15 @@ def test_single_stroke_text():
 
 def test_furniture_text_never_below_pen_minimum():
     from decorations import min_cap_for_pen
-    assert min_cap_for_pen(0.7) > min_cap_for_pen(0.38) >= 2.0
+    assert min_cap_for_pen(0.7) > min_cap_for_pen(0.38) >= 1.5
     segs, masks = build_decorations({'title': True, 'title_text': 'A very long map title here', 'scale_bar': True,
                                      'north_arrow': True, 'graticule': 'Edge ticks', 'frame': True, 'pen': 'base',
                                      'line_mm': 0.7}, [-10, 30, 0, 40], 100, 100, False, 'Moon',
                                     subtitle="MOON  \u00b7  20.00\u00b0N 10.00\u00b0E  \u00b7  4,000 ft contours")
-    # title block and scale bar masks must not overlap
+    # every title-block line has its own blanking box, and none of them overlaps the scale bar's
     from decorations import _overlaps
-    assert len(masks) == 3 and not _overlaps(masks[0], masks[1], gap=0.0)
+    assert len(masks) >= 4                                     # scale bar + >=2 text lines + north arrow
+    assert not any(_overlaps(masks[0], m, gap=0.0) for m in masks[1:-1])
 
 
 def test_calibration_sheet():

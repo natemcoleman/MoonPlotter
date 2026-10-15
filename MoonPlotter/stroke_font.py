@@ -53,7 +53,7 @@ def available(name='futural'):
     return load_font(name) is not None
 
 
-def stroke_text(text, x, y, cap_height, anchor='left', font='futural', spacing=0.12):
+def stroke_text(text, x, y, cap_height, anchor='left', font='futural', spacing=0.0):
     """Polylines (paper mm, y up) for 'text' with its baseline at y and capitals 'cap_height' mm tall.
     anchor: 'left' | 'center' | 'right' about x. Returns (polylines, (xmin, ymin, xmax, ymax)) or None
     if the font isn't available."""
