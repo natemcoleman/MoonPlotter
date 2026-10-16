@@ -2,8 +2,8 @@
 
 The app is plain Python. The GUI uses PyQt6, the plotting and preview use matplotlib, rasters are read
 with rasterio, geometry uses shapely and scipy, and G-code is written by vpype. All application code is
-in the `MoonPlotter/` folder. Run everything from that folder, because data paths in `config.py` are
-relative.
+in the `MoonPlotter/` folder. Data paths in `config.py` are relative to that folder: `main.py` switches
+to it on start-up, so the app can be launched from anywhere.
 
 ## Module map
 
@@ -28,8 +28,6 @@ relative.
 | `pen_dialog.py`, `export_dialog.py`, `data_dialog.py` | Dialogs |
 | `ui_widgets.py`, `theme.py` | Reusable widgets (collapsible sections, layer panel, swatch combo box, wheel guard) and the Qt style sheet |
 | `tools/` | One-off scripts, such as building the Lake Tahoe bathymetry file |
-
-`main_v1.py` and `main_matplotlib.py` are older versions kept for reference.
 
 ## How a plot is represented
 

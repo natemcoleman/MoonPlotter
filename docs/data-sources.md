@@ -31,8 +31,9 @@ Notes:
 
   If you swap in a different DEM, set the multiplier to match its units.
 - **Mars** stays disabled under **Source** until at least one of its files exists.
-- If the Earth DEM is missing, the app still starts. Drawing an Earth map fails with a file error until
-  you add the DEM.
+- If the Earth DEM is missing, selecting Earth (or drawing an Earth map) shows a message with the
+  download link and where to put the file. Lake Tahoe and fetched regional elevation still work without
+  it.
 - `tahoe_lake_wgs84.tif` (in the repo) is a 10 m Lake Tahoe bathymetry model. It is used when you choose
   **Clip to region › Lake Tahoe (High-Res Bathymetry)**. `tools/make_tahoe.py` shows how it was built.
 - Country and state borders come from [Natural Earth](https://www.naturalearthdata.com/). They are

@@ -161,8 +161,8 @@ its real line width, colour and opacity on your paper colour.
 
 **Projects** (`*.topo.json`) save everything: subject, selection, paper, every setting, painted pens, hand
 edits and annotations. Mission and image settings are saved too. Use **File › New / Open / Open recent /
-Save / Save as**. Opening a project re-renders the map as it was. An example is in
-`MoonPlotter/projects/`.
+Save / Save as**. Projects are saved to and opened from the `MoonPlotter/projects/` folder by default.
+Opening a project re-renders the map as it was. The folder includes a Lake Tahoe example.
 
 **Style presets** (top of the sidebar) save just the look, so you can apply it to any area. The built-in
 presets are:

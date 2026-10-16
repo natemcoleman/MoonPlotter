@@ -18,8 +18,9 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QProgressBar, QDoubleSpinBox, QGridLayout, QDialog, QListWidget,
                              QListWidgetItem, QToolButton, QMenu, QTableWidget, QTableWidgetItem,
                              QAbstractItemView, QHeaderView)
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QThread
-from PyQt6.QtGui import QDoubleValidator, QIntValidator, QShortcut, QKeySequence, QIcon, QAction, QColor
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QThread, QUrl, QStandardPaths
+from PyQt6.QtGui import (QDoubleValidator, QIntValidator, QShortcut, QKeySequence, QIcon, QAction, QColor,
+                         QDesktopServices)
 
 # Matplotlib Imports
 import matplotlib
@@ -82,6 +83,18 @@ def fmt_minutes(m):
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
+os.chdir(APP_DIR)                  # data, pens, presets and projects are all relative to the app folder
+PROJECTS_DIR = os.path.join(APP_DIR, "projects")
+ETOPO_URL = "https://www.ncei.noaa.gov/products/etopo-global-relief-model"
+
+
+def desktop_dir():
+    """The user's Desktop (follows OneDrive redirection), falling back to the home folder."""
+    try:
+        d = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DesktopLocation)
+    except Exception:
+        d = ""
+    return d if d and os.path.isdir(d) else os.path.expanduser("~")
 
 
 def app_icon():
@@ -190,7 +203,7 @@ class PlotterApp(QMainWindow):
         self.setWindowIcon(app_icon())
         self.resize(1500, 500)
 
-        self.active_planet = 'Earth'
+        self.active_planet = 'Moon'
         self.paper_name = '100x100mm (Default)'
         self.is_landscape = True
         self.interval_ft = 200
@@ -430,7 +443,7 @@ class PlotterApp(QMainWindow):
         self.radio_solar.setToolTip("Spacecraft trajectories through the solar system (Voyager, Cassini, New Horizons...)")
         self.radio_image = QRadioButton("Image")
         self.radio_image.setToolTip("Trace a logo, drawing or photo into pen outlines (and sticker cut lines)")
-        self.radio_earth.setChecked(True)
+        self.radio_moon.setChecked(True)            # works straight after cloning (data is in the repo)
         mars_files = DATA_FILES['Mars']
         if not (os.path.exists(mars_files['dem']) or os.path.exists(mars_files['color'])):
             self.radio_mars.setEnabled(False)
@@ -1385,9 +1398,9 @@ class PlotterApp(QMainWindow):
             return
         needs_dem = params['layer_contours'] or (params['layer_fill'] and (
             "Hachure" in params['hatch_strategy'] or "Hillshade" in params['fill_source']))
-        if needs_dem and not os.path.exists(dem_path):
-            QMessageBox.critical(self, "Missing File", f"Cannot find {dem_path}")
-            self.lbl_status.setText("Ready.")
+        if needs_dem and not os.path.exists(dem_path) and not params.get('regional_dem'):
+            self.explain_missing_dem(self.active_planet, force=True)
+            self.lbl_status.setText("Elevation data missing - see the message for where to get it.")
             return
 
         self.btn_draw.setEnabled(False)
@@ -2378,6 +2391,44 @@ class PlotterApp(QMainWindow):
             return 'Mars'
         return 'Moon' if self.radio_moon.isChecked() else 'Earth'
 
+    def explain_missing_dem(self, planet, force=False):
+        """Earth / Mars elevation files are too big for the repository: explain where to get them
+        (once per session when switching to the planet, every time a draw needs the file)."""
+        if planet not in DATA_FILES or os.path.exists(DATA_FILES[planet]['dem']):
+            return
+        shown = self.__dict__.setdefault('_dem_help_shown', set())
+        if planet in shown and not force:
+            return
+        shown.add(planet)
+        name = DATA_FILES[planet]['dem']
+        if planet == 'Earth':
+            url = ETOPO_URL
+            body = (
+                "<p>The global Earth elevation model is too large to include in the repository, so it is a "
+                "one-time download.</p>"
+                "<ol><li>Open the <a href='%s'>NOAA ETOPO 2022 page</a>.</li>"
+                "<li>Under <b>60 Arc-Second</b>, download the <b>Ice Surface Elevation</b> GeoTIFF "
+                "(<i>ETOPO_2022_v1_60s_N90W180_surface.tif</i>).</li>"
+                "<li>Put it in the app folder as <b>%s</b>:<br><i>%s</i></li>"
+                "<li>Select Earth again (no restart needed).</li></ol>"
+                "<p>Until then you can still plot <b>Lake Tahoe</b> (Clip to region) and any area you fetch with "
+                "<b>Tools &rsaquo; Data sources</b>.</p>") % (url, name, APP_DIR)
+        else:
+            url = "https://planetarymaps.usgs.gov/mosaic/"
+            body = ("<p>The %s elevation file <b>%s</b> is not in the app folder:<br><i>%s</i></p>"
+                    "<p>Download it from <a href='%s'>USGS Astrogeology</a> (the exact URLs are in "
+                    "config.py) and keep the original file name.</p>") % (planet, name, APP_DIR, url)
+        box = QMessageBox(self)
+        box.setWindowTitle(f"{planet} elevation data needed")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText(body)
+        b_open = box.addButton("Open download page", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Close)
+        box.exec()
+        if box.clickedButton() is b_open:
+            QDesktopServices.openUrl(QUrl(url))
+
     def switch_planet(self):
         if self.selected_planet() == 'Solar System':
             self._enter_mission_mode()
@@ -2389,6 +2440,8 @@ class PlotterApp(QMainWindow):
             self._leave_mission_mode()
         self.active_planet = self.selected_planet()
         self.context_ui_update()
+        if not self._loading:
+            QTimer.singleShot(0, lambda p=self.active_planet: self.explain_missing_dem(p))
 
         _, base_img = load_planet_data(self.active_planet)
         self.ax_map.clear()
@@ -2953,7 +3006,9 @@ class PlotterApp(QMainWindow):
     def save_project(self, save_as=False):
         path = self.project_path
         if save_as or not path:
-            default = f"{self.active_planet.lower()}_plot.topo.json"
+            os.makedirs(PROJECTS_DIR, exist_ok=True)
+            folder = os.path.dirname(self.project_path) if self.project_path else PROJECTS_DIR
+            default = os.path.join(folder, f"{self.active_planet.lower()}_plot.topo.json")
             path, _ = QFileDialog.getSaveFileName(self, "Save project", default, "Topo projects (*.topo.json)")
             if not path:
                 return
@@ -2969,7 +3024,7 @@ class PlotterApp(QMainWindow):
 
     def open_project(self, path=None):
         if not path:
-            start = os.path.dirname(self.project_path) if self.project_path else ""
+            start = os.path.dirname(self.project_path) if self.project_path else PROJECTS_DIR
             path, _ = QFileDialog.getOpenFileName(self, "Open project", start,
                                                   "Topo projects (*.topo.json);;JSON (*.json)")
         if not path:
@@ -2991,18 +3046,37 @@ class PlotterApp(QMainWindow):
     # --- recent projects / painted lines ---
     RECENT_FILE = "recent_projects.json"
 
+    @staticmethod
+    def _rel_to_app(path):
+        """Projects inside the app folder are remembered relative to it, so the list survives moving or
+        cloning the folder; anything elsewhere keeps its absolute path."""
+        p = os.path.abspath(path)
+        try:
+            if os.path.commonpath([p, APP_DIR]) == APP_DIR:
+                return os.path.relpath(p, APP_DIR)
+        except ValueError:                         # different drive on Windows
+            pass
+        return p
+
     def _recent(self):
+        """Absolute paths of recent projects (stored relative to the app folder where possible)."""
         try:
             with open(self.RECENT_FILE) as f:
                 items = json.load(f)
-            return [p for p in items if isinstance(p, str)]
         except Exception:
             return []
+        out = []
+        for p in items:
+            if isinstance(p, str):
+                p = p if os.path.isabs(p) else os.path.join(APP_DIR, p)
+                if os.path.abspath(p) not in out:
+                    out.append(os.path.abspath(p))
+        return out
 
     def _write_recent(self, items):
         try:
             with open(self.RECENT_FILE, 'w') as f:
-                json.dump(items[:10], f, indent=2)
+                json.dump([self._rel_to_app(p) for p in items[:10]], f, indent=2)
         except Exception as e:
             print(f"Could not save recent projects: {e}")
 
@@ -3862,7 +3936,8 @@ class PlotterApp(QMainWindow):
             return
         orient = "landscape" if self.is_landscape else "portrait"
         default_name = f"{self.active_planet.lower()}_{orient}_{int(self.pw)}x{int(self.ph)}.svg"
-        out_svg, _ = QFileDialog.getSaveFileName(self, "Save Editable SVG", default_name, "SVG Files (*.svg)")
+        out_svg, _ = QFileDialog.getSaveFileName(self, "Save Editable SVG", os.path.join(desktop_dir(), default_name),
+                                                 "SVG Files (*.svg)")
         if not out_svg: return
 
         self.lbl_status.setText("Generating Master SVG...")
@@ -3950,7 +4025,8 @@ class PlotterApp(QMainWindow):
     def _export_gcode(self, st):
         orient = "landscape" if self.is_landscape else "portrait"
         default_base_name = f"{self.active_planet.lower()}_{orient}_{int(self.pw)}x{int(self.ph)}.gcode"
-        base_filepath, _ = QFileDialog.getSaveFileName(self, "Select base name for the G-code", default_base_name,
+        base_filepath, _ = QFileDialog.getSaveFileName(self, "Select base name for the G-code",
+                                                       os.path.join(desktop_dir(), default_base_name),
                                                        "G-Code Files (*.gcode)")
         if not base_filepath:
             return

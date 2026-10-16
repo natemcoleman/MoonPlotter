@@ -43,22 +43,20 @@ using real pen colours, white pen on black paper, and Voyager 2's path from NASA
 
 ## Quick start
 
-You need **Python 3.12** and Git. The app is developed and tested on Windows. Its libraries are
-cross-platform, so macOS and Linux should work, but they haven't been tested.
+You need **Windows**, **Python 3.12** and Git.
 
 ```bash
 git clone https://github.com/natemcoleman/MoonPlotter.git
 cd MoonPlotter
 python -m venv .venv
-# Windows:            .venv\Scripts\activate
-# macOS / Linux:      source .venv/bin/activate
+.venv\Scripts\activate
 pip install -r requirements.txt
-cd MoonPlotter            # the app folder: run it from here, data paths are relative
-python main.py
+python MoonPlotter\main.py
 ```
 
-The Moon data and a low-resolution Earth colour map come with the repository. **The global Earth elevation
-model is not included** because it is too large for GitHub. Download it once:
+The app opens on the **Moon**, whose data comes with the repository, so you can plot straight away.
+**The global Earth elevation model is not included** because it is too large for GitHub. When you select
+Earth without it, the app explains where to get it. To download it ahead of time:
 
 1. Get the ETOPO 2022 60 arc-second **ice surface** GeoTIFF from
    [NOAA](https://www.ncei.noaa.gov/products/etopo-global-relief-model)
@@ -70,7 +68,8 @@ Mars needs two large USGS files. See [Data sources](docs/data-sources.md) for th
 
 ### Your first plot
 
-1. Under **Source**, pick **Moon**. On the **Source map**, scroll to zoom and drag a box around an area.
+1. The **Moon** is selected under **Source**. On the **Source map**, scroll to zoom and drag a box around an
+   area.
 2. Click **Draw Map**. The contour interval is chosen automatically.
 3. Optionally, turn on **Fill / Hatching** or **Map furniture** and adjust them. The preview updates live.
 4. **File › Save SVG…** to look at the result, or **File › Export G-code…** (`Ctrl+E`) for the plotter.
@@ -103,15 +102,20 @@ MoonPlotter/              repository root
 ├── README.md
 ├── requirements.txt
 ├── docs/                 guides and images
-└── MoonPlotter/          the application (run main.py from here)
+└── MoonPlotter/          the application (main.py starts it)
     ├── main.py           Qt window and all UI logic
     ├── config.py         paper sizes, pens, plotter / G-code settings, data file names
     ├── *.py              engines: contours, hatching, decorations, missions, image tracing, export...
     ├── missions/         cached JPL Horizons trajectories
     ├── regions/          downloaded or imported regional rasters (created on demand)
-    ├── projects/         example project files (*.topo.json)
+    ├── projects/         saved projects (*.topo.json): the default save and open folder
     └── tests/            unit tests (python tests/test_engines.py)
 ```
+
+## Licence
+
+The code is released under the [MIT License](LICENSE). The datasets it downloads or includes have their
+own terms, listed below and in [Data sources](docs/data-sources.md#licences-and-credits).
 
 ## Data credits
 

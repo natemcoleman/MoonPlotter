@@ -18,3 +18,10 @@ MoonPlotter/Mars_Viking_ClrMosaic_global_925m.tif
 MoonPlotter/earth_color.tif
 MoonPlotter/earth_color.tif
 *.tif
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Personal, per-machine files
+MoonPlotter/recent_projects.json

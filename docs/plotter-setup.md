@@ -58,7 +58,8 @@ Restart the app after editing `config.py`.
 
 ## Exporting
 
-**File › Export G-code…** (`Ctrl+E`) opens the export dialog:
+**File › Export G-code…** (`Ctrl+E`) opens the export dialog. G-code and SVG files are saved to your
+Desktop by default.
 
 - **Pens and plot order.** Pens are ordered from lightest ink to darkest, so dark lines are drawn on top.
   Untick a pen to skip it. Each pen has its own **draw feed**: thick gel pens skip if they move too fast.
