@@ -2,7 +2,20 @@
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QEvent, QCoreApplication
 from PyQt6.QtGui import QPixmap, QColor, QIcon, QPainter, QPen
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QToolButton, QCheckBox, QFrame,
-                             QListWidget, QListWidgetItem, QLabel, QComboBox, QAbstractSpinBox, QSlider)
+                             QListWidget, QListWidgetItem, QLabel, QComboBox, QAbstractSpinBox, QSlider,
+                             QStylePainter, QStyleOptionComboBox, QStyle)
+
+
+class SwatchCombo(QComboBox):
+    """Compact combo: shows only the current item's colour swatch; the drop-down lists full names."""
+
+    def paintEvent(self, event):
+        p = QStylePainter(self)
+        opt = QStyleOptionComboBox()
+        self.initStyleOption(opt)
+        opt.currentText = ""
+        p.drawComplexControl(QStyle.ComplexControl.CC_ComboBox, opt)
+        p.drawControl(QStyle.ControlElement.CE_ComboBoxLabel, opt)
 
 
 class WheelGuard(QObject):
@@ -111,8 +124,10 @@ def swatch_icon(colors, size=14):
 
 
 class LayerPanel(QWidget):
-    """Checkable list of plot layers. Emits visibility_changed(layer_key, visible)."""
+    """Checkable list of plot layers. Emits visibility_changed(layer_key, visible) and
+    context_requested(layer_key, global_pos) on right-click (used for 'set pen for whole layer')."""
     visibility_changed = pyqtSignal(str, bool)
+    context_requested = pyqtSignal(str, object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -125,8 +140,10 @@ class LayerPanel(QWidget):
         self.list = QListWidget()
         self.list.setObjectName("layers")
         self.list.itemChanged.connect(self._changed)
+        self.list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.list.customContextMenuRequested.connect(self._context)
         v.addWidget(self.list, 1)
-        self.hint = QLabel("Hidden layers are left out of the SVG and G-code.")
+        self.hint = QLabel("Hidden layers are left out of the SVG and G-code. Right-click a layer to change its pen.")
         self.hint.setObjectName("hint")
         self.hint.setWordWrap(True)
         v.addWidget(self.hint)
@@ -166,6 +183,11 @@ class LayerPanel(QWidget):
             f"<tr><td>{i + 1}. {n}</td><td align='right'>{t}</td></tr>" for i, (n, t) in enumerate(rows)) + "</table>"
         self.order.setText(html)
         self.total.setText(f"Total \u2248 {total}" if total else "")
+
+    def _context(self, pos):
+        it = self.list.itemAt(pos)
+        if it is not None:
+            self.context_requested.emit(it.data(Qt.ItemDataRole.UserRole), self.list.viewport().mapToGlobal(pos))
 
     def _changed(self, item):
         if self._updating:

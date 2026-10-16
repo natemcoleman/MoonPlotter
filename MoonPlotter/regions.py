@@ -302,18 +302,18 @@ def xyz_plan(extent, max_zoom, max_px=MAX_OUT_PX, max_tiles=MAX_XYZ_TILES):
 
 def _get_tile(url):
     import io
-    import urllib.request
     from PIL import Image
-    req = urllib.request.Request(url, headers={'User-Agent': _UA})
+    import net
     for attempt in range(3):
         try:
-            with urllib.request.urlopen(req, timeout=30) as r:
-                data = r.read()
+            data = net.fetch_bytes(url, timeout=30)
             return np.asarray(Image.open(io.BytesIO(data)).convert('RGB'))
-        except Exception as e:
-            code = getattr(e, 'code', None)
-            if code in (400, 404):
+        except net.HTTPStatusError as e:
+            if e.code in (400, 404):
                 return None                          # no imagery here (e.g. outside the USA)
+            if attempt == 2:
+                raise
+        except Exception:
             if attempt == 2:
                 raise
     return None

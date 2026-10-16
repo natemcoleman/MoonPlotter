@@ -324,6 +324,63 @@ def test_xyz_fetch_geometry():
     assert captured['bounds'] == (ext[0], ext[2], ext[1], ext[3])
 
 
+def _fixture(hid):
+    import missions as MS
+    return MS.parse_vectors(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fixtures',
+                                              f'horizons_{hid}_coarse.txt')).read())
+
+
+def test_horizons_parse_and_planet_positions():
+    """Real Voyager 2 data (JPL Horizons): planets computed from orbital elements sit on the spacecraft
+    path at the flyby dates."""
+    import missions as MS
+    jd, xyz = _fixture('-32')
+    assert len(jd) == 71 and xyz.shape == (71, 3)
+    for date, body in (('1979-07-09', 'Jupiter'), ('1981-08-25', 'Saturn'), ('1986-01-24', 'Uranus'),
+                       ('1989-08-25', 'Neptune')):
+        j = MS.jd_from_date(date)
+        sc = MS.position_at(jd, xyz, j)
+        pl = np.array(MS.planet_position(body, j))
+        assert np.linalg.norm(sc[:2] - pl[:2]) < 0.3, body          # 90-day samples -> small interp error
+
+
+def test_horizons_span_error_parsing():
+    import missions as MS
+    msg = 'No ephemeris for target "Pioneer 10 (spacecraft)" prior to A.D. 1972-MAR-03 02:04:42.1854 TDB'
+    kind, y, mon, d = MS._SPAN_RE.search(msg).groups()
+    assert (kind, y, MS._MON[mon], d) == ('prior to', '1972', 3, '03')
+    assert MS.parse_vectors("no data here") == (None, None)
+
+
+def test_mission_catalogue():
+    import missions as MS
+    hids = [m['hid'] for m in MS.MISSIONS]
+    assert len(hids) == len(set(hids))
+    apl_led = {m['name'] for m in MS.MISSIONS if m.get('apl') == 'led'}
+    assert {'New Horizons', 'MESSENGER', 'Parker Solar Probe', 'DART', 'NEAR Shoemaker'} <= apl_led
+    for m in MS.MISSIONS:
+        for date, body, _ in m['events']:
+            assert m['launch'] <= date, m['name']
+            assert body is None or body in MS.PLANET_ELEMENTS
+
+
+def test_mission_plot_layout():
+    import missions as MS
+    from mission_plot import build_mission_plot, _overlaps
+    data = {'voyager1': _fixture('-31'), 'voyager2': _fixture('-32'), 'cassini': _fixture('-82')}
+    sel = [(MS.MISSION_BY_KEY[k], p) for k, p in (('voyager1', 'red_038'), ('voyager2', 'blue_038'),
+                                                   ('cassini', 'orange_07'))]
+    segs, masks, info = build_mission_plot(sel, data, {'pen': 'base', 'line_mm': 0.38}, 200, 200)
+    layers = {s['layer'] for s in segs}
+    assert {'orbits', 'trajectory', 'markers', 'labels', 'belt'} <= layers
+    pts = np.vstack([s['seg'] for s in segs])
+    assert pts[:, 0].min() >= 0 and pts[:, 0].max() <= 200 and pts[:, 1].min() >= -100 and pts[:, 1].max() <= 100
+    for i in range(len(masks)):                                  # labels never overlap each other
+        for j in range(i + 1, len(masks)):
+            assert not _overlaps(masks[i], masks[j], gap=-1.7), (masks[i], masks[j])   # 0.8 mm pad each
+    assert {s['pen_id'] for s in segs if s['layer'] == 'trajectory'} == {'red_038', 'blue_038', 'orange_07'}
+
+
 def test_project_roundtrip():
     st = {'planet': 'Moon', 'selection': [1.0, 2.0, 3.0, 4.0], 'custom_items': [{'points': np.zeros((2, 2))}],
           'selected_sites': {'Moon': ['Apollo 11']}}
@@ -332,6 +389,58 @@ def test_project_roundtrip():
     back = project_io.load_project(path)
     assert back['selection'] == [1.0, 2.0, 3.0, 4.0]
     assert back['selected_sites']['Moon'] == ['Apollo 11']
+
+
+def _logo_rgb():
+    """White page with a red ring (with a hole) and a blue square."""
+    h, w = 200, 300
+    yy, xx = np.mgrid[0:h, 0:w]
+    rgb = np.ones((h, w, 3), np.float32)
+    r = np.hypot(xx - 80, yy - 100)
+    ring = (r < 60) & (r > 20)
+    rgb[ring] = (0.9, 0.1, 0.1)
+    sq = (xx > 170) & (xx < 270) & (yy > 50) & (yy < 150)
+    rgb[sq] = (0.1, 0.1, 0.8)
+    return rgb
+
+
+def test_image_trace_outlines():
+    import image_trace as it
+    layers, info = it.trace_image(_logo_rgb(), {'colours': 3, 'smooth_px': 1.0}, 200, 150)
+    cols = sorted(tuple(np.round(l['color'], 1)) for l in layers)
+    assert len(layers) == 2 and (0.9, 0.1, 0.1) in cols and (0.1, 0.1, 0.8) in cols   # background skipped
+    ring = next(l for l in layers if l['color'][0] > 0.5)
+    assert len(ring['polys']) == 2                                   # outer edge + the hole
+    for l in layers:
+        for p in l['polys']:
+            assert np.allclose(p[0], p[-1], atol=0.5)                  # closed outlines
+            assert p[:, 0].min() >= 0 and p[:, 0].max() <= 200 and p[:, 1].min() >= 0 and p[:, 1].max() <= 150
+    # a 2-colour trace puts both shapes into one layer
+    layers2, _ = it.trace_image(_logo_rgb(), {'colours': 2}, 200, 150)
+    assert len(layers2) == 1 and len(layers2[0]['polys']) == 3
+
+
+def test_image_trace_fill_and_cutline():
+    import image_trace as it
+    layers, _ = it.trace_image(_logo_rgb(), {'colours': 3, 'fill': True, 'fill_spacing_mm': 1.0,
+                                             'cutline': True, 'cut_offset_mm': 2.0}, 200, 150)
+    keys = [l['key'] for l in layers]
+    assert keys[-1] == 'img:cut'
+    cut = layers[-1]['polys']
+    assert len(cut) == 2                                              # one outline around each shape, no holes
+    sq = next(l for l in layers if l['color'][2] > 0.5)
+    assert len(sq['polys']) > 20                                      # outline + hatching
+    # the cut line sits outside the art by about the offset
+    art = np.vstack([p for l in layers[:-1] for p in l['polys']])
+    c = np.vstack(cut)
+    assert c[:, 0].min() < art[:, 0].min() - 1.0 and c[:, 0].max() > art[:, 0].max() + 1.0
+
+
+def test_image_trace_edges():
+    import image_trace as it
+    layers, _ = it.trace_image(_logo_rgb(), {'mode': it.MODES[1]}, 200, 150)
+    assert len(layers) == 1 and len(layers[0]['polys']) >= 3
+    assert sum(len(p) for p in layers[0]['polys']) > 50
 
 
 if __name__ == '__main__':

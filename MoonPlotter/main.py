@@ -16,8 +16,9 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QFileDialog, QMessageBox, QFrame, QButtonGroup,
                              QInputDialog, QColorDialog, QSlider, QScrollArea, QSpinBox, QCompleter,
                              QProgressBar, QDoubleSpinBox, QGridLayout, QDialog, QListWidget,
-                             QListWidgetItem, QToolButton, QMenu)
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer
+                             QListWidgetItem, QToolButton, QMenu, QTableWidget, QTableWidgetItem,
+                             QAbstractItemView, QHeaderView)
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QThread
 from PyQt6.QtGui import QDoubleValidator, QIntValidator, QShortcut, QKeySequence, QIcon, QAction, QColor
 
 # Matplotlib Imports
@@ -40,13 +41,16 @@ from config import (DATA_FILES, PAPER_SIZES, PT_PER_MM, PLANET_RADII, PAPER_COLO
 from workers import RenderWorker
 from hatch_engine import composite_ink_layers, STRATEGIES
 from theme import apply_theme, style_axes, SEPIA, ACCENT, TEXT, MUTED
-from ui_widgets import CollapsibleSection, LayerPanel, swatch_icon, WheelGuard
+from ui_widgets import CollapsibleSection, LayerPanel, swatch_icon, WheelGuard, SwatchCombo
 from sites import sites_for, CATEGORY_STYLE
 import exporter
 import regions
 from decorations import build_decorations, TEXT_SCALES, LABEL_CAP_MM, min_cap_for_pen
 from stroke_font import stroke_text
 from calibration import build_calibration_sheet
+import missions as MS
+from mission_plot import build_mission_plot, PATH_STYLES
+import image_trace as IT
 from export_dialog import ExportDialog
 from pen_dialog import PenManagerDialog
 from data_dialog import DataDialog
@@ -59,7 +63,9 @@ SEL_EDGE = SEPIA
 ZOOM_FILL = ACCENT
 LAYER_LABELS = {'contours': 'Contours', 'borders': 'Borders & outlines', 'sites': 'Points of interest',
                 'decor': 'Map furniture', 'calibration': 'Calibration sheet',
-                'annotations': 'Text & drawn lines'}
+                'orbits': 'Planet orbits', 'trajectory': 'Trajectories', 'markers': 'Sun, planets & year marks',
+                'belt': 'Asteroid belt', 'labels': 'Labels & title',
+                'annotations': 'Text & drawn lines', 'img:cut': 'Sticker cut line'}
 
 # Rough plotter model for the live time estimate (matches the G-code writer / estimator):
 DRAW_FEED = 1500.0      # mm/min (G1)
@@ -135,6 +141,48 @@ def load_planet_data(planet):
 # ==========================================
 # MAIN PYQT6 GUI
 # ==========================================
+class _MissionFetch(QThread):
+    """Downloads mission trajectories from JPL Horizons in the background."""
+    done = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    progress = pyqtSignal(str)
+
+    def __init__(self, mission_list):
+        super().__init__()
+        self.mission_list = mission_list
+
+    def run(self):
+        out = {}
+        try:
+            for m in self.mission_list:
+                out[m['key']] = MS.fetch_mission(m, progress=self.progress.emit)
+        except Exception as e:
+            self.failed.emit(f"{type(e).__name__}: {e}")
+            return
+        self.done.emit(out)
+
+
+class _ImageTrace(QThread):
+    """Traces the loaded image in the background (k-means / outlines can take a second or two)."""
+    done = pyqtSignal(object, object, int)
+    failed = pyqtSignal(str)
+
+    def __init__(self, rgb, opts, pw, ph, cache, token):
+        super().__init__()
+        self.args = (rgb, opts, pw, ph, cache)
+        self.token = token
+
+    def run(self):
+        try:
+            layers, info = IT.trace_image(*self.args)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.failed.emit(f"{type(e).__name__}: {e}")
+            return
+        self.done.emit(layers, info, self.token)
+
+
 class PlotterApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -162,6 +210,17 @@ class PlotterApp(QMainWindow):
         self.decor_segments = []          # title / scale bar / north arrow / graticule / frame
         self.decor_masks = []             # data-coord boxes blanked behind the decorations
         self.calibration_mode = False
+        self.mission_mode = False         # True for every paper-space mode (Solar System and Image)
+        self.image_mode = False
+        self.mission_data = {}
+        self.image_path = None
+        self.image_rgb = None
+        self._image_cache = {}
+        self._image_layers = []           # last trace result
+        self._image_pens = {}             # traced layer key -> pen id
+        self._image_job = None
+        self._image_token = 0
+        self._image_pending = False
         self.circle_center_lon = 0.0
         self._saved_selection = None
         self._loading = False
@@ -259,7 +318,7 @@ class PlotterApp(QMainWindow):
         lbl = QLabel(label_text)
         lbl.setObjectName("fieldLabel")
         v.addWidget(lbl)
-        if isinstance(widget, QHBoxLayout):
+        if isinstance(widget, (QHBoxLayout, QGridLayout, QVBoxLayout)):
             v.addLayout(widget)
         else:
             v.addWidget(widget)
@@ -367,19 +426,26 @@ class PlotterApp(QMainWindow):
         self.radio_earth = QRadioButton("Earth")
         self.radio_moon = QRadioButton("Moon")
         self.radio_mars = QRadioButton("Mars")
+        self.radio_solar = QRadioButton("Solar System")
+        self.radio_solar.setToolTip("Spacecraft trajectories through the solar system (Voyager, Cassini, New Horizons...)")
+        self.radio_image = QRadioButton("Image")
+        self.radio_image.setToolTip("Trace a logo, drawing or photo into pen outlines (and sticker cut lines)")
         self.radio_earth.setChecked(True)
         mars_files = DATA_FILES['Mars']
         if not (os.path.exists(mars_files['dem']) or os.path.exists(mars_files['color'])):
             self.radio_mars.setEnabled(False)
             self.radio_mars.setToolTip("Download the USGS Mars files into the project folder:\n"
                                        f"{mars_files['dem']}\n{mars_files['color']}")
-        for r in (self.radio_earth, self.radio_moon, self.radio_mars):
+        for r in (self.radio_earth, self.radio_moon, self.radio_mars, self.radio_solar, self.radio_image):
             r.toggled.connect(lambda checked: checked and self.switch_planet())
-        h_planet = QHBoxLayout()
-        for r in (self.radio_earth, self.radio_moon, self.radio_mars):
-            h_planet.addWidget(r)
-        h_planet.addStretch()
-        sec_src.add(self._field("Planet", h_planet))
+        h_planet = QGridLayout()
+        h_planet.setContentsMargins(0, 0, 0, 0)
+        h_planet.addWidget(self.radio_earth, 0, 0)
+        h_planet.addWidget(self.radio_moon, 0, 1)
+        h_planet.addWidget(self.radio_mars, 0, 2)
+        h_planet.addWidget(self.radio_solar, 1, 0, 1, 2)
+        h_planet.addWidget(self.radio_image, 1, 2)
+        sec_src.add(self._field("Subject", h_planet))
 
         self.combo_region = QComboBox()
         self.combo_region.setEditable(True)
@@ -423,6 +489,8 @@ class PlotterApp(QMainWindow):
         self.lbl_sites_hint.setWordWrap(True)
         sec_src.add(self.lbl_sites_hint)
         vbox.addWidget(sec_src)
+        self._build_missions_section(vbox)
+        self._build_image_section(vbox)
 
         # ---------- PAPER ----------
         sec_paper = CollapsibleSection("Paper")
@@ -702,7 +770,7 @@ class PlotterApp(QMainWindow):
         vbox.addWidget(self.sec_fill)
 
         # ---------- MAP FURNITURE ----------
-        sec_deco = CollapsibleSection("Map furniture", expanded=False)
+        sec_deco = self.sec_deco = CollapsibleSection("Map furniture", expanded=False)
         self.chk_deco_title = QCheckBox("Title block")
         self.chk_deco_title.toggled.connect(self.update_decorations)
         sec_deco.add(self.chk_deco_title)
@@ -933,6 +1001,7 @@ class PlotterApp(QMainWindow):
         self.layer_panel = LayerPanel()
         self.layer_panel.setFixedWidth(210)
         self.layer_panel.visibility_changed.connect(self.on_layer_visibility)
+        self.layer_panel.context_requested.connect(self.on_layer_context)
         prev_outer.addWidget(self.layer_panel)
         splitter.addWidget(prev_card)
         splitter.setStretchFactor(0, 4)
@@ -1007,6 +1076,24 @@ class PlotterApp(QMainWindow):
         self.chk_auto_contrast.setVisible(not is_hachure)
         self.chk_join.setVisible(not ("Stipp" in strategy or is_hachure))
         self._update_contrast_warning()
+        # Solar System mode: mission controls instead of the map / terrain controls
+        solar = planet in ('Solar System', 'Image')
+        self.sec_missions.setVisible(planet == 'Solar System')
+        self.sec_image.setVisible(planet == 'Image')
+        if planet == 'Image':
+            self._update_image_controls()
+        for w in (self.sec_contours, self.sec_fill):
+            w.setVisible(not solar)
+        for w in (self.chk_circle, self.chk_sites, self.chk_site_labels, self.lbl_sites_hint):
+            w.setVisible(not solar)
+        if solar:
+            self.lbl_region.setVisible(False)
+            self.chk_borders.setVisible(False)
+        for w in (self.chk_deco_scale, self.chk_deco_north, self.combo_graticule.parentWidget(),
+                  self.combo_scale_units.parentWidget(), self.chk_deco_title):
+            w.setVisible(not solar)
+        if hasattr(self, 'btn_draw'):
+            self.btn_draw.setText({'Solar System': "Draw Mission Plot", 'Image': "Trace Image"}.get(planet, "Draw Map"))
 
     def on_region_changed(self, text):
         if "Tahoe" in text:
@@ -1185,6 +1272,9 @@ class PlotterApp(QMainWindow):
         # and PyQt would pass those values in as arguments.
         if self._loading or self.calibration_mode:
             return
+        if self.mission_mode:
+            self.update_paper_plot()
+            return
         if self.is_calculating:
             self.recalc_pending = True
             return
@@ -1275,6 +1365,12 @@ class PlotterApp(QMainWindow):
             return
         if self.calibration_mode:
             self.exit_calibration()
+        if self.image_mode:
+            self.start_image_plot(fresh=True)
+            return
+        if self.mission_mode:
+            self.start_mission_plot()
+            return
         self._start_render(fresh=True)
 
     def _start_render(self, fresh):
@@ -1562,6 +1658,42 @@ class PlotterApp(QMainWindow):
     def annotations_visible(self):
         return self.layer_visible.get('annotations', True)
 
+    def on_layer_context(self, key, global_pos):
+        """Right-click on a layer: pick a pen for every stroke in it."""
+        menu = QMenu(self)
+        title = menu.addAction("Set pen for whole layer:")
+        title.setEnabled(False)
+        for pid, pen in sorted(self.ink_pens(), key=lambda kv: ink_lightness(kv[1]['color'])):
+            a = menu.addAction(swatch_icon([pen['color']]), pen['name'])
+            a.triggered.connect(lambda _=False, p=pid: self.set_layer_pen(key, p))
+        menu.exec(global_pos)
+
+    def set_layer_pen(self, key, pen_id):
+        if key == 'annotations':
+            targets_custom = list(range(len(self.custom_items)))
+            targets = []
+        else:
+            targets_custom = []
+            targets = [i for i, it in enumerate(self.dem_segments) if self.layer_key(it) == key]
+        if not targets and not targets_custom:
+            return
+        self.push_undo_state()
+        vis = self.layer_visible.get(key, True)
+        for i in targets:
+            self.dem_segments[i]['pen_id'] = pen_id
+        for i in targets_custom:
+            self.custom_items[i]['pen_id'] = pen_id
+        if key.startswith('fill:'):                       # fill layers are keyed by pen - keep visibility
+            self.layer_visible[f"fill:{pen_id}"] = vis
+        if key.startswith('img:'):                        # image mode: the layer table follows
+            self._image_pens[key] = pen_id
+            self._fill_image_table()
+        self._cache_stroke_metrics()
+        self.render_canvas()
+        self.refresh_layer_panel()
+        self.lbl_status.setText(f"{LAYER_LABELS.get(key, key)} now uses {self.pens[pen_id]['name']}. "
+                                "(Redrawing the map resets layer pens.)")
+
     def refresh_layer_panel(self):
         groups = {}
         for item in self.dem_segments:
@@ -1573,7 +1705,9 @@ class PlotterApp(QMainWindow):
         if self.custom_items:
             groups['annotations'] = {'pens': list(dict.fromkeys(i['pen_id'] for i in self.custom_items)),
                                      'n': len(self.custom_items)}
-        order = ['calibration', 'contours', 'borders', 'sites'] + sorted(k for k in groups if k.startswith('fill:')) + ['decor', 'annotations']
+        order = ['calibration', 'contours', 'borders', 'sites'] + sorted(k for k in groups if k.startswith('fill:')) + \
+                ['orbits', 'belt', 'trajectory', 'markers', 'labels', 'decor', 'annotations']
+        order += sorted(k for k in groups if k not in order)
         rows = []
         for k in order:
             if k not in groups: continue
@@ -1581,6 +1715,8 @@ class PlotterApp(QMainWindow):
             colors = [self.pens.get(p, self.pens['base'])['color'] for p in pens][:4]
             if k.startswith('fill:'):
                 label = "Fill · " + self.pens.get(k[5:], {'name': k[5:]})['name']
+            elif k.startswith('img:') and k != 'img:cut':
+                label = "Image · " + next((l['label'] for l in self._image_layers if l['key'] == k), k[4:])
             else:
                 label = LAYER_LABELS.get(k, k)
             rows.append((k, label, colors, groups[k]['n']))
@@ -1696,7 +1832,7 @@ class PlotterApp(QMainWindow):
         self.ax_prev.set_aspect(1 / np.cos(mid_lat))
 
         self._visible_idx = [i for i, item in enumerate(self.dem_segments)
-                             if self.is_visible(item) and item.get('layer') != 'decor']
+                             if self.is_visible(item) and item.get('layer') not in self.TOP_LAYERS]
         self.dem_collection = None
         if self._visible_idx:
             vis = [self.dem_segments[i] for i in self._visible_idx]
@@ -1738,11 +1874,11 @@ class PlotterApp(QMainWindow):
             self.ax_prev.add_patch(patches.Rectangle((x0, y0), x1 - x0, y1 - y0, facecolor=self.current_paper_color(),
                                                      edgecolor='none', zorder=13))
         # Map furniture sits above its own blanking boxes (and above the ink preview image).
-        decor = [it for it in self.dem_segments if it.get('layer') == 'decor' and self.is_visible(it)]
-        if decor:
-            dpen = self.pens.get(decor[0]['pen_id'], self.pens['base'])
-            self.ax_prev.add_collection(LineCollection([it['seg'] for it in decor], colors=dpen['color'],
-                                                       linewidths=dpen['width'] * PT_PER_MM, zorder=14))
+        top = [it for it in self.dem_segments if it.get('layer') in self.TOP_LAYERS and self.is_visible(it)]
+        if top:
+            tpens = [self.pens.get(it['pen_id'], self.pens['base']) for it in top]
+            self.ax_prev.add_collection(LineCollection([it['seg'] for it in top], colors=[p['color'] for p in tpens],
+                                                       linewidths=[p['width'] * PT_PER_MM for p in tpens], zorder=14))
 
         if is_fresh and self.current_view_extent:
             if self.chk_circle.isChecked():
@@ -1813,7 +1949,7 @@ class PlotterApp(QMainWindow):
 
         by_pen = {}
         for item in self.dem_segments:
-            if self.is_visible(item) and item.get('layer') != 'decor':
+            if self.is_visible(item) and item.get('layer') not in self.TOP_LAYERS:
                 by_pen.setdefault(item['pen_id'], []).append(item['seg'])
 
         off_fig = Figure(figsize=(w / dpi, h / dpi), dpi=dpi, facecolor='white')
@@ -2019,6 +2155,8 @@ class PlotterApp(QMainWindow):
         return
 
     PAINT_SKIP_LAYERS = ('fill', 'decor', 'calibration')
+    # drawn above the label blanking boxes (and excluded from the ink simulation / paint picking)
+    TOP_LAYERS = ('decor', 'labels', 'markers', 'trajectory', 'belt')
 
     def _paint_at(self, event):
         """Gives every line under the cursor (within the pick radius) the active pen. Hatching is left
@@ -2142,6 +2280,8 @@ class PlotterApp(QMainWindow):
         self.btn_zoom_tool.setChecked(False)
 
     def on_mouse_press_map(self, event):
+        if self.mission_mode and event.button == 1:
+            return
         if event.button == 1:
             hit = self._site_at(event)
             if hit is not None:
@@ -2190,7 +2330,7 @@ class PlotterApp(QMainWindow):
                 if self.circle_patch_2.get_visible(): self.ax_map.draw_artist(self.circle_patch_2)
                 self.canvas_map.blit(self.ax_map.bbox)
             return
-        if event.button is None:
+        if event.button is None and not self.mission_mode:
             self._update_site_hover(event)
 
     def on_mouse_release_map(self, event):
@@ -2215,6 +2355,10 @@ class PlotterApp(QMainWindow):
         self.paper_aspect = self.pw / self.ph
         self.ax_prev.set_box_aspect(self.ph / self.pw)
         self.canvas_prev.draw_idle()
+        if getattr(self, 'mission_mode', False):
+            if self.has_drawn and not self.calibration_mode:
+                self.update_paper_plot()
+            return
         if self.last_drag_coords: self.process_selection(*self.last_drag_coords)
 
     def change_paper(self, name):
@@ -2226,11 +2370,23 @@ class PlotterApp(QMainWindow):
         self.update_paper_dims()
 
     def selected_planet(self):
+        if self.radio_image.isChecked():
+            return 'Image'
+        if self.radio_solar.isChecked():
+            return 'Solar System'
         if self.radio_mars.isChecked():
             return 'Mars'
         return 'Moon' if self.radio_moon.isChecked() else 'Earth'
 
     def switch_planet(self):
+        if self.selected_planet() == 'Solar System':
+            self._enter_mission_mode()
+            return
+        if self.selected_planet() == 'Image':
+            self._enter_image_mode()
+            return
+        if self.mission_mode:
+            self._leave_mission_mode()
         self.active_planet = self.selected_planet()
         self.context_ui_update()
 
@@ -2445,11 +2601,19 @@ class PlotterApp(QMainWindow):
         if x is None or y is None: return
         nw, nh = (cx[1] - cx[0]) * scale, (cy[1] - cy[0]) * scale
         rx, ry = (cx[1] - x) / (cx[1] - cx[0]), (cy[1] - y) / (cy[1] - cy[0])
-        self.ax_map.set_xlim([max(-180, x - nw * (1 - rx)), min(180, x + nw * rx)])
-        self.ax_map.set_ylim([max(-90, y - nh * (1 - ry)), min(90, y + nh * ry)])
+        if self.mission_mode:
+            if self.image_mode:
+                return
+            self.ax_map.set_xlim([x - nw * (1 - rx), x + nw * rx])
+            self.ax_map.set_ylim([y - nh * (1 - ry), y + nh * ry])
+        else:
+            self.ax_map.set_xlim([max(-180, x - nw * (1 - rx)), min(180, x + nw * rx)])
+            self.ax_map.set_ylim([max(-90, y - nh * (1 - ry)), min(90, y + nh * ry)])
         self.canvas_map.draw_idle()
 
     def on_select(self, eclick, erelease):
+        if self.mission_mode:
+            return
         x1, x2 = sorted([eclick.xdata, erelease.xdata]);
         y1, y2 = sorted([eclick.ydata, erelease.ydata])
         tiny = abs(erelease.x - eclick.x) < 4 or abs(erelease.y - eclick.y) < 4
@@ -2537,6 +2701,9 @@ class PlotterApp(QMainWindow):
 
     def update_decorations(self, *_):
         if not self.has_drawn or self._loading:
+            return
+        if self.mission_mode:
+            self.update_paper_plot()
             return
         self._build_decorations()
         self._cache_stroke_metrics()
@@ -2683,7 +2850,15 @@ class PlotterApp(QMainWindow):
             'layer_visible': self.layer_visible, 'custom_items': self.custom_items,
             'has_drawn': self.has_drawn and not self.calibration_mode,
             'map_view': [list(self.ax_map.get_xlim()), list(self.ax_map.get_ylim())],
-            'segment_pens': self._painted_pens_state(),
+            'segment_pens': self._painted_pens_state() if not self.mission_mode else None,
+            'missions': {'checked': [k for k, v in self._mission_checked.items() if v], 'pens': dict(self._mission_pens),
+                         'filter': self.combo_mission_filter.currentIndex(), 'path_style': self.combo_path_style.currentText(),
+                         'year_marks': self.chk_year_marks.isChecked(), 'labels': self.chk_mission_labels.isChecked(),
+                         'belt': self.chk_belt.isChecked(), 'title': self.txt_mission_title.text(),
+                         'pen_labels': self.combo_mpen_labels.currentData(),
+                         'pen_orbits': self.combo_mpen_orbits.currentData(),
+                         'pen_belt': self.combo_mpen_belt.currentData()},
+            'image': self._image_state(),
             'preview_view': [list(self.ax_prev.get_xlim()), list(self.ax_prev.get_ylim())] if self.has_drawn else None,
         })
         return st
@@ -2692,7 +2867,26 @@ class PlotterApp(QMainWindow):
         self._loading = True
         try:
             planet = st.get('planet', 'Earth')
-            {'Earth': self.radio_earth, 'Moon': self.radio_moon, 'Mars': self.radio_mars}[planet].setChecked(True)
+            ms = st.get('missions') or {}
+            if ms:
+                self._mission_checked = {k: True for k in ms.get('checked', [])}
+                self._mission_pens.update(ms.get('pens', {}))
+                self.combo_mission_filter.setCurrentIndex(int(ms.get('filter', 0)))
+                self.combo_path_style.setCurrentText(ms.get('path_style', 'Dashed'))
+                self.chk_year_marks.setChecked(bool(ms.get('year_marks', True)))
+                self.chk_mission_labels.setChecked(bool(ms.get('labels', True)))
+                self.chk_belt.setChecked(bool(ms.get('belt', True)))
+                self.txt_mission_title.setText(ms.get('title', ''))
+                for cb, k in ((self.combo_mpen_labels, 'pen_labels'), (self.combo_mpen_orbits, 'pen_orbits'),
+                              (self.combo_mpen_belt, 'pen_belt')):
+                    i = cb.findData(ms.get(k))
+                    if i >= 0:
+                        cb.setCurrentIndex(i)
+                self._fill_mission_table()
+            if st.get('image'):
+                self._apply_image_state(st['image'])
+            {'Earth': self.radio_earth, 'Moon': self.radio_moon, 'Mars': self.radio_mars,
+             'Solar System': self.radio_solar, 'Image': self.radio_image}[planet].setChecked(True)
             if self.active_planet != planet:
                 self.switch_planet()
             self.selected_sites = {k: set(v) for k, v in st.get('selected_sites', {}).items()}
@@ -2733,7 +2927,7 @@ class PlotterApp(QMainWindow):
             self._loading = False
         self.context_ui_update()
         self.canvas_map.draw_idle()
-        if st.get('has_drawn') and self.current_view_extent:
+        if st.get('has_drawn') and self.current_view_extent and not self.mission_mode:
             # Re-render with the saved interval (no auto pick) and keep the saved annotations.
             self.interval_auto_done = True
             self.has_drawn = True
@@ -2742,6 +2936,10 @@ class PlotterApp(QMainWindow):
             self.ax_prev.set_ylim(0.0, 1.0)
             self._pending_restore = {'pens': st.get('segment_pens'), 'view': st.get('preview_view')}
             self._start_render(fresh=False)
+        if planet == 'Solar System' and st.get('has_drawn'):
+            self.start_mission_plot()
+        if planet == 'Image' and self.image_rgb is not None:
+            self.start_image_plot(fresh=True)
         self.lbl_status.setText("Project loaded.")
 
     def new_project(self):
@@ -2872,6 +3070,8 @@ class PlotterApp(QMainWindow):
             self.active_pen_id = 'base'
         self.rebuild_palette_ui()
         self.rebuild_ink_widgets()
+        self._fill_mission_pen_combos()
+        self._fill_mission_table()
         if self.has_drawn and self.sec_fill.is_enabled():
             self.recalc_timer.start(150)
         cur = self.combo_deco_pen.currentData()
@@ -2888,6 +3088,638 @@ class PlotterApp(QMainWindow):
         if self.has_drawn:
             self.render_canvas()
             self.refresh_layer_panel()
+
+    # ------------------------------------------------------------------
+    # SOLAR SYSTEM / MISSIONS
+    # ------------------------------------------------------------------
+    MISSION_PEN_CYCLE = ['blue_038', 'red_038', 'base', 'green_07', 'orange_07', 'purple_07', 'pink_07', 'blue_07']
+
+    def _build_missions_section(self, vbox):
+        sec = self.sec_missions = CollapsibleSection("Missions")
+        self.combo_mission_filter = QComboBox()
+        self.combo_mission_filter.addItems(["All missions", "Johns Hopkins APL missions", "APL-built spacecraft only"])
+        self.combo_mission_filter.setToolTip("APL missions: spacecraft built/operated by the Johns Hopkins Applied "
+                                             "Physics Laboratory, or carrying an APL-built instrument.")
+        self.combo_mission_filter.currentIndexChanged.connect(lambda _: self._fill_mission_table())
+        sec.add(self._field("Show", self.combo_mission_filter))
+        self.table_missions = QTableWidget(0, 3)
+        self.table_missions.setHorizontalHeaderLabels(["", "Mission", "Pen"])
+        self.table_missions.setWordWrap(False)
+        self.table_missions.verticalHeader().setVisible(False)
+        self.table_missions.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        hh = self.table_missions.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.table_missions.setMinimumHeight(230)
+        self._mission_checked = {'voyager2': True}
+        self._mission_pens = {}
+        sec.add(self.table_missions)
+        self.combo_path_style = QComboBox()
+        self.combo_path_style.addItems(PATH_STYLES)
+        self.combo_path_style.currentIndexChanged.connect(lambda _: self.update_mission_plot())
+        sec.add(self._field("Trajectory line", self.combo_path_style))
+        self.chk_year_marks = QCheckBox("Year markers (1 YR, 2 YR...)")
+        self.chk_year_marks.setChecked(True)
+        self.chk_mission_labels = QCheckBox("Labels with leader arrows")
+        self.chk_mission_labels.setChecked(True)
+        self.chk_belt = QCheckBox("Asteroid belt (stippled)")
+        self.chk_belt.setChecked(True)
+        for c in (self.chk_year_marks, self.chk_mission_labels, self.chk_belt):
+            c.toggled.connect(lambda _: self.update_mission_plot())
+            sec.add(c)
+        # pens for everything that isn't a trajectory (light pens for dark paper)
+        pen_box = QWidget()
+        g = QGridLayout(pen_box)
+        g.setContentsMargins(0, 0, 0, 0)
+        g.setVerticalSpacing(4)
+        self.combo_mpen_labels, self.combo_mpen_orbits, self.combo_mpen_belt = QComboBox(), QComboBox(), QComboBox()
+        for r, (lab, cb) in enumerate((("Labels, Sun & planets", self.combo_mpen_labels),
+                                        ("Orbits", self.combo_mpen_orbits), ("Asteroid belt", self.combo_mpen_belt))):
+            l = QLabel(lab)
+            l.setObjectName("fieldLabel")
+            g.addWidget(l, r, 0)
+            g.addWidget(cb, r, 1)
+            cb.currentIndexChanged.connect(lambda _: self.update_mission_plot())
+        g.setColumnStretch(1, 1)
+        sec.add(self._field("Pens", pen_box))
+        b_light = QPushButton("Use light pens (dark paper)")
+        b_light.setObjectName("ghost")
+        b_light.clicked.connect(self.use_light_mission_pens)
+        sec.add(b_light)
+        self.txt_mission_title = QLineEdit()
+        self.txt_mission_title.setPlaceholderText("Title (blank = automatic)")
+        self.txt_mission_title.textChanged.connect(lambda _: self.decor_timer.start(500))
+        sec.add(self._field("Title", self.txt_mission_title))
+        hint = QLabel("Real trajectories from NASA JPL Horizons. The first use of a mission downloads it (internet "
+                      "needed, a few seconds); it is then cached in the 'missions' folder. Distances from the Sun are "
+                      "compressed so inner and outer planets both fit. On dark paper, click 'Use light pens'.")
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        sec.add(hint)
+        self.lbl_mission_status = QLabel("")
+        self.lbl_mission_status.setObjectName("hint")
+        self.lbl_mission_status.setWordWrap(True)
+        sec.add(self.lbl_mission_status)
+        sec.setVisible(False)
+        vbox.addWidget(sec)
+        self._fill_mission_table()
+        self._fill_mission_pen_combos()
+
+    def _fill_mission_pen_combos(self):
+        for cb in (self.combo_mpen_labels, self.combo_mpen_orbits, self.combo_mpen_belt):
+            self._fill_pen_combo(cb, 'base')
+
+    def use_light_mission_pens(self):
+        """Dark paper: lightest in-stock pens for labels / orbits / belt and light pens for trajectories."""
+        paper_l = ink_lightness(self.current_paper_color())
+        light = [(pid, p) for pid, p in self.ink_pens() if ink_lightness(p['color']) - paper_l >= 0.35]
+        if not light:
+            QMessageBox.information(self, "Pens", "None of your in-stock pens is light enough for this paper colour.")
+            return
+        light.sort(key=lambda kv: (-ink_lightness(kv[1]['color']), float(kv[1].get('line_mm', kv[1]['width']))))
+        lightest = [pid for pid, p in light if ink_lightness(p['color']) >= ink_lightness(light[0][1]['color']) - 0.05]
+        thin = min(lightest, key=lambda pid: float(self.pens[pid].get('line_mm', self.pens[pid]['width'])))
+        for cb in (self.combo_mpen_labels, self.combo_mpen_orbits, self.combo_mpen_belt):
+            cb.blockSignals(True)
+            cb.setCurrentIndex(max(0, cb.findData(thin)))
+            cb.blockSignals(False)
+        # trajectories: keep each mission's pen if it shows on this paper, else the next light pen
+        cycle = [pid for pid, _ in light]
+        for i, (m, pid) in enumerate(self.mission_selection()):
+            if ink_lightness(self.pens.get(pid, self.pens['base'])['color']) - paper_l < 0.35:
+                self._mission_pens[m['key']] = cycle[(i + 1) % len(cycle)] if len(cycle) > 1 else cycle[0]
+        self._fill_mission_table()
+        self.update_mission_plot()
+
+    def _mission_rows(self):
+        f = self.combo_mission_filter.currentIndex()
+        if f == 1:
+            return [m for m in MS.MISSIONS if m.get('apl')]
+        if f == 2:
+            return [m for m in MS.MISSIONS if m.get('apl') == 'led']
+        return list(MS.MISSIONS)
+
+    def _fill_mission_table(self):
+        self._sync_mission_table()                      # keep ticks / pens of rows about to be hidden
+        rows = self._mission_rows()
+        t = self.table_missions
+        t.setRowCount(0)
+        pens = [(pid, pen) for pid, pen in self.ink_pens()]
+        for i, m in enumerate(rows):
+            r = t.rowCount()
+            t.insertRow(r)
+            chk = QCheckBox()
+            chk.setChecked(bool(self._mission_checked.get(m['key'])))
+            chk.toggled.connect(lambda on, k=m['key']: (self._mission_checked.__setitem__(k, on),
+                                                         self.update_mission_plot()))
+            t.setCellWidget(r, 0, chk)
+            tag = {'led': "  ★ APL", 'instrument': "  ☆ APL"}.get(m.get('apl'), "")
+            years = m['launch'][:4] + ("" if not m.get('end') else f"–{m['end'][:4]}")
+            it = QTableWidgetItem(f"{m['name']}  ({years}){tag}")
+            cached = os.path.exists(MS.cache_path(m))
+            tip = [f"{m['name']} - launched {m['launch']}",
+                   "Flybys: " + (", ".join(f"{e[2]} {e[0][:4]}" for e in m['events']) or "-")]
+            if m.get('apl_note'):
+                tip.append("Johns Hopkins APL: " + m['apl_note'])
+            if m.get('planned_after'):
+                tip.append("Later parts of the path are JPL's planned trajectory.")
+            tip.append("Downloaded" if cached else "Not downloaded yet (needs internet once)")
+            it.setToolTip("\n".join(tip))
+            it.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            t.setItem(r, 1, it)
+            cb = SwatchCombo()
+            cb.setFixedWidth(48)                         # swatch only when closed; names in the drop-down
+            cb.view().setMinimumWidth(200)
+            for pid, pen in pens:
+                cb.addItem(swatch_icon([pen['color']]), pen['name'], pid)
+            want = self._mission_pens.get(m['key']) or next(
+                (p for p in self.MISSION_PEN_CYCLE if cb.findData(p) >= 0), None)
+            cb.setCurrentIndex(max(0, cb.findData(want)))
+            self._mission_pens[m['key']] = cb.currentData()
+            cb.setToolTip(f"Pen for {m['name']}: " + self.pens.get(cb.currentData(), {}).get('name', ''))
+            cb.currentIndexChanged.connect(lambda _, k=m['key'], c=cb, n=m['name']: (
+                self._mission_pens.__setitem__(k, c.currentData()),
+                c.setToolTip(f"Pen for {n}: " + self.pens.get(c.currentData(), {}).get('name', '')),
+                self.update_mission_plot()))
+            t.setCellWidget(r, 2, cb)
+
+    def _sync_mission_table(self):
+        pass                                            # state lives in _mission_checked / _mission_pens
+
+    def mission_selection(self):
+        return [(m, self._mission_pens.get(m['key']) or 'base') for m in MS.MISSIONS
+                if self._mission_checked.get(m['key'])]
+
+    def update_paper_plot(self):
+        if self.image_mode:
+            self.update_image_plot()
+        else:
+            self.update_mission_plot()
+
+    def _enter_mission_mode(self):
+        self.mission_mode = True
+        self.image_mode = False
+        self.active_planet = 'Solar System'
+        if self.calibration_mode:
+            self.calibration_mode = False
+        self._render_token += 1
+        self.last_drag_coords = None
+        self.selector.set_visible(False)
+        self.map_segments, self.decor_segments, self.decor_masks, self.dem_segments = [], [], [], []
+        self.custom_items = []
+        self.has_drawn = False
+        self.context_ui_update()
+        self._draw_mission_overview()
+        self.ax_prev.clear()
+        self.ax_prev.set_xticks([])
+        self.ax_prev.set_yticks([])
+        style_axes(self.fig_prev, self.ax_prev)
+        self.canvas_prev.draw_idle()
+        self.layer_panel.set_layers([], {})
+        self.layer_panel.set_order([], '')
+        self.lbl_status.setText("Solar System: tick missions, then Draw Mission Plot.")
+
+    def _leave_mission_mode(self):
+        self.mission_mode = False
+        self.image_mode = False
+        self.map_segments, self.dem_segments, self.decor_segments, self.decor_masks = [], [], [], []
+        self.has_drawn = False
+        self.current_view_extent = None
+        self.selector.set_visible(True)
+
+    def _draw_mission_overview(self):
+        """Source-map panel in Solar System mode: true-scale orbits + downloaded trajectories."""
+        ax = self.ax_map
+        ax.clear()
+        style_axes(self.fig_map, ax)
+        ax.set_facecolor('#0B1020')
+        for p in MS.PLANET_ORDER[:8]:
+            o = MS.planet_orbit(p)
+            ax.plot(o[:, 0], o[:, 1], color='#8A93A8', lw=0.6)
+        ax.plot([0], [0], marker='*', color='#FFD34D', ms=9)
+        lim = 32.0
+        for m, pid in self.mission_selection():
+            d = self.mission_data.get(m['key']) or MS.load_cached(m)
+            if d is None:
+                continue
+            xyz = d[1]
+            ax.plot(xyz[:, 0], xyz[:, 1], color=self.pens.get(pid, self.pens['base'])['color'], lw=1.0)
+        ax.set_xlim(-lim, lim)
+        ax.set_ylim(-lim, lim)
+        ax.set_aspect('equal')
+        ax.set_title("Solar system (true scale, AU) - scroll to zoom", fontsize=8, color='#8A93A8')
+        self.canvas_map.draw_idle()
+
+    def start_mission_plot(self):
+        sel = self.mission_selection()
+        if not sel:
+            self.lbl_status.setText("Tick at least one mission first.")
+            return
+        missing = [m for m, _ in sel if m['key'] not in self.mission_data and MS.load_cached(m) is None]
+        for m, _ in sel:
+            if m['key'] not in self.mission_data:
+                d = MS.load_cached(m)
+                if d is not None:
+                    self.mission_data[m['key']] = d
+        if not missing:
+            self.update_mission_plot(fresh=True)
+            return
+        self.is_calculating = True
+        self.btn_draw.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self._mission_job = _MissionFetch(missing)
+        self._mission_job.progress.connect(self.lbl_status.setText)
+        self._mission_job.done.connect(self._on_missions_fetched)
+        self._mission_job.failed.connect(self._on_missions_failed)
+        self._mission_job.start()
+
+    def _on_missions_fetched(self, data):
+        self.mission_data.update(data)
+        self.is_calculating = False
+        self.btn_draw.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self._fill_mission_table()
+        self.update_mission_plot(fresh=True)
+
+    def _on_missions_failed(self, msg):
+        self.is_calculating = False
+        self.btn_draw.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.lbl_status.setText("Download failed.")
+        QMessageBox.warning(self, "Missions", f"Could not download the trajectory from NASA JPL Horizons:\n\n{msg}\n\n"
+                                              "Check the internet connection and try again.")
+
+    def update_mission_plot(self, fresh=False):
+        if not self.mission_mode or self.image_mode or self._loading or self.calibration_mode:
+            return
+        if not fresh and not self.has_drawn:
+            return
+        for m, _ in self.mission_selection():
+            if m['key'] not in self.mission_data:
+                d = MS.load_cached(m)                   # already downloaded: no need to press Draw
+                if d is not None:
+                    self.mission_data[m['key']] = d
+        sel = [(m, p) for m, p in self.mission_selection() if m['key'] in self.mission_data]
+        waiting = [m['name'] for m, _ in self.mission_selection() if m['key'] not in self.mission_data]
+        if not sel:
+            if self.has_drawn:
+                self.lbl_status.setText("Tick a mission and click Draw Mission Plot (new ones need a download).")
+            return
+        lab_pen = self.combo_mpen_labels.currentData() or 'base'
+        opts = {'pen': lab_pen, 'line_mm': self._pen_line_mm(lab_pen),
+                'pen_orbits': self.combo_mpen_orbits.currentData() or lab_pen,
+                'pen_belt': self.combo_mpen_belt.currentData() or lab_pen,
+                'belt_line_mm': self._pen_line_mm(self.combo_mpen_belt.currentData() or lab_pen),
+                'text_size': self.combo_text_size.currentText(), 'title_text': self.txt_mission_title.text().strip(),
+                'path_style': self.combo_path_style.currentText(), 'year_marks': self.chk_year_marks.isChecked(),
+                'labels': self.chk_mission_labels.isChecked(), 'belt': self.chk_belt.isChecked()}
+        try:
+            segs, masks, info = build_mission_plot(sel, self.mission_data, opts, self.pw, self.ph)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.lbl_status.setText(f"Mission plot failed: {e}")
+            return
+        if opts and self.chk_deco_frame.isChecked():
+            f = 2.0
+            frame = np.array([[f, f], [self.pw - f, f], [self.pw - f, self.ph - f], [f, self.ph - f], [f, f]])
+            segs.append({'type': 'border', 'layer': 'decor', 'seg': frame - [0, self.ph / 2], 'level': 0,
+                         'pen_id': opts['pen_orbits']})
+        self.current_view_extent = [0.0, self.pw, -self.ph / 2.0, self.ph / 2.0]
+        self.map_segments = segs
+        self.decor_segments, self.decor_masks = [], masks
+        self.dem_segments = list(segs)
+        self.has_drawn = True
+        if fresh:
+            self.custom_items = []
+            self.ax_prev.set_xlim(0.0, 1.0)
+            self.ax_prev.set_ylim(0.0, 1.0)
+        self._cache_stroke_metrics()
+        self.render_canvas()
+        self.refresh_layer_panel()
+        self._draw_mission_overview()
+        names = ", ".join(m['name'] for m, _ in sel)
+        clipped = [x['name'] for x in info.get('missions', []) if x.get('clipped')]
+        self.lbl_status.setText(f"Mission plot: {names} ({len(segs):,} strokes)."
+                                + (f" {', '.join(clipped)} continue beyond the edge." if clipped else "")
+                                + (f" Click Draw Mission Plot to download {', '.join(waiting)}." if waiting else ""))
+
+    # --- IMAGE TRACING (logos, drawings, photos -> outlines / sticker cut lines) ---
+    def _build_image_section(self, vbox):
+        sec = self.sec_image = CollapsibleSection("Image")
+        row = QHBoxLayout()
+        b_open = QPushButton("Open image…")
+        b_open.clicked.connect(self.open_image)
+        self.lbl_image_file = QLabel("No image loaded")
+        self.lbl_image_file.setObjectName("hint")
+        self.lbl_image_file.setWordWrap(True)
+        row.addWidget(b_open)
+        row.addWidget(self.lbl_image_file, 1)
+        sec.add(self._field("Picture", row))
+        self.combo_image_mode = QComboBox()
+        self.combo_image_mode.addItems(IT.MODES)
+        self.combo_image_mode.setToolTip("Outlines: flat-colour artwork (logos, clip-art, line drawings) - every colour "
+                                         "region gets a clean closed outline.\nEdges: photos - draws the strongest "
+                                         "edges as single lines.")
+        sec.add(self._field("Method", self.combo_image_mode))
+        self.spin_image_colours = QSpinBox()
+        self.spin_image_colours.setRange(2, 8)
+        self.spin_image_colours.setValue(2)
+        self.spin_image_colours.setToolTip("How many colours the artwork is reduced to (the background counts as one).\n"
+                                           "2 = black-and-white trace.")
+        self.lbl_image_colours = sec.add(self._field("Colours (incl. background)", self.spin_image_colours))
+        self.chk_image_invert = QCheckBox("Trace the light parts instead")
+        self.chk_image_invert.setToolTip("For white-on-dark artwork in 2-colour mode.")
+        sec.add(self.chk_image_invert)
+
+        def slider(lo, hi, val, fmt):
+            sl = QSlider(Qt.Orientation.Horizontal)
+            sl.setRange(lo, hi)
+            sl.setValue(val)
+            lab = QLabel(fmt(val))
+            sl.valueChanged.connect(lambda v: lab.setText(fmt(v)))
+            return sl, self._slider_row(sl, lab)
+
+        self.slider_image_size, w = slider(20, 100, 100, lambda v: f"{v}%")
+        sec.add(self._field("Size on the page", w))
+        self.slider_image_smooth, w = slider(0, 10, 3, lambda v: "sharp" if v == 0 else f"{v}")
+        self.slider_image_smooth.setToolTip("Rounds off jagged pixel edges. Higher = smoother, less detail.")
+        sec.add(self._field("Smoothing", w))
+        self.slider_image_speck, w = slider(0, 20, 2, lambda v: f"{v * 0.25:g} mm²")
+        self.slider_image_speck.setToolTip("Shapes smaller than this are dropped (dust, JPEG noise).")
+        self.lbl_image_speck = sec.add(self._field("Ignore specks under", w))
+        self.slider_image_edges, w = slider(1, 10, 5, lambda v: f"{v}")
+        self.slider_image_edges.setToolTip("Higher = more (weaker) edges are drawn.")
+        self.lbl_image_edges = sec.add(self._field("Edge detail", w))
+        self.chk_image_fill = QCheckBox("Fill shapes with hatching")
+        sec.add(self.chk_image_fill)
+        self.slider_image_fill, w = slider(3, 30, 8, lambda v: f"{v / 10:g} mm")
+        self.lbl_image_fill = sec.add(self._field("Hatch spacing", w))
+        self.chk_image_cut = QCheckBox("Sticker cut line around the design")
+        self.chk_image_cut.setToolTip("An offset outline around the whole design - draw it with a pen as a cutting "
+                                      "guide, or use the Cutter tool pen.")
+        sec.add(self.chk_image_cut)
+        self.slider_image_cut, w = slider(1, 20, 4, lambda v: f"{v / 2:g} mm")
+        self.lbl_image_cut = sec.add(self._field("Cut line offset", w))
+        self.table_image = QTableWidget(0, 2)
+        self.table_image.setHorizontalHeaderLabels(["Traced layer", "Pen"])
+        self.table_image.verticalHeader().setVisible(False)
+        self.table_image.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        hh = self.table_image.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.table_image.setMinimumHeight(120)
+        sec.add(self.table_image)
+        hint = QLabel("PNG / JPG / BMP / GIF. Transparent areas count as paper. Each traced colour gets its own layer "
+                      "and pen - right-click a layer in the Layers tab to change it too. Export SVG for cutting "
+                      "software, or G-code for the plotter.")
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        sec.add(hint)
+        for wdg in (self.combo_image_mode,):
+            wdg.currentIndexChanged.connect(lambda _: (self._update_image_controls(), self.schedule_image_trace()))
+        self.spin_image_colours.valueChanged.connect(lambda _: (self._update_image_controls(),
+                                                                self.schedule_image_trace()))
+        for c in (self.chk_image_invert, self.chk_image_fill, self.chk_image_cut):
+            c.toggled.connect(lambda _: (self._update_image_controls(), self.schedule_image_trace()))
+        for sl in (self.slider_image_size, self.slider_image_smooth, self.slider_image_speck, self.slider_image_edges,
+                   self.slider_image_fill, self.slider_image_cut):
+            sl.valueChanged.connect(lambda _: self.schedule_image_trace())
+        self.image_timer = QTimer()
+        self.image_timer.setSingleShot(True)
+        self.image_timer.timeout.connect(lambda: self.start_image_plot(fresh=False))
+        sec.setVisible(False)
+        vbox.addWidget(sec)
+        self._update_image_controls()
+
+    def _update_image_controls(self):
+        edges = self.combo_image_mode.currentText().startswith("Edges")
+        for w in (self.lbl_image_colours, self.chk_image_fill, self.chk_image_cut, self.lbl_image_speck):
+            w.setVisible(not edges)
+        self.chk_image_invert.setVisible(not edges and self.spin_image_colours.value() == 2)
+        self.lbl_image_edges.setVisible(edges)
+        self.lbl_image_fill.setVisible(not edges and self.chk_image_fill.isChecked())
+        self.lbl_image_cut.setVisible(not edges and self.chk_image_cut.isChecked())
+
+    def image_options(self):
+        e = self.slider_image_edges.value()
+        return {'mode': self.combo_image_mode.currentText(), 'colours': self.spin_image_colours.value(),
+                'invert': self.chk_image_invert.isChecked(), 'size_pct': self.slider_image_size.value(),
+                'smooth_px': 0.5 * self.slider_image_smooth.value(),
+                'min_area_mm2': 0.25 * self.slider_image_speck.value(), 'simplify_mm': 0.05, 'margin_mm': 6.0,
+                'fill': self.chk_image_fill.isChecked(), 'fill_spacing_mm': self.slider_image_fill.value() / 10.0,
+                'cutline': self.chk_image_cut.isChecked(), 'cut_offset_mm': self.slider_image_cut.value() / 2.0,
+                'edge_sigma': 2.0, 'edge_high': 0.36 - 0.03 * e, 'edge_low': 0.4 * (0.36 - 0.03 * e)}
+
+    def open_image(self, path=None):
+        if not path:
+            path, _ = QFileDialog.getOpenFileName(self, "Open image", os.path.dirname(self.image_path or "") or "",
+                                                  "Images (*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff *.webp)")
+            if not path:
+                return
+        try:
+            rgb = IT.load_image(path)
+        except Exception as e:
+            QMessageBox.warning(self, "Image", f"Could not open the image:\n{e}")
+            return
+        self.image_path, self.image_rgb = path, rgb
+        self._image_cache = {}
+        self._image_pens = {}
+        self.lbl_image_file.setText(f"{os.path.basename(path)}  ({rgb.shape[1]}×{rgb.shape[0]} px)")
+        if not self.radio_image.isChecked():
+            self.radio_image.setChecked(True)          # -> switch_planet -> _enter_image_mode
+        else:
+            self._draw_image_overview()
+        if not self._loading:
+            self.start_image_plot(fresh=True)
+
+    def _enter_image_mode(self):
+        self._enter_mission_mode()                     # shared paper-space setup
+        self.image_mode = True
+        self.active_planet = 'Image'
+        self.context_ui_update()
+        self._draw_image_overview()
+        self.lbl_status.setText("Image: click 'Open image…' in the Image section." if self.image_rgb is None
+                                else "Image: click Trace Image.")
+        if self.image_rgb is not None and not self._loading:
+            self.start_image_plot(fresh=True)
+
+    def _draw_image_overview(self):
+        ax = self.ax_map
+        ax.clear()
+        style_axes(self.fig_map, ax)
+        if self.image_rgb is not None:
+            ax.imshow(self.image_rgb, origin='upper', interpolation='bilinear')
+            ax.set_title(os.path.basename(self.image_path or ""), fontsize=8, color='#8A93A8')
+        else:
+            ax.text(0.5, 0.5, "Open an image in the Image section", ha='center', va='center', color='#8A93A8',
+                    transform=ax.transAxes)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        self.canvas_map.draw_idle()
+
+    def schedule_image_trace(self):
+        if self.image_mode and self.has_drawn and not self._loading:
+            self.image_timer.start(350)
+
+    def start_image_plot(self, fresh=False):
+        if not self.image_mode or self.calibration_mode or self._loading:
+            return
+        if self.image_rgb is None:
+            self.open_image()
+            return
+        if self._image_job is not None and self._image_job.isRunning():
+            self._image_pending = True                 # re-trace with the newest settings when this one ends
+            self._image_pending_fresh = fresh or getattr(self, '_image_pending_fresh', False)
+            return
+        self._image_token += 1
+        self.progress_bar.setVisible(True)
+        self.lbl_status.setText("Tracing image…")
+        job = self._image_job = _ImageTrace(self.image_rgb, self.image_options(), self.pw, self.ph,
+                                            self._image_cache, self._image_token)
+        job.done.connect(lambda layers, info, tok, f=fresh: self._on_image_traced(layers, info, tok, f))
+        job.failed.connect(self._on_image_failed)
+        self._workers.add(job)
+        job.finished.connect(lambda j=job: self._workers.discard(j))
+        job.start()
+
+    def _on_image_traced(self, layers, info, token, fresh):
+        self.progress_bar.setVisible(False)
+        if not self.image_mode or token != self._image_token:
+            return
+        # a layer key now holding a different colour (colour count changed) gets a fresh default pen
+        old = {l['key']: l['color'] for l in self._image_layers}
+        for l in layers:
+            if l['key'] in old and np.sum((np.array(old[l['key']]) - np.array(l['color'])) ** 2) > 0.03:
+                self._image_pens.pop(l['key'], None)
+        self._image_layers = layers
+        self._image_info = info
+        if self._image_pending:
+            self._image_pending = False
+            f = getattr(self, '_image_pending_fresh', False)
+            self._image_pending_fresh = False
+            self.start_image_plot(fresh=f)
+            return
+        self._fill_image_table()
+        self.update_image_plot(fresh=fresh or not self.has_drawn)
+
+    def _on_image_failed(self, msg):
+        self.progress_bar.setVisible(False)
+        self._image_pending = False
+        self.lbl_status.setText(f"Image trace failed: {msg}")
+
+    def _image_pen_choices(self, key):
+        pens = sorted(self.ink_pens(), key=lambda kv: ink_lightness(kv[1]['color']))
+        if key == 'img:cut':
+            pens += [(pid, p) for pid, p in self.pens.items() if pid in TOOL_PEN_IDS]
+        return pens
+
+    def _default_image_pen(self, layer):
+        pens = self.ink_pens()                         # (the Cutter tool is offered for the cut line, never default)
+        if not pens:
+            return 'base'
+        def rgb(hx):
+            hx = hx.lstrip('#')
+            return np.array([int(hx[i:i + 2], 16) / 255.0 for i in (0, 2, 4)])
+
+        paper = rgb(self.current_paper_color())
+        if layer['key'] == 'img:cut':                  # the pen that contrasts most with the paper
+            return max(pens, key=lambda kv: np.sum((rgb(kv[1]['color']) - paper) ** 2))[0]
+        want = np.array(layer['color'])
+        if np.sum((want - paper) ** 2) < 0.1:          # artwork colour ~ paper colour: use the contrast pen
+            want = 1.0 - paper
+        return min(pens, key=lambda kv: np.sum((rgb(kv[1]['color']) - want) ** 2))[0]
+
+    def paper_is_light(self):
+        return ink_lightness(self.current_paper_color()) >= 0.5
+
+    def _fill_image_table(self):
+        t = self.table_image
+        t.setRowCount(0)
+        for layer in self._image_layers:
+            k = layer['key']
+            if k not in self._image_pens or self._image_pens[k] not in self.pens:
+                self._image_pens[k] = self._default_image_pen(layer)
+            r = t.rowCount()
+            t.insertRow(r)
+            hx = '#%02X%02X%02X' % tuple(int(round(255 * v)) for v in layer['color'])
+            it = QTableWidgetItem(swatch_icon([hx]), f"{layer['label']}  ({len(layer['polys'])} strokes)")
+            it.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            it.setToolTip(f"Colour in the picture: {hx}")
+            t.setItem(r, 0, it)
+            cb = SwatchCombo()
+            cb.setFixedWidth(48)
+            cb.view().setMinimumWidth(200)
+            for pid, pen in self._image_pen_choices(k):
+                cb.addItem(swatch_icon([pen['color']]), pen['name'], pid)
+            cb.setCurrentIndex(max(0, cb.findData(self._image_pens[k])))
+            cb.setToolTip("Pen: " + self.pens.get(cb.currentData(), {}).get('name', ''))
+            cb.currentIndexChanged.connect(lambda _, key=k, c=cb: (
+                self._image_pens.__setitem__(key, c.currentData()),
+                c.setToolTip("Pen: " + self.pens.get(c.currentData(), {}).get('name', '')),
+                self.update_image_plot()))
+            t.setCellWidget(r, 1, cb)
+
+    def update_image_plot(self, fresh=False):
+        if not self.image_mode or self._loading or self.calibration_mode or not self._image_layers:
+            return
+        y0 = self.ph / 2.0
+        segs = []
+        for layer in self._image_layers:
+            pid = self._image_pens.get(layer['key']) or 'base'
+            for p in layer['polys']:
+                if len(p) >= 2:
+                    segs.append({'type': 'border', 'layer': layer['key'], 'seg': np.asarray(p) - [0.0, y0],
+                                 'level': 0, 'pen_id': pid})
+        if self.chk_deco_frame.isChecked():
+            f = 2.0
+            frame = np.array([[f, f], [self.pw - f, f], [self.pw - f, self.ph - f], [f, self.ph - f], [f, f]])
+            fpid = self._image_pens.get(self._image_layers[0]['key'], 'base') if self._image_layers else 'base'
+            segs.append({'type': 'border', 'layer': 'decor', 'seg': frame - [0, y0], 'level': 0, 'pen_id': fpid})
+        self.current_view_extent = [0.0, self.pw, -y0, y0]
+        self.map_segments = segs
+        self.decor_segments, self.decor_masks = [], []
+        self.dem_segments = list(segs)
+        self.has_drawn = True
+        if fresh:
+            self.custom_items = []
+            self.ax_prev.set_xlim(0.0, 1.0)
+            self.ax_prev.set_ylim(0.0, 1.0)
+        self._cache_stroke_metrics()
+        self.render_canvas()
+        self.refresh_layer_panel()
+        n = sum(len(l['polys']) for l in self._image_layers)
+        self.lbl_status.setText(f"Image traced: {len(self._image_layers)} layer(s), {n:,} strokes. "
+                                "Change pens in the Image section or right-click a layer.")
+
+    def _image_state(self):
+        return {'path': self.image_path, 'mode': self.combo_image_mode.currentText(),
+                'colours': self.spin_image_colours.value(), 'invert': self.chk_image_invert.isChecked(),
+                'size': self.slider_image_size.value(), 'smooth': self.slider_image_smooth.value(),
+                'speck': self.slider_image_speck.value(), 'edges': self.slider_image_edges.value(),
+                'fill': self.chk_image_fill.isChecked(), 'fill_spacing': self.slider_image_fill.value(),
+                'cut': self.chk_image_cut.isChecked(), 'cut_offset': self.slider_image_cut.value(),
+                'pens': dict(self._image_pens)}
+
+    def _apply_image_state(self, st):
+        self.combo_image_mode.setCurrentText(st.get('mode', IT.MODES[0]))
+        self.spin_image_colours.setValue(int(st.get('colours', 2)))
+        self.chk_image_invert.setChecked(bool(st.get('invert')))
+        for sl, k in ((self.slider_image_size, 'size'), (self.slider_image_smooth, 'smooth'),
+                      (self.slider_image_speck, 'speck'), (self.slider_image_edges, 'edges'),
+                      (self.slider_image_fill, 'fill_spacing'), (self.slider_image_cut, 'cut_offset')):
+            if k in st:
+                sl.setValue(int(st[k]))
+        self.chk_image_fill.setChecked(bool(st.get('fill')))
+        self.chk_image_cut.setChecked(bool(st.get('cut')))
+        self._update_image_controls()
+        path = st.get('path')
+        if path and os.path.exists(path):
+            self.open_image(path)                       # _loading is set: loads without tracing
+            self._image_pens = dict(st.get('pens') or {})
+        elif path:
+            self.lbl_image_file.setText(f"Missing: {path}")
 
     def show_calibration_sheet(self, pen_ids):
         if self.is_calculating:
@@ -2986,7 +3818,7 @@ class PlotterApp(QMainWindow):
 
     # Layers made of lettering / fine marks: exported without vpype's simplify, merge and 2 mm length filter
     # (those would delete the short strokes that make up small letters, dots and degree signs).
-    FINE_LAYERS = ('decor', 'sites', 'calibration')
+    FINE_LAYERS = ('decor', 'sites', 'calibration', 'labels', 'markers', 'trajectory', 'belt')
 
     def _lines_for_pen(self, p_id, text_boxes, split=False):
         """All plot lines (in data coords) for one pen, with text blanking applied.
@@ -2994,7 +3826,7 @@ class PlotterApp(QMainWindow):
         lines, fine = [], []
         for item in getattr(self, 'dem_segments', []):
             if item.get('pen_id') == p_id and self.is_visible(item):
-                if item.get('layer') in self.FINE_LAYERS:
+                if item.get('layer') in self.FINE_LAYERS or str(item.get('layer', '')).startswith('img:'):
                     fine.append(np.asarray(item['seg']))         # furniture / labels are never blanked
                 elif item.get('type') == 'stipple':
                     lines.append(np.asarray(item['seg']))

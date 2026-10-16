@@ -1,0 +1,133 @@
+{
+  "app": "Topo Plotter Studio",
+  "version": 1,
+  "state": {
+    "contours_on": true,
+    "fill_on": false,
+    "density": 0,
+    "auto_index": true,
+    "index_every": 5,
+    "blur": 0,
+    "simplify": 40,
+    "smooth": 640,
+    "tanaka": false,
+    "ocean": true,
+    "blue_water": true,
+    "plot_borders": true,
+    "pattern": "Multi-Pass Crosshatch",
+    "tone_source": "Color map",
+    "inks": "Color separation",
+    "mono_pen": "pen_1",
+    "fill_pens": [
+      "white_gr05",
+      "white_gr08",
+      "white_gr10",
+      "yellow_07",
+      "orange_07",
+      "green_07",
+      "red_038",
+      "pink_07",
+      "red_07",
+      "purple_07",
+      "blue_07",
+      "blue_038",
+      "base",
+      "pen_1"
+    ],
+    "paper_color": "#FFFFFF",
+    "contour_pen": "base",
+    "index_pen": "pen_1",
+    "water_pen": "blue_038",
+    "border_pen": "pen_1",
+    "spacing": 1.0,
+    "tone": 0,
+    "auto_contrast": true,
+    "join": true,
+    "deco_title": true,
+    "deco_title_text": "California",
+    "deco_scale": true,
+    "deco_north": true,
+    "deco_graticule": "Edge ticks",
+    "deco_frame": true,
+    "deco_pen": "base",
+    "site_labels": true,
+    "deco_text_size": "Medium",
+    "deco_scale_units": "Miles",
+    "show_sites": true,
+    "mask_text": true,
+    "show_map_borders": true,
+    "planet": "Earth",
+    "region": "California",
+    "paper_name": "100x100mm (Default)",
+    "custom_w": "100",
+    "custom_h": "120",
+    "landscape": true,
+    "circle_mode": false,
+    "circle_center_lon": -85.117302052786,
+    "selection": [
+      -126.30577381872484,
+      -113.9794769460667,
+      31.12679892549886,
+      43.192681075495216
+    ],
+    "interval_ft": 2000,
+    "interval_auto_done": true,
+    "selected_sites": {
+      "Earth": [],
+      "Moon": [],
+      "Mars": []
+    },
+    "layer_visible": {},
+    "custom_items": [],
+    "has_drawn": true,
+    "map_view": [
+      [
+        -127.74239503874239,
+        -111.95547585160088
+      ],
+      [
+        29.399273097066555,
+        44.005861877692794
+      ]
+    ],
+    "segment_pens": {
+      "count": 1128,
+      "runs": [
+        [
+          "blue_038",
+          2
+        ],
+        [
+          "pen_1",
+          85
+        ],
+        [
+          "base",
+          958
+        ],
+        [
+          "pen_1",
+          49
+        ],
+        [
+          "base",
+          33
+        ],
+        [
+          "pen_1",
+          1
+        ]
+      ]
+    },
+    "preview_view": [
+      [
+        -127.71261922853718,
+        -112.57263153625438
+      ],
+      [
+        31.12679892549886,
+        43.192681075495216
+      ]
+    ]
+  }
+}
