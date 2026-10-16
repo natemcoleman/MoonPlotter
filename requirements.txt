@@ -1,0 +1,21 @@
+# Topo Plotter Studio - Python dependencies (developed with Python 3.12 on Windows)
+PyQt6>=6.5
+numpy>=1.26
+scipy>=1.11
+matplotlib>=3.8
+contourpy>=1.2
+rasterio>=1.3
+shapely>=2.0
+Pillow>=10.0
+
+# G-code export (stroke optimisation + gwrite)
+vpype>=1.14
+vpype-gcode>=0.13
+
+# Optional: country / state borders on Earth maps and "Clip to region"
+# (downloads Natural Earth outlines on first start; the app runs without it)
+geopandas>=0.14
+
+# Optional: lets downloads use the operating system's certificate store
+# (helps behind antivirus / corporate HTTPS inspection)
+# truststore>=0.9
