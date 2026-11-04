@@ -198,11 +198,14 @@ def build_decorations(opts, view_extent, pw, ph, circle, planet, subtitle=""):
     if opts.get('title') and (opts.get('title_text') or subtitle):
         room = (scale_box[0] - 3.0 if scale_box else pw - m) - m
         title_text = opts.get('title_text', '')
+        # print(subtitle)
+        # print(title_text)
         th = cap_title
         tw = _text_w(title_text, th)
         if tw > room > 0:
             th = max(floor * 1.2, th * room / tw)
         sub_lines = _wrap(subtitle, cap_sub, room)
+        # print(sub_lines)
         title_lines = _wrap(title_text, th, room, separators=(" ",))
         boxes = []
         y = m

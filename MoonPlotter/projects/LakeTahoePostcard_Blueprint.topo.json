@@ -1,0 +1,204 @@
+{
+  "app": "Topo Plotter Studio",
+  "version": 1,
+  "state": {
+    "contours_on": true,
+    "fill_on": false,
+    "density": 0,
+    "auto_index": true,
+    "index_every": 5,
+    "blur": 0,
+    "simplify": 40,
+    "smooth": 640,
+    "tanaka": false,
+    "ocean": true,
+    "blue_water": true,
+    "plot_borders": true,
+    "pattern": "Multi-Pass Crosshatch",
+    "tone_source": "Color map",
+    "inks": "Monochrome",
+    "mono_pen": "pen_1",
+    "fill_pens": [
+      "white_gr05",
+      "white_gr08",
+      "white_gr10",
+      "yellow_07",
+      "stabilo_44",
+      "stabilo_43",
+      "stabilo_54",
+      "orange_07",
+      "green_07",
+      "stabilo_56",
+      "stabilo_36",
+      "stabilo_55",
+      "red_038",
+      "pink_07",
+      "stabilo_41",
+      "red_07",
+      "purple_07",
+      "blue_07",
+      "stabilo_45",
+      "blue_038",
+      "base",
+      "pen_1"
+    ],
+    "paper_color": "#4a5478",
+    "contour_pen": "white_gr05",
+    "index_pen": "white_gr08",
+    "water_pen": "blue_038",
+    "border_pen": "pen_1",
+    "spacing": 1.0,
+    "tone": 0,
+    "auto_contrast": true,
+    "join": true,
+    "deco_title": true,
+    "deco_title_text": "Lake Tahoe",
+    "deco_scale": true,
+    "deco_north": true,
+    "deco_graticule": "Off",
+    "deco_frame": true,
+    "deco_pen": "white_gr08",
+    "site_labels": true,
+    "deco_text_size": "Large",
+    "deco_scale_units": "Miles",
+    "show_sites": true,
+    "mask_text": true,
+    "show_map_borders": true,
+    "planet": "Earth",
+    "region": "Lake Tahoe (High-Res Bathymetry)",
+    "paper_name": "Postcard",
+    "custom_w": "150",
+    "custom_h": "150",
+    "landscape": false,
+    "circle_mode": false,
+    "circle_center_lon": 0.0,
+    "selection": [
+      -120.1755,
+      -119.914384,
+      38.917,
+      39.25909
+    ],
+    "interval_ft": 75,
+    "interval_auto_done": false,
+    "selected_sites": {
+      "Moon": [],
+      "Earth": []
+    },
+    "layer_visible": {},
+    "custom_items": [],
+    "has_drawn": true,
+    "map_view": [
+      [
+        -120.7755,
+        -119.314384
+      ],
+      [
+        38.317,
+        39.85909
+      ]
+    ],
+    "segment_pens": {
+      "count": 370,
+      "runs": [
+        [
+          "white_gr05",
+          81
+        ],
+        [
+          "white_gr08",
+          81
+        ],
+        [
+          "white_gr05",
+          78
+        ],
+        [
+          "white_gr08",
+          16
+        ],
+        [
+          "white_gr05",
+          41
+        ],
+        [
+          "white_gr08",
+          5
+        ],
+        [
+          "white_gr05",
+          16
+        ],
+        [
+          "white_gr08",
+          1
+        ],
+        [
+          "white_gr05",
+          21
+        ],
+        [
+          "white_gr08",
+          30
+        ]
+      ]
+    },
+    "missions": {
+      "checked": [
+        "voyager2"
+      ],
+      "pens": {
+        "pioneer10": "blue_038",
+        "pioneer11": "blue_038",
+        "voyager1": "blue_038",
+        "voyager2": "blue_038",
+        "galileo": "blue_038",
+        "cassini": "blue_038",
+        "juno": "blue_038",
+        "newhorizons": "blue_038",
+        "messenger": "blue_038",
+        "parker": "blue_038",
+        "near": "blue_038",
+        "dart": "blue_038",
+        "europaclipper": "blue_038",
+        "stereoa": "blue_038",
+        "lucy": "blue_038",
+        "rosetta": "blue_038",
+        "dawn": "blue_038"
+      },
+      "filter": 0,
+      "path_style": "Dashed",
+      "year_marks": true,
+      "labels": true,
+      "belt": true,
+      "title": "",
+      "pen_labels": "base",
+      "pen_orbits": "base",
+      "pen_belt": "base"
+    },
+    "image": {
+      "path": null,
+      "mode": "Outlines (logos, clip-art)",
+      "colours": 2,
+      "invert": false,
+      "size": 100,
+      "smooth": 3,
+      "speck": 2,
+      "edges": 5,
+      "fill": false,
+      "fill_spacing": 8,
+      "cut": false,
+      "cut_offset": 4,
+      "pens": {}
+    },
+    "preview_view": [
+      [
+        -120.1918541805274,
+        -119.89802981947258
+      ],
+      [
+        38.917,
+        39.25909
+      ]
+    ]
+  }
+}

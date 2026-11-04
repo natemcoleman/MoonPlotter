@@ -1,0 +1,242 @@
+{
+  "app": "Topo Plotter Studio",
+  "version": 1,
+  "state": {
+    "contours_on": true,
+    "fill_on": false,
+    "density": 1,
+    "auto_index": true,
+    "index_every": 5,
+    "blur": 0,
+    "simplify": 40,
+    "smooth": 640,
+    "tanaka": false,
+    "ocean": true,
+    "blue_water": true,
+    "plot_borders": true,
+    "pattern": "Multi-Pass Crosshatch",
+    "tone_source": "Color map",
+    "inks": "Monochrome",
+    "mono_pen": "pen_1",
+    "fill_pens": [
+      "white_gr05",
+      "white_gr08",
+      "white_gr10",
+      "yellow_07",
+      "stabilo_44",
+      "stabilo_43",
+      "stabilo_54",
+      "orange_07",
+      "green_07",
+      "stabilo_56",
+      "stabilo_36",
+      "stabilo_55",
+      "red_038",
+      "pink_07",
+      "stabilo_41",
+      "red_07",
+      "purple_07",
+      "blue_07",
+      "stabilo_45",
+      "blue_038",
+      "base",
+      "pen_1"
+    ],
+    "paper_color": "#4a5478",
+    "contour_pen": "white_gr05",
+    "index_pen": "white_gr08",
+    "water_pen": "blue_038",
+    "border_pen": "pen_1",
+    "spacing": 1.0,
+    "tone": 0,
+    "auto_contrast": true,
+    "join": true,
+    "deco_title": true,
+    "deco_title_text": "Mount Rainier",
+    "deco_scale": true,
+    "deco_north": true,
+    "deco_graticule": "Off",
+    "deco_frame": true,
+    "deco_pen": "white_gr08",
+    "site_labels": true,
+    "deco_text_size": "Large",
+    "deco_scale_units": "Miles",
+    "show_sites": true,
+    "mask_text": true,
+    "show_map_borders": true,
+    "planet": "Earth",
+    "region": "None (Plot Full Selection)",
+    "paper_name": "Postcard",
+    "custom_w": "150",
+    "custom_h": "150",
+    "landscape": true,
+    "circle_mode": false,
+    "circle_center_lon": 0.0,
+    "selection": [
+      -121.8177841839456,
+      -121.70690198104401,
+      46.804108710864824,
+      46.90037853043831
+    ],
+    "interval_ft": 250,
+    "interval_auto_done": true,
+    "selected_sites": {
+      "Moon": [],
+      "Earth": [
+        "Vulcao de Fogo"
+      ]
+    },
+    "layer_visible": {},
+    "custom_items": [],
+    "has_drawn": true,
+    "map_view": [
+      [
+        -122.08824220830988,
+        -121.61927065867334
+      ],
+      [
+        46.54861533920053,
+        47.0797155984043
+      ]
+    ],
+    "segment_pens": {
+      "count": 190,
+      "runs": [
+        [
+          "white_gr08",
+          2
+        ],
+        [
+          "white_gr05",
+          24
+        ],
+        [
+          "white_gr08",
+          8
+        ],
+        [
+          "white_gr05",
+          42
+        ],
+        [
+          "white_gr08",
+          14
+        ],
+        [
+          "white_gr05",
+          35
+        ],
+        [
+          "white_gr08",
+          5
+        ],
+        [
+          "white_gr05",
+          9
+        ],
+        [
+          "white_gr08",
+          1
+        ],
+        [
+          "white_gr05",
+          7
+        ],
+        [
+          "white_gr08",
+          2
+        ],
+        [
+          "white_gr05",
+          7
+        ],
+        [
+          "white_gr08",
+          1
+        ],
+        [
+          "white_gr05",
+          5
+        ],
+        [
+          "white_gr08",
+          1
+        ],
+        [
+          "white_gr05",
+          4
+        ],
+        [
+          "white_gr08",
+          2
+        ],
+        [
+          "white_gr05",
+          3
+        ],
+        [
+          "pen_1",
+          18
+        ]
+      ]
+    },
+    "missions": {
+      "checked": [
+        "voyager2"
+      ],
+      "pens": {
+        "pioneer10": "blue_038",
+        "pioneer11": "blue_038",
+        "voyager1": "blue_038",
+        "voyager2": "blue_038",
+        "galileo": "blue_038",
+        "cassini": "blue_038",
+        "juno": "blue_038",
+        "newhorizons": "blue_038",
+        "messenger": "blue_038",
+        "parker": "blue_038",
+        "near": "blue_038",
+        "dart": "blue_038",
+        "europaclipper": "blue_038",
+        "stereoa": "blue_038",
+        "lucy": "blue_038",
+        "rosetta": "blue_038",
+        "dawn": "blue_038"
+      },
+      "filter": 0,
+      "path_style": "Dashed",
+      "year_marks": true,
+      "labels": true,
+      "belt": true,
+      "title": "",
+      "pen_labels": "base",
+      "pen_orbits": "base",
+      "pen_belt": "base"
+    },
+    "image": {
+      "path": null,
+      "mode": "Outlines (logos, clip-art)",
+      "colours": 2,
+      "invert": false,
+      "size": 100,
+      "smooth": 3,
+      "speck": 2,
+      "edges": 5,
+      "fill": false,
+      "fill_spacing": 8,
+      "cut": false,
+      "cut_offset": 4,
+      "pens": {}
+    },
+    "preview_view": [
+      [
+        -121.86792028858484,
+        -121.65676587640478
+      ],
+      [
+        46.804108710864824,
+        46.9003785304383
+      ]
+    ]
+  }
+}

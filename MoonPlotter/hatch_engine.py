@@ -563,6 +563,84 @@ def _drop_duplicate_inks(ids, pens, progress_callback=None):
     return [p for p in ids if p in kept]
 
 
+# --- Tuning knobs for Earth Circle Mode (Land / Ocean) ---
+EARTH_CIRCLE_SHARED_ANGLE = 45.0   # Set to 0.0 for horizontal waves, or None to use crossing angles
+LAND_MIN_DENSITY = 0.18           # Minimum wave density on brightest land (ice caps/deserts); >0 keeps lines unbroken
+LAND_MAX_DENSITY = 1.00           # Maximum wave density on darkest land
+OCEAN_MIN_DENSITY = 0.15          # Minimum wave density on brightest water
+OCEAN_MAX_DENSITY = 0.85          # Maximum wave density on deepest/darkest water
+
+# Keep every scanline unbroken across the full disc in Circle Mode (bright ice caps become flat 0-amplitude lines)
+FULL_DISC_IN_CIRCLE_MODE = True
+
+
+def _normalize_region(vals, mask, auto_contrast, tone_gamma, d_min, d_max):
+    """Normalizes lightness within a specific mask (land or ocean) and maps it to [d_min, d_max]."""
+    if not mask.any():
+        return np.zeros_like(vals, dtype=np.float32)
+    v = vals.copy()
+    if auto_contrast:
+        p_lo, p_hi = np.percentile(v[mask], [2.0, 98.0])
+        if p_hi - p_lo > 1e-4:
+            v = np.clip((v - p_lo) / (p_hi - p_lo), 0.0, 1.0)
+    darkness = apply_tone_curve(1.0 - v, tone_gamma)
+    return (d_min + (d_max - d_min) * darkness).astype(np.float32)
+
+
+def _earth_land_ocean_separate(rgb, valid, rgb_bounds, elev, pens, ids, auto_contrast, tone_gamma):
+    """Splits Earth into Green (land) and Blue (ocean) density maps for Circle Mode."""
+    # 1. Pick the best green and blue pens
+    green_pen = next((p for p in ids if 'green' in p.lower() or 'green' in pens[p]['name'].lower()), None)
+    if not green_pen:
+        green_pen = 'green_07' if 'green_07' in pens else ids[0]
+
+    blue_pen = next((p for p in ids if ('blue' in p.lower() or 'cyan' in p.lower() or
+                                        'blue' in pens[p]['name'].lower() or 'cyan' in pens[p]['name'].lower())
+                     and p != green_pen), None)
+    if not blue_pen:
+        for cand in ('blue_07', 'cyan_07', 'blue_038'):
+            if cand in pens and cand != green_pen:
+                blue_pen = cand
+                break
+        else:
+            blue_pen = ids[-1]
+
+    # 2. Build the Land vs. Ocean mask
+    h, w = rgb.shape[:2]
+    if elev is not None and elev[0] is not None:
+        dem_m, dem_bounds = elev
+        lon_c = rgb_bounds['lon0'] + (np.arange(w) + 0.5) / w * rgb_bounds['lon_span']
+        lat_c = rgb_bounds['lat_top'] - (np.arange(h) + 0.5) / h * (rgb_bounds['lat_top'] - rgb_bounds['lat_bot'])
+        LO, LA = np.meshgrid(lon_c, lat_c)
+        z = _Raster(dem_m, dem_bounds).sample_bilinear(LO, LA)
+        is_land = (z > 0.0) & valid
+    else:
+        # Fallback if BE_dem_v2.tif is not installed: classify water by blue dominance in RGB
+        r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+        is_water = (b > r * 1.12) & (b > g * 1.03) & (b < 0.85)
+        is_land = (~is_water) & valid
+    is_ocean = (~is_land) & valid
+
+    # 3. Compute independent contrast for Land and Ocean so both show rich wave modulation
+    lum = luminance(srgb_to_linear(rgb))
+    land_tone = _normalize_region(lum, is_land, auto_contrast, tone_gamma, LAND_MIN_DENSITY, LAND_MAX_DENSITY)
+    ocean_tone = _normalize_region(lum, is_ocean, auto_contrast, tone_gamma, OCEAN_MIN_DENSITY, OCEAN_MAX_DENSITY)
+
+    land_dmap = np.where(is_land, land_tone, 0.0).astype(np.float32)
+    ocean_dmap = np.where(is_ocean, ocean_tone, 0.0).astype(np.float32)
+
+    # Order lightest ink first to match the plotter pipeline
+    pairs = [(green_pen, land_dmap), (blue_pen, ocean_dmap)]
+    pairs.sort(key=lambda item: ink_lightness(pens[item[0]]['color']), reverse=True)
+
+    if EARTH_CIRCLE_SHARED_ANGLE is not None:
+        inks = [(pid, float(EARTH_CIRCLE_SHARED_ANGLE)) for pid, _ in pairs]
+    else:
+        inks = [(pid, BASE_ANGLES[i % len(BASE_ANGLES)]) for i, (pid, _) in enumerate(pairs)]
+    dens_maps = [dmap for _, dmap in pairs]
+    return inks, dens_maps
+
+
 def generate_hatches(rgb, rgb_bounds, view_extent, params, progress_callback=None, elev=None):
     """Fill layer generator.
 
@@ -619,21 +697,40 @@ def generate_hatches(rgb, rgb_bounds, view_extent, params, progress_callback=Non
     if rgb is None or rgb.size == 0:
         return segments
 
-    line_w = [float(pens[pid].get('line_mm', pens[pid]['width'])) for pid, _ in inks]
-    max_cov = [pattern_max_coverage(strategy, w, spacing, n_passes) for w in line_w]
-
     # --- Prefilter to roughly the hatch resolution, then separate ---
-    if progress_callback: progress_callback(f"Separating {len(inks)} ink layer(s)...")
     valid = np.isfinite(rgb).all(axis=-1)
     rgb = np.where(valid[..., None], rgb, 1.0).astype(np.float64)
     mm_per_px = rgb_bounds['lon_span'] / rgb.shape[1] * frame.mm_per_deg()
     sigma = 0.35 * spacing / max(mm_per_px, 1e-9)
     if sigma > 0.3:
         rgb = scipy.ndimage.gaussian_filter(rgb, sigma=(sigma, sigma, 0), mode='nearest')
-    dens_maps = _separate(rgb, valid, [pens[pid]['color'] for pid, _ in inks], paper_hex,
-                          max_cov, auto_contrast, tone_gamma, [pen_opacity(pens[pid]) for pid, _ in inks])
+
+    is_earth_circle_color = (
+        params.get('active_planet') == 'Earth'
+        and frame.circle
+        and not use_mono
+        and not is_hachure
+    )
+
+    if is_earth_circle_color:
+        if progress_callback:
+            progress_callback("Separating Earth into Green (land) and Blue (ocean) layers...")
+        inks, dens_maps = _earth_land_ocean_separate(
+            rgb, valid, rgb_bounds, elev, pens, ids, auto_contrast, tone_gamma
+        )
+        line_w = [float(pens[pid].get('line_mm', pens[pid]['width'])) for pid, _ in inks]
+        max_cov = [pattern_max_coverage(strategy, w, spacing, n_passes) for w in line_w]
+    else:
+        line_w = [float(pens[pid].get('line_mm', pens[pid]['width'])) for pid, _ in inks]
+        max_cov = [pattern_max_coverage(strategy, w, spacing, n_passes) for w in line_w]
+        if progress_callback:
+            progress_callback(f"Separating {len(inks)} ink layer(s)...")
+        dens_maps = _separate(rgb, valid, [pens[pid]['color'] for pid, _ in inks], paper_hex,
+                              max_cov, auto_contrast, tone_gamma, [pen_opacity(pens[pid]) for pid, _ in inks])
 
     golden = 0.6180339887
+    align_phases = is_earth_circle_color and (EARTH_CIRCLE_SHARED_ANGLE is not None)
+
     for ink_idx, ((pen_id, base_angle), dmap, lw, cmax) in enumerate(zip(inks, dens_maps, line_w, max_cov)):
         raster = _Raster(dmap, rgb_bounds)
         level = 1000 * (ink_idx + 1)
@@ -647,12 +744,21 @@ def generate_hatches(rgb, rgb_bounds, view_extent, params, progress_callback=Non
             line_spacing, _, wavelength = _squiggle_params(spacing)
             amps, covs = _squiggle_table(lw, spacing)
             dt = wavelength / 16.0
-            offs, ts, U, V, (nx, ny) = _scan_grid(frame, base_angle, line_spacing, dt, golden * ink_idx * line_spacing)
+            phase_offset = 0.0 if align_phases else (golden * ink_idx * line_spacing)
+            offs, ts, U, V, (nx, ny) = _scan_grid(frame, base_angle, line_spacing, dt, phase_offset)
             inside = frame.inside(U, V)
             d = raster.sample(*frame.to_lonlat(U, V)) * inside
             c = d * cmax
             c0 = covs[0]                                   # coverage of a straight line
-            on = (c >= 0.5 * c0) & inside
+
+            # Keep the full circle intact on monochrome globes (white ice caps draw as flat 0-amplitude lines)
+            if FULL_DISC_IN_CIRCLE_MODE and frame.circle and use_mono:
+                on = inside.copy()
+            elif FULL_DISC_IN_CIRCLE_MODE and is_earth_circle_color:
+                on = (d > 0.0) & inside
+            else:
+                on = (c >= 0.5 * c0) & inside
+
             on = _clean_runs(on, inside, dt)
             A = np.interp(c, covs, amps) if len(covs) > 1 else np.zeros_like(c)
             wave = np.sin(2.0 * np.pi * ts / wavelength)[None, :]

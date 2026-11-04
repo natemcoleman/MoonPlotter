@@ -27,9 +27,10 @@ TAHOE = {
 PLANET_RADII = {'Earth': 6371000.0, 'Moon': 1737400.0, 'Mars': 3389500.0}
 
 PAPER_SIZES = {
-    '100x100mm (Default)': (100.0, 100.0),
-    'Ender3_Safe (200x200)': (200.0, 200.0),
+    'Postcard': (152.4, 101.6),
+    '100x100mm': (100.0, 100.0),
     'A4': (297.0, 210.0),
+    'Ender3_Safe (200x200)': (200.0, 200.0),
     'Letter': (279.4, 215.9),
     'Custom (mm)': (150.0, 150.0)
 }
@@ -61,6 +62,11 @@ MAX_DEM_PX = 4000
 PAPER_COLORS = {
     'White': '#FFFFFF',
     'Black': '#1C1C1C',
+    'Pale blue': '#787f99',
+    'Light blue': '#a6b0b9',
+    'Navy blue': '#46475b',
+    'Teal blue': '#87b3b5',
+    'Blue': '#4a5478',
     'Cream / Ivory': '#F2EAD3',
     'Tan / Kraft': '#C9A97C',
     'Light gray': '#C8C8C8',
@@ -69,8 +75,8 @@ PAPER_COLORS = {
     'Orange': '#F27022',
     'Yellow': '#FFE234',
     'Green': '#3FAE49',
-    'Light blue': '#8ECDEB',
-    'Blue': '#1F6FC5',
+    # 'Light blue': '#8ECDEB',
+    # 'Blue': '#1F6FC5',
     'Navy': '#1E2A5A',
     'Purple': '#6E3FA0',
     'Pink': '#EC4E9A',
@@ -106,16 +112,19 @@ DEFAULT_HATCH_SPACING_MM = 1.0
 # coordinate (0, 0) sits 50 mm in from the home corner. The usable plot area is therefore the bed
 # size minus that offset. Adjust BED_MM if your Ender's travel differs.
 BED_MM = (235.0, 235.0)
-GCODE_OFFSET_MM = (50.0, 50.0)
-DEFAULT_DRAW_FEED = 1500.0      # mm/min, pen down
+GCODE_OFFSET_MM = (38.0, 18.0)
+DEFAULT_DRAW_FEED = 1200.0      # mm/min, pen down
 TRAVEL_FEED = 3000.0            # mm/min, pen up
-PEN_LIFT_MM = 3.0               # pen-up height above the paper between strokes (was 1.0); the export dialog can override it
+PEN_LIFT_MM = 3.5               # pen-up height above the paper between strokes (was 1.0); the export dialog can override it
 # Height of the drawing plane (pen down, Z0) above the homed Z position. The header declares the homed
 # head to be at Z = -PEN_DOWN_ABOVE_HOME_MM. Raise it if the pen drags or hits the plate; lower it if
 # lines come out faint. (Was 4.0; raised 1.5 mm after the pen caught the plate edge.)
-PEN_DOWN_ABOVE_HOME_MM = 5.5
+# PEN_DOWN_ABOVE_HOME_MM = 5.5
+PEN_DOWN_ABOVE_HOME_MM = 2.5 #this is for cutter, should raise for other pens
 # Clearance used for long moves: leaving home for the start point, parking and pen changes.
-SAFE_Z_MM = 5.0
+SAFE_Z_MM = 5.5
+# SAFE_Z_MM = 0.5
+# SAFE_Z_MM = 0.0
 
 # Folder for high-resolution regional data (DEMs and colour maps) - see regions.py
 REGIONS_DIR = "regions"

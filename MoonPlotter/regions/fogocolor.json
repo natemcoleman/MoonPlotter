@@ -1,0 +1,13 @@
+{
+  "planet": "Earth",
+  "kind": "color",
+  "units": "",
+  "source": "USDA, USGS The National Map: Orthoimagery (public domain)",
+  "bounds": [
+    -24.593760062612148,
+    14.799986593329663,
+    -24.197400796345427,
+    15.055308520024465
+  ],
+  "res_deg": 8.582920447525358e-05
+}

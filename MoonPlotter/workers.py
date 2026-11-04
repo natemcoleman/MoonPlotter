@@ -273,7 +273,14 @@ class RenderWorker(QThread):
         strategy = self.params.get('hatch_strategy', '')
         source = self.params.get('fill_source', 'Color map')
         need_color = "Hachure" not in strategy and "Color" in source
-        need_dem = "Hachure" in strategy or "Hillshade" in source or is_tahoe
+
+        is_earth_circle_color = (
+            self.planet == 'Earth'
+            and self.params.get('circle_mode', False)
+            and self.params.get('fill_inks') == 'color'
+            and os.path.exists(self.dem_path)
+        )
+        need_dem = "Hachure" in strategy or "Hillshade" in source or is_tahoe or is_earth_circle_color
 
         pw = float(self.params.get('paper_w_mm', 100.0))
         ph = float(self.params.get('paper_h_mm', 100.0))
@@ -340,7 +347,9 @@ class RenderWorker(QThread):
                 if is_tahoe:
                     rgb[~np.isfinite(dk)] = np.nan              # nothing outside the lake
 
-        return generate_hatches(rgb, bounds, extent, self.params, progress_callback=self.progress.emit)
+        elev_arg = (dem_m, dem_bounds) if dem_m is not None else None
+        return generate_hatches(rgb, bounds, extent, self.params, progress_callback=self.progress.emit,
+                                elev=elev_arg)
 
 
 def _sample_nearest(arr, bounds, lon, lat):

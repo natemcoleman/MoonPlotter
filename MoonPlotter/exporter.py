@@ -17,7 +17,9 @@ def vpype_command(svg_path, gcode_path, has_dots=False):
     lettering / map furniture, whose short strokes must not be simplified, merged or length-filtered."""
     if has_dots:
         return f'read "{svg_path}" linesort gwrite --profile gcodemm "{gcode_path}"'
-    return (f'read "{svg_path}" linesimplify -t 0.1mm linemerge -t 0.3mm '
+    # return (f'read "{svg_path}" linesimplify -t 0.1mm linemerge -t 0.3mm '
+    #         f'filter --min-length {MIN_SEGMENT_MM:g}mm linesort gwrite --profile gcodemm "{gcode_path}"')
+    return (f'read "{svg_path}" linemerge -t 0.3mm '
             f'filter --min-length {MIN_SEGMENT_MM:g}mm linesort gwrite --profile gcodemm "{gcode_path}"')
 
 

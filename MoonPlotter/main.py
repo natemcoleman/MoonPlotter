@@ -203,8 +203,8 @@ class PlotterApp(QMainWindow):
         self.setWindowIcon(app_icon())
         self.resize(1500, 500)
 
-        self.active_planet = 'Moon'
-        self.paper_name = '100x100mm (Default)'
+        self.active_planet = 'Earth'
+        self.paper_name = 'Postcard'
         self.is_landscape = True
         self.interval_ft = 200
 
@@ -2735,11 +2735,14 @@ class PlotterApp(QMainWindow):
             return ""
         lat = 0.5 * (e[2] + e[3])
         lon = ((0.5 * (e[0] + e[1]) + 180) % 360) - 180
-        parts = [self.active_planet.upper(), f"{abs(lat):.2f}°{'N' if lat >= 0 else 'S'} "
-                                            f"{abs(lon):.2f}°{'E' if lon >= 0 else 'W'}"]
+        # parts = [self.active_planet.upper(), f"{abs(lat):.2f}°{'N' if lat >= 0 else 'S'} "
+        #                                     f"{abs(lon):.2f}°{'E' if lon >= 0 else 'W'}"]
+        # if self.sec_contours.is_enabled() and any(i.get('layer') == 'contours' for i in self.map_segments):
+        #     parts.append(f"{self.interval_ft:,} ft contours")
+        # return "  ·  ".join(parts)
         if self.sec_contours.is_enabled() and any(i.get('layer') == 'contours' for i in self.map_segments):
-            parts.append(f"{self.interval_ft:,} ft contours")
-        return "  ·  ".join(parts)
+            return f"{self.interval_ft:,} ft contours"
+        return ""
 
     def _build_decorations(self):
         self.decor_segments, self.decor_masks = [], []
@@ -4134,4 +4137,4 @@ if __name__ == '__main__':
     apply_theme(app)
     window = PlotterApp()
     window.showMaximized()
-    sys.exit(app.exec())
+    sys.exit(app.exec())

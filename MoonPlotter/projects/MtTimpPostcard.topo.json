@@ -1,0 +1,232 @@
+{
+  "app": "Topo Plotter Studio",
+  "version": 1,
+  "state": {
+    "contours_on": true,
+    "fill_on": false,
+    "density": 0,
+    "auto_index": true,
+    "index_every": 5,
+    "blur": 0,
+    "simplify": 0,
+    "smooth": 0,
+    "tanaka": false,
+    "ocean": true,
+    "blue_water": true,
+    "plot_borders": true,
+    "pattern": "Multi-Pass Crosshatch",
+    "tone_source": "Color map",
+    "inks": "Monochrome",
+    "mono_pen": "pen_1",
+    "fill_pens": [
+      "white_gr05",
+      "white_gr08",
+      "white_gr10",
+      "yellow_07",
+      "stabilo_44",
+      "stabilo_43",
+      "stabilo_54",
+      "orange_07",
+      "green_07",
+      "stabilo_56",
+      "stabilo_36",
+      "stabilo_55",
+      "red_038",
+      "pink_07",
+      "stabilo_41",
+      "red_07",
+      "purple_07",
+      "blue_07",
+      "stabilo_45",
+      "blue_038",
+      "base",
+      "pen_1"
+    ],
+    "paper_color": "#46475b",
+    "contour_pen": "white_gr05",
+    "index_pen": "white_gr08",
+    "water_pen": "blue_038",
+    "border_pen": "pen_1",
+    "spacing": 1.0,
+    "tone": 0,
+    "auto_contrast": true,
+    "join": true,
+    "deco_title": true,
+    "deco_title_text": "Mount Timpanogos",
+    "deco_scale": true,
+    "deco_north": true,
+    "deco_graticule": "Off",
+    "deco_frame": true,
+    "deco_pen": "white_gr08",
+    "site_labels": true,
+    "deco_text_size": "Medium",
+    "deco_scale_units": "Miles",
+    "show_sites": true,
+    "mask_text": true,
+    "show_map_borders": true,
+    "planet": "Earth",
+    "region": "None (Plot Full Selection)",
+    "paper_name": "Postcard",
+    "custom_w": "150",
+    "custom_h": "150",
+    "landscape": true,
+    "circle_mode": false,
+    "circle_center_lon": 0.0,
+    "selection": [
+      -111.68868327004137,
+      -111.60174474237769,
+      40.353434177063356,
+      40.42669356575897
+    ],
+    "interval_ft": 200,
+    "interval_auto_done": true,
+    "selected_sites": {
+      "Moon": [],
+      "Earth": [
+        "Clouds Rest",
+        "El Capitan",
+        "Half Dome"
+      ]
+    },
+    "layer_visible": {},
+    "custom_items": [],
+    "has_drawn": true,
+    "map_view": [
+      [
+        -111.71897496333396,
+        -111.55312300286788
+      ],
+      [
+        40.314905390401854,
+        40.45987228917962
+      ]
+    ],
+    "segment_pens": {
+      "count": 179,
+      "runs": [
+        [
+          "white_gr05",
+          1
+        ],
+        [
+          "white_gr08",
+          1
+        ],
+        [
+          "white_gr05",
+          14
+        ],
+        [
+          "white_gr08",
+          4
+        ],
+        [
+          "white_gr05",
+          21
+        ],
+        [
+          "white_gr08",
+          8
+        ],
+        [
+          "white_gr05",
+          31
+        ],
+        [
+          "white_gr08",
+          4
+        ],
+        [
+          "white_gr05",
+          34
+        ],
+        [
+          "white_gr08",
+          2
+        ],
+        [
+          "white_gr05",
+          4
+        ],
+        [
+          "white_gr08",
+          3
+        ],
+        [
+          "white_gr05",
+          15
+        ],
+        [
+          "white_gr08",
+          2
+        ],
+        [
+          "white_gr05",
+          9
+        ],
+        [
+          "pen_1",
+          26
+        ]
+      ]
+    },
+    "missions": {
+      "checked": [
+        "voyager2"
+      ],
+      "pens": {
+        "pioneer10": "blue_038",
+        "pioneer11": "blue_038",
+        "voyager1": "blue_038",
+        "voyager2": "blue_038",
+        "galileo": "blue_038",
+        "cassini": "blue_038",
+        "juno": "blue_038",
+        "newhorizons": "blue_038",
+        "messenger": "blue_038",
+        "parker": "blue_038",
+        "near": "blue_038",
+        "dart": "blue_038",
+        "europaclipper": "blue_038",
+        "stereoa": "blue_038",
+        "lucy": "blue_038",
+        "rosetta": "blue_038",
+        "dawn": "blue_038"
+      },
+      "filter": 0,
+      "path_style": "Dashed",
+      "year_marks": true,
+      "labels": true,
+      "belt": true,
+      "title": "",
+      "pen_labels": "base",
+      "pen_orbits": "base",
+      "pen_belt": "base"
+    },
+    "image": {
+      "path": null,
+      "mode": "Outlines (logos, clip-art)",
+      "colours": 2,
+      "invert": false,
+      "size": 100,
+      "smooth": 3,
+      "speck": 2,
+      "edges": 5,
+      "fill": false,
+      "fill_spacing": 8,
+      "cut": false,
+      "cut_offset": 4,
+      "pens": {}
+    },
+    "preview_view": [
+      [
+        -111.71735277285151,
+        -111.57307523956754
+      ],
+      [
+        40.35343417706335,
+        40.42669356575897
+      ]
+    ]
+  }
+}
