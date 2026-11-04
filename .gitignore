@@ -18,8 +18,8 @@ MoonPlotter/Mars_Viking_ClrMosaic_global_925m.tif
 MoonPlotter/earth_color.tif
 MoonPlotter/earth_color.tif
 *.tif
-MoonPlotter/MoonPlotter/projects/
-MoonPlotter/MoonPlotter/regions/
+MoonPlotter/projects/
+MoonPlotter/regions/
 
 # Python bytecode
 __pycache__/
