@@ -50,7 +50,8 @@ NICE_INTERVALS_FT = [1, 2, 5, 10, 20, 25, 40, 50, 80, 100, 200, 250, 400, 500, 8
 
 # Longest side (pixels) of the DEM array handed to the contour engine. Larger
 # windows are block-averaged down. 4000 px is ~20 px/mm on a 200 mm plot.
-MAX_DEM_PX = 4000
+# MAX_DEM_PX = 4000
+MAX_DEM_PX = 8192
 
 # ==========================================
 # HATCHING / COLOR SEPARATION
