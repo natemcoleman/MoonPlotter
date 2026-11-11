@@ -47,7 +47,7 @@ from ui_widgets import CollapsibleSection, LayerPanel, swatch_icon, WheelGuard, 
 from sites import sites_for, CATEGORY_STYLE
 import exporter
 import regions
-from decorations import build_decorations, TEXT_SCALES, LABEL_CAP_MM, min_cap_for_pen
+from decorations import build_decorations, TEXT_SCALES, LABEL_CAP_MM, min_cap_for_pen, PaperFrame
 from stroke_font import stroke_text
 from calibration import build_calibration_sheet
 import missions as MS
@@ -67,7 +67,8 @@ LAYER_LABELS = {'contours': 'Contours', 'borders': 'Borders & outlines', 'sites'
                 'decor': 'Map furniture', 'calibration': 'Calibration sheet',
                 'orbits': 'Planet orbits', 'trajectory': 'Trajectories', 'markers': 'Sun, planets & year marks',
                 'belt': 'Asteroid belt', 'labels': 'Labels & title',
-                'annotations': 'Text & drawn lines', 'img:cut': 'Sticker cut line'}
+                'annotations': 'Text & drawn lines', 'img:cut': 'Sticker cut line',
+                'ski_runs': 'Ski runs', 'ski_lifts': 'Ski lifts'}
 
 # Rough plotter model for the live time estimate (matches the G-code writer / estimator):
 DRAW_FEED = 1500.0      # mm/min (G1)
@@ -129,6 +130,8 @@ except ImportError:
 from contour_engine import HAS_GPD, world_borders, state_borders, BORDERS_ERROR, NATURAL_EARTH_DIR, \
     NATURAL_EARTH_FILES
 import dem_prep
+import ski
+import svg_import
 from workers import clear_dem_cache
 
 # Cache for UI map previews
@@ -177,6 +180,35 @@ class _MissionFetch(QThread):
             self.failed.emit(f"{type(e).__name__}: {e}")
             return
         self.done.emit(out)
+
+
+class _SkiFetch(QThread):
+    """Loads a ski resort (OpenStreetMap) and, if needed, 30 m elevation for it, in the background."""
+    done = pyqtSignal(str, object, str)
+    failed = pyqtSignal(str, str)
+    progress = pyqtSignal(str)
+
+    def __init__(self, resort):
+        super().__init__()
+        self.resort = resort
+
+    def run(self):
+        try:
+            data = ski.load(self.resort, progress=self.progress.emit)
+        except Exception as e:
+            self.failed.emit(self.resort, f"{type(e).__name__}: {e}")
+            return
+        note = ""
+        ext = list(ski.dem_extent(data))       # roomy box: panning, zooming out or tiling stays covered
+        try:
+            if regions.best_region('Earth', 'dem', ext, min_coverage=0.99) is None:
+                src = next(s for s in regions.REMOTE_SOURCES['Earth'] if s.get('tiles') == 'copernicus30')
+                self.progress.emit(f"Fetching 30 m elevation for {self.resort} (one time)...")
+                regions.fetch_region(src, 'Earth', ext, "ski_" + ski.slug(self.resort), progress=self.progress.emit)
+                note = "30 m elevation fetched for it."
+        except Exception as e:
+            note = f"(30 m elevation not fetched: {e} - contours use the coarse global data.)"
+        self.done.emit(self.resort, data, note)
 
 
 class _DemPrep(QThread):
@@ -351,6 +383,7 @@ class PlotterApp(QMainWindow):
         self.mission_data = {}
         self.image_path = None
         self.image_rgb = None
+        self.svg_layers = None            # raw layers of an imported SVG (Image mode), or None
         self._image_cache = {}
         self._image_layers = []           # last trace result
         self._image_pens = {}             # traced layer key -> pen id
@@ -610,6 +643,34 @@ class PlotterApp(QMainWindow):
         region_row.addWidget(self.btn_fav_region)
         self.lbl_region = sec_src.add(self._field("Clip to region", region_row))
 
+        # Ski resort overlay (shown when a resort is picked under Clip to region)
+        self.widget_ski = QWidget()
+        gs = QGridLayout(self.widget_ski)
+        gs.setContentsMargins(0, 0, 0, 0)
+        gs.setVerticalSpacing(4)
+        self.chk_ski_runs = QCheckBox("Runs")
+        self.chk_ski_runs.setChecked(True)
+        self.chk_ski_lifts = QCheckBox("Lifts")
+        self.chk_ski_lifts.setChecked(True)
+        self.chk_ski_diff = QCheckBox("Colour runs by difficulty")
+        self.chk_ski_diff.setToolTip("Green = easy, blue = intermediate, thin black = advanced, thick black = expert\n"
+                                     "(pens that are out of stock fall back to the Runs pen).")
+        self.combo_ski_run_pen, self.combo_ski_lift_pen = QComboBox(), QComboBox()
+        gs.addWidget(self.chk_ski_runs, 0, 0)
+        gs.addWidget(self.combo_ski_run_pen, 0, 1)
+        gs.addWidget(self.chk_ski_lifts, 1, 0)
+        gs.addWidget(self.combo_ski_lift_pen, 1, 1)
+        gs.addWidget(self.chk_ski_diff, 2, 0, 1, 2)
+        gs.setColumnStretch(1, 1)
+        for c in (self.chk_ski_runs, self.chk_ski_lifts, self.chk_ski_diff):
+            c.toggled.connect(self.trigger_recalc)
+        for cb in (self.combo_ski_run_pen, self.combo_ski_lift_pen):
+            cb.currentIndexChanged.connect(lambda _: self.trigger_recalc())
+        self.widget_ski_field = sec_src.add(self._field(
+            "Ski resort overlay", self.widget_ski,
+            "Lifts and runs: \u00a9 OpenStreetMap contributors (ODbL). Downloaded once, kept in ski_resorts/."))
+        self.widget_ski_field.setVisible(False)
+
         self.combo_scale = QComboBox()
         self.combo_scale.addItem("Free (drag any area)")
         for label, miles, ft in SCALE_PRESETS:
@@ -696,6 +757,41 @@ class PlotterApp(QMainWindow):
         h_custom.addWidget(QLabel("mm"))
         self.widget_custom.setVisible(False)
         sec_paper.add(self.widget_custom)
+
+        # Tiles: one big map split across several sheets of the chosen paper size
+        tile_box = QWidget()
+        gt = QGridLayout(tile_box)
+        gt.setContentsMargins(0, 0, 0, 0)
+        gt.setVerticalSpacing(4)
+        self.spin_tile_cols, self.spin_tile_rows = QSpinBox(), QSpinBox()
+        for sp in (self.spin_tile_cols, self.spin_tile_rows):
+            sp.setRange(1, 8)
+            sp.setValue(1)
+            sp.setFixedWidth(52)
+        self.spin_tile_gap = QDoubleSpinBox()
+        self.spin_tile_gap.setRange(0.0, 50.0)
+        self.spin_tile_gap.setSingleStep(1.0)
+        self.spin_tile_gap.setDecimals(1)
+        self.spin_tile_gap.setSuffix(" mm")
+        self.spin_tile_gap.setToolTip("Space between the pages when they are mounted. The map skips that strip, so\n"
+                                      "features line up across the gap. 0 = pages butt together.")
+        self.chk_tile_cut = QCheckBox("Cut lines")
+        self.chk_tile_cut.setToolTip("Show each page's edge in the preview and pre-tick 'cut out each page' (drag\n"
+                                     "knife) in the export.")
+        gt.addWidget(self.spin_tile_cols, 0, 0)
+        gt.addWidget(QLabel("across \u00d7"), 0, 1)
+        gt.addWidget(self.spin_tile_rows, 0, 2)
+        gt.addWidget(QLabel("down"), 0, 3)
+        gt.addWidget(QLabel("Gap"), 1, 0)
+        gt.addWidget(self.spin_tile_gap, 1, 1, 1, 2)
+        gt.addWidget(self.chk_tile_cut, 1, 3)
+        gt.setColumnStretch(4, 1)
+        for sp in (self.spin_tile_cols, self.spin_tile_rows, self.spin_tile_gap):
+            sp.valueChanged.connect(lambda _: self.update_paper_dims())
+        self.chk_tile_cut.toggled.connect(lambda _: self.render_canvas())
+        sec_paper.add(self._field("Split into pages (tiles)", tile_box,
+                                  "The paper size above is one page; the map spans all of them. Each page "
+                                  "exports as its own G-code."))
         vbox.addWidget(sec_paper)
 
         # ---------- CONTOURS LAYER ----------
@@ -1272,6 +1368,7 @@ class PlotterApp(QMainWindow):
         is_color = self.combo_inks.currentText() == "Color separation" and not is_hachure
 
         self.lbl_region.setVisible(is_earth)
+        self.widget_ski_field.setVisible(is_earth and self.selected_resort() is not None)
         self.chk_borders.setVisible(is_earth)
         self.chk_plot_borders.setVisible(is_earth)
         self.chk_blue_water.setVisible(is_earth)
@@ -1308,7 +1405,9 @@ class PlotterApp(QMainWindow):
                   self.combo_scale_units.parentWidget(), self.chk_deco_title, self.widget_subtitle):
             w.setVisible(not solar)
         if hasattr(self, 'btn_draw'):
-            self.btn_draw.setText({'Solar System': "Draw Mission Plot", 'Image': "Trace Image"}.get(planet, "Draw Map"))
+            self.btn_draw.setText({'Solar System': "Draw Mission Plot",
+                                   'Image': "Place SVG" if self.svg_layers is not None else "Trace Image"
+                                   }.get(planet, "Draw Map"))
 
     REGION_NONE = "None (Plot Full Selection)"
 
@@ -1404,11 +1503,12 @@ class PlotterApp(QMainWindow):
             if s_col: states = sorted(set(state_borders[s_col].dropna().tolist()))
             if w_col: countries = sorted(set(world_borders[w_col].dropna().tolist()))
         lakes = list(REGION_LAKES)
-        known = set(lakes) | set(states) | set(countries)
+        resorts = [ski.region_label(n) for n in ski.RESORTS]
+        known = set(lakes) | set(resorts) | set(states) | set(countries)
         favs = [r for r in self.favorites['regions'] if r in known]
         for r in favs:
             cb.addItem(r)
-        groups = [("Lakes", lakes), ("States", states), ("Countries", countries)]
+        groups = [("Lakes", lakes), ("Ski resorts", resorts), ("States", states), ("Countries", countries)]
         model = cb.model()
         for title, names in groups:
             names = [n for n in names if n not in favs]
@@ -1499,7 +1599,8 @@ class PlotterApp(QMainWindow):
                 'water_pen': self.combo_water_pen, 'border_pen': self.combo_border_pen,
                 'mono_pen': self.combo_mono_pen, 'deco_pen': self.combo_deco_pen,
                 'mission_pen_labels': self.combo_mpen_labels, 'mission_pen_orbits': self.combo_mpen_orbits,
-                'mission_pen_belt': self.combo_mpen_belt}
+                'mission_pen_belt': self.combo_mpen_belt,
+                'ski_run_pen': self.combo_ski_run_pen, 'ski_lift_pen': self.combo_ski_lift_pen}
 
     def current_colorway(self):
         out = {'paper_color': self.current_paper_color()}
@@ -1587,8 +1688,15 @@ class PlotterApp(QMainWindow):
         self.set_panel_visible('map', not on)
         self.set_panel_visible('layers', not on)
 
+    def selected_resort(self):
+        return ski.resort_from_label(self.combo_region.currentText()) if hasattr(self, 'combo_region') else None
+
     def on_region_changed(self, text):
         self._update_fav_stars()
+        resort = ski.resort_from_label(text)
+        self.widget_ski_field.setVisible(resort is not None and self.active_planet == 'Earth')
+        if resort and not self._loading:
+            self.start_ski_fetch(resort)
         if "Tahoe" in text:
             self.slider_int.blockSignals(True);
             self.txt_int.blockSignals(True)
@@ -1815,6 +1923,8 @@ class PlotterApp(QMainWindow):
             'layer_fill': self.sec_fill.is_enabled(),
             'force_auto_interval': not self.interval_auto_done,
             'fixed_interval': self.scale_preset() is not None,
+            'ski_resort': self.selected_resort() if self.active_planet == 'Earth' else None,
+            'ski_opts': self.ski_options(),
             'tanaka': self.chk_tanaka.isChecked(),
             'fill_source': self.combo_source.currentText(),
             'fill_inks': 'color' if self.combo_inks.currentText() == "Color separation" else 'mono',
@@ -2050,6 +2160,9 @@ class PlotterApp(QMainWindow):
         for cb, default in ((self.combo_contour_pen, 'base'), (self.combo_index_pen, 'pen_1'),
                             (self.combo_water_pen, 'blue_038'), (self.combo_border_pen, 'pen_1')):
             self._fill_pen_combo(cb, default)
+        if hasattr(self, 'combo_ski_run_pen'):
+            self._fill_pen_combo(self.combo_ski_run_pen, 'base')
+            self._fill_pen_combo(self.combo_ski_lift_pen, 'red_038')
         self._update_ink_count()
         self._update_contrast_warning()
 
@@ -2220,7 +2333,7 @@ class PlotterApp(QMainWindow):
         if self.custom_items:
             groups['annotations'] = {'pens': list(dict.fromkeys(i['pen_id'] for i in self.custom_items)),
                                      'n': len(self.custom_items)}
-        order = ['calibration', 'contours', 'borders', 'sites'] + sorted(k for k in groups if k.startswith('fill:')) + \
+        order = ['calibration', 'contours', 'borders', 'ski_runs', 'ski_lifts', 'sites'] + sorted(k for k in groups if k.startswith('fill:')) + \
                 ['orbits', 'belt', 'trajectory', 'markers', 'labels', 'decor', 'annotations']
         order += sorted(k for k in groups if k not in order)
         rows = []
@@ -2417,6 +2530,7 @@ class PlotterApp(QMainWindow):
             self.ax_prev.set_xlim(xlim)
             self.ax_prev.set_ylim(ylim)
 
+        self._draw_tile_overlay()
         self._apply_screen_linewidths(redraw=False)
         self.ink_image = None                 # ax.clear() above removed the old one
         self.canvas_prev.draw_idle()
@@ -2968,7 +3082,10 @@ class PlotterApp(QMainWindow):
         else:
             self.widget_custom.setVisible(False)
             w, h = PAPER_SIZES[self.paper_name]
-        self.pw, self.ph = (w, h) if self.is_landscape else (h, w)
+        self.tile_w, self.tile_h = (w, h) if self.is_landscape else (h, w)
+        cols, rows, gap = self.tile_layout()
+        self.pw = cols * self.tile_w + (cols - 1) * gap
+        self.ph = rows * self.tile_h + (rows - 1) * gap
         self.paper_aspect = self.pw / self.ph
         self.ax_prev.set_box_aspect(self.ph / self.pw)
         self.canvas_prev.draw_idle()
@@ -2977,6 +3094,81 @@ class PlotterApp(QMainWindow):
                 self.update_paper_plot()
             return
         if self.last_drag_coords: self.process_selection(*self.last_drag_coords)
+
+    # --- TILES (one map over several pages) ---
+    def tile_layout(self):
+        """(columns, rows, gap mm). (1, 1, 0) when the plot is a single page."""
+        if not hasattr(self, 'spin_tile_cols'):
+            return 1, 1, 0.0
+        cols, rows = self.spin_tile_cols.value(), self.spin_tile_rows.value()
+        gap = self.spin_tile_gap.value() if cols * rows > 1 else 0.0
+        return cols, rows, gap
+
+    def is_tiled(self):
+        c, r, _ = self.tile_layout()
+        return c * r > 1
+
+    def tile_rects(self):
+        """[(label, (x0, y0, w, h))] in paper mm over the whole mosaic (origin bottom-left); row 1 is the top."""
+        cols, rows, gap = self.tile_layout()
+        if cols * rows <= 1:
+            return [(None, (0.0, 0.0, self.pw, self.ph))]
+        out = []
+        for r in range(rows):
+            for c in range(cols):
+                out.append((f"r{r + 1}c{c + 1}", (c * (self.tile_w + gap), (rows - 1 - r) * (self.tile_h + gap),
+                                                  self.tile_w, self.tile_h)))
+        return out
+
+    def _paper_frame(self):
+        return PaperFrame(self.current_view_extent, self.pw, self.ph, self.chk_circle.isChecked(), self.active_planet)
+
+    def _paper_rect_to_data(self, x0, y0, w, h):
+        """Paper-mm rectangle -> (X0, X1, Y0, Y1) in data coordinates."""
+        pts = self._paper_frame().to_data([[x0, y0], [x0 + w, y0 + h]])
+        return float(pts[0, 0]), float(pts[1, 0]), float(pts[0, 1]), float(pts[1, 1])
+
+    def _draw_tile_overlay(self):
+        """Preview: shades the gaps between pages and outlines each page."""
+        if not self.is_tiled() or not self.current_view_extent:
+            return
+        cols, rows, gap = self.tile_layout()
+        shade = '#B9B1A3'
+        if gap > 0:
+            for c in range(1, cols):
+                X0, X1, Y0, Y1 = self._paper_rect_to_data(c * (self.tile_w + gap) - gap, 0, gap, self.ph)
+                self.ax_prev.add_patch(patches.Rectangle((X0, Y0), X1 - X0, Y1 - Y0, facecolor=shade, alpha=0.85,
+                                                         edgecolor='none', zorder=16))
+            for r in range(1, rows):
+                X0, X1, Y0, Y1 = self._paper_rect_to_data(0, r * (self.tile_h + gap) - gap, self.pw, gap)
+                self.ax_prev.add_patch(patches.Rectangle((X0, Y0), X1 - X0, Y1 - Y0, facecolor=shade, alpha=0.85,
+                                                         edgecolor='none', zorder=16))
+        cut = self.chk_tile_cut.isChecked()
+        for label, (x0, y0, w, h) in self.tile_rects():
+            X0, X1, Y0, Y1 = self._paper_rect_to_data(x0, y0, w, h)
+            self.ax_prev.add_patch(patches.Rectangle((X0, Y0), X1 - X0, Y1 - Y0, fill=False, zorder=17,
+                                                     edgecolor=ACCENT if cut else '#8A8173',
+                                                     linestyle='--', linewidth=1.0 if cut else 0.7))
+            self.ax_prev.text(X0 + 0.02 * (X1 - X0), Y1 - 0.03 * (Y1 - Y0), label.upper(), fontsize=7,
+                              color='#8A8173', va='top', ha='left', zorder=17)
+
+    @staticmethod
+    def _clip_lines(lines, box):
+        """Clips polylines (data coords) to a shapely box; rings fully inside stay closed."""
+        out = []
+        for ln in lines:
+            ln = np.asarray(ln, dtype=float)
+            if len(ln) < 2:
+                continue
+            g = LineString(ln)
+            if box.contains(g):
+                out.append(ln)
+                continue
+            inter = g.intersection(box)
+            for part in getattr(inter, 'geoms', [inter]):
+                if part.geom_type == 'LineString' and len(part.coords) >= 2:
+                    out.append(np.asarray(part.coords))
+        return out
 
     def change_paper(self, name):
         self.paper_name = name;
@@ -3026,6 +3218,62 @@ class PlotterApp(QMainWindow):
         box.exec()
         if box.clickedButton() is b_open:
             QDesktopServices.openUrl(QUrl(url))
+
+    def start_ski_fetch(self, resort):
+        """Loads (downloading the first time) a resort's lifts/runs, fetches 30 m elevation for it if no
+        sharper elevation covers it yet, then frames the selection on the resort."""
+        if self.is_calculating:
+            self.lbl_status.setText("Busy - pick the resort again when the current job finishes.")
+            return
+        if self.chk_circle.isChecked():
+            self.chk_circle.setChecked(False)
+        self.is_calculating = True
+        self.btn_draw.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self._ski_job = _SkiFetch(resort)
+        self._ski_job.progress.connect(self.lbl_status.setText)
+        self._ski_job.done.connect(self._on_ski_ready)
+        self._ski_job.failed.connect(self._on_ski_failed)
+        self._ski_job.start()
+
+    def _ski_job_finished(self):
+        self.is_calculating = False
+        self.btn_draw.setEnabled(True)
+        self.progress_bar.setVisible(False)
+
+    def _on_ski_ready(self, resort, data, note):
+        self._ski_job_finished()
+        if self.selected_resort() != resort or self.active_planet != 'Earth':
+            return
+        x1, x2, y1, y2 = ski.frame_extent(data)
+        self.last_drag_coords = (x1, x2, y1, y2)
+        self.process_selection(x1, x2, y1, y2)
+        self.selector.set_visible(True)
+        px, py = (x2 - x1) * 1.5, (y2 - y1) * 1.5
+        self.draw_regional_overlays(redraw=False)
+        self.ax_map.set_xlim(x1 - px, x2 + px)
+        self.ax_map.set_ylim(y1 - py, y2 + py)
+        self.canvas_map.draw_idle()
+        n_runs = sum(f['kind'] == 'run' for f in data['features'])
+        n_lifts = sum(f['kind'] == 'lift' for f in data['features'])
+        self.lbl_status.setText(f"{resort}: {n_runs} runs, {n_lifts} lifts framed - click Draw Map." +
+                                (f" {note}" if note else ""))
+
+    def _on_ski_failed(self, resort, msg):
+        self._ski_job_finished()
+        QMessageBox.warning(self, "Ski resort", f"Could not load {resort}:\n\n{msg}\n\nCheck the internet "
+                                                "connection and pick the resort again.")
+
+    def ski_options(self):
+        def pen_if_ok(pid):
+            pen = self.pens.get(pid)
+            return pid if pen and pen_available(pid, pen) else None
+        return {'runs': self.chk_ski_runs.isChecked(), 'lifts': self.chk_ski_lifts.isChecked(),
+                'run_pen': self.combo_ski_run_pen.currentData() or 'base',
+                'lift_pen': self.combo_ski_lift_pen.currentData() or 'pen_1',
+                'by_difficulty': self.chk_ski_diff.isChecked(),
+                'difficulty_pens': {'easy': pen_if_ok('green_07'), 'intermediate': pen_if_ok('blue_07'),
+                                    'advanced': pen_if_ok('base'), 'expert': pen_if_ok('pen_1')}}
 
     def explain_missing_borders(self):
         """Once per session: why there are no country / state borders, and how to get them."""
@@ -3463,6 +3711,11 @@ class PlotterApp(QMainWindow):
             'deco_scale_units': (self.combo_scale_units, 'combo'),
             'show_sites': (self.chk_sites, 'check'), 'mask_text': (self.chk_mask_text, 'check'),
             'show_map_borders': (self.chk_borders, 'check'),
+            'ski_runs': (self.chk_ski_runs, 'check'), 'ski_lifts': (self.chk_ski_lifts, 'check'),
+            'tile_cols': (self.spin_tile_cols, 'value'), 'tile_rows': (self.spin_tile_rows, 'value'),
+            'tile_gap': (self.spin_tile_gap, 'value'), 'tile_cut': (self.chk_tile_cut, 'check'),
+            'ski_by_difficulty': (self.chk_ski_diff, 'check'),
+            'ski_run_pen': (self.combo_ski_run_pen, 'data'), 'ski_lift_pen': (self.combo_ski_lift_pen, 'data'),
         }
 
     def _get_widget_state(self):
@@ -3665,7 +3918,7 @@ class PlotterApp(QMainWindow):
             self._start_render(fresh=False)
         if planet == 'Solar System' and st.get('has_drawn'):
             self.start_mission_plot()
-        if planet == 'Image' and self.image_rgb is not None:
+        if planet == 'Image' and (self.image_rgb is not None or self.svg_layers is not None):
             self.start_image_plot(fresh=True)
         self.lbl_status.setText("Project loaded.")
 
@@ -4155,7 +4408,7 @@ class PlotterApp(QMainWindow):
     def _build_image_section(self, vbox):
         sec = self.sec_image = CollapsibleSection("Image")
         row = QHBoxLayout()
-        b_open = QPushButton("Open image…")
+        b_open = QPushButton("Open image / SVG…")
         b_open.clicked.connect(self.open_image)
         self.lbl_image_file = QLabel("No image loaded")
         self.lbl_image_file.setObjectName("hint")
@@ -4217,9 +4470,9 @@ class PlotterApp(QMainWindow):
         hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.table_image.setMinimumHeight(120)
         sec.add(self.table_image)
-        hint = QLabel("PNG / JPG / BMP / GIF. Transparent areas count as paper. Each traced colour gets its own layer "
-                      "and pen - right-click a layer in the Layers tab to change it too. Export SVG for cutting "
-                      "software, or G-code for the plotter.")
+        hint = QLabel("PNG / JPG / BMP / GIF are traced; transparent areas count as paper. SVG files (e.g. Inkscape) "
+                      "are used as drawn: every layer becomes a plot layer, scaled and centred on the page. Each "
+                      "layer gets its own pen - right-click a layer in the Layers tab to change it too.")
         hint.setObjectName("hint")
         hint.setWordWrap(True)
         sec.add(hint)
@@ -4240,6 +4493,16 @@ class PlotterApp(QMainWindow):
         self._update_image_controls()
 
     def _update_image_controls(self):
+        svg = self.svg_layers is not None
+        for w in (self.combo_image_mode.parentWidget(), self.slider_image_smooth.parentWidget().parentWidget(),
+                  self.chk_image_invert, self.lbl_image_colours, self.chk_image_fill, self.chk_image_cut,
+                  self.lbl_image_speck, self.lbl_image_edges, self.lbl_image_fill, self.lbl_image_cut):
+            w.setVisible(not svg)
+        self.table_image.setHorizontalHeaderLabels(["SVG layer" if svg else "Traced layer", "Pen"])
+        if self.image_mode:
+            self.btn_draw.setText("Place SVG" if svg else "Trace Image")
+        if svg:
+            return
         edges = self.combo_image_mode.currentText().startswith("Edges")
         for w in (self.lbl_image_colours, self.chk_image_fill, self.chk_image_cut, self.lbl_image_speck):
             w.setVisible(not edges)
@@ -4260,19 +4523,32 @@ class PlotterApp(QMainWindow):
 
     def open_image(self, path=None):
         if not path:
-            path, _ = QFileDialog.getOpenFileName(self, "Open image", os.path.dirname(self.image_path or "") or "",
-                                                  "Images (*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff *.webp)")
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Open image or SVG", os.path.dirname(self.image_path or "") or "",
+                "Images and SVG (*.svg *.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff *.webp);;SVG (*.svg)")
             if not path:
                 return
-        try:
-            rgb = IT.load_image(path)
-        except Exception as e:
-            QMessageBox.warning(self, "Image", f"Could not open the image:\n{e}")
-            return
-        self.image_path, self.image_rgb = path, rgb
+        if path.lower().endswith('.svg'):
+            try:
+                layers = svg_import.load_svg(path)
+            except Exception as e:
+                QMessageBox.warning(self, "SVG", f"Could not read the SVG:\n{type(e).__name__}: {e}")
+                return
+            self.image_path, self.image_rgb, self.svg_layers = path, None, layers
+            n = sum(len(l['polys']) for l in layers)
+            self.lbl_image_file.setText(f"{os.path.basename(path)}  ({len(layers)} layer(s), {n:,} paths)")
+        else:
+            try:
+                rgb = IT.load_image(path)
+            except Exception as e:
+                QMessageBox.warning(self, "Image", f"Could not open the image:\n{e}")
+                return
+            self.image_path, self.image_rgb, self.svg_layers = path, rgb, None
+            self.lbl_image_file.setText(f"{os.path.basename(path)}  ({rgb.shape[1]}×{rgb.shape[0]} px)")
         self._image_cache = {}
         self._image_pens = {}
-        self.lbl_image_file.setText(f"{os.path.basename(path)}  ({rgb.shape[1]}×{rgb.shape[0]} px)")
+        self._image_layers = []
+        self._update_image_controls()
         if self.combo_subject.currentText() != 'Image':
             self.combo_subject.setCurrentText('Image')     # -> switch_planet -> _enter_image_mode
         else:
@@ -4286,16 +4562,26 @@ class PlotterApp(QMainWindow):
         self.active_planet = 'Image'
         self.context_ui_update()
         self._draw_image_overview()
-        self.lbl_status.setText("Image: click 'Open image…' in the Image section." if self.image_rgb is None
-                                else "Image: click Trace Image.")
-        if self.image_rgb is not None and not self._loading:
+        has_src = self.image_rgb is not None or self.svg_layers is not None
+        self.lbl_status.setText("Image: click 'Open image / SVG…' in the Image section." if not has_src
+                                else f"Image: click {self.btn_draw.text()}.")
+        if has_src and not self._loading:
             self.start_image_plot(fresh=True)
 
     def _draw_image_overview(self):
         ax = self.ax_map
         ax.clear()
         style_axes(self.fig_map, ax)
-        if self.image_rgb is not None:
+        if self.svg_layers is not None:
+            ax.set_facecolor('#F4F1EA')                 # paper-like, so black layers stay visible
+            for l in self.svg_layers:
+                ax.add_collection(LineCollection(l['polys'], colors=[l['color']], linewidths=0.6))
+            x0, y0, x1, y1 = svg_import.bounds(self.svg_layers)
+            ax.set_xlim(x0, x1)
+            ax.set_ylim(y1, y0)                         # SVG y points down
+            ax.set_aspect('equal')
+            ax.set_title(os.path.basename(self.image_path or ""), fontsize=8, color='#8A93A8')
+        elif self.image_rgb is not None:
             ax.imshow(self.image_rgb, origin='upper', interpolation='bilinear')
             ax.set_title(os.path.basename(self.image_path or ""), fontsize=8, color='#8A93A8')
         else:
@@ -4311,6 +4597,14 @@ class PlotterApp(QMainWindow):
 
     def start_image_plot(self, fresh=False):
         if not self.image_mode or self.calibration_mode or self._loading:
+            return
+        if self.svg_layers is not None:
+            # vector artwork: no tracing - fit the layers to the page and plot them
+            self._image_layers, scale = svg_import.fit_layers(self.svg_layers, self.pw, self.ph,
+                                                              self.slider_image_size.value())
+            self._image_info = {'svg_scale': scale}
+            self._fill_image_table()
+            self.update_image_plot(fresh=fresh or not self.has_drawn)
             return
         if self.image_rgb is None:
             self.open_image()
@@ -4563,7 +4857,7 @@ class PlotterApp(QMainWindow):
 
     # Layers made of lettering / fine marks: exported without vpype's simplify, merge and 2 mm length filter
     # (those would delete the short strokes that make up small letters, dots and degree signs).
-    FINE_LAYERS = ('decor', 'sites', 'calibration', 'labels', 'markers', 'trajectory', 'belt')
+    FINE_LAYERS = ('decor', 'sites', 'calibration', 'labels', 'markers', 'trajectory', 'belt', 'ski_lifts')
 
     def _lines_for_pen(self, p_id, text_boxes, split=False):
         """All plot lines (in data coords) for one pen, with text blanking applied.
@@ -4588,10 +4882,25 @@ class PlotterApp(QMainWindow):
                 fine.extend(self.text_item_polys(item)[0])
         return (lines, fine, one_way) if split else lines + fine
 
+    @staticmethod
+    def _export_figure(w_mm, h_mm):
+        """Blank export figure. Its background patch is hidden: in the SVG it is a page-sized rectangle,
+        which vpype would read as a stroke and draw (with every pen) along the paper's edge."""
+        fig = Figure(figsize=(w_mm / 25.4, h_mm / 25.4))
+        fig.patch.set_visible(False)
+        ax = fig.add_axes([0, 0, 1, 1])
+        ax.axis('off')
+        return fig, ax
+
     def _make_export_axes(self):
-        export_fig = Figure(figsize=(self.pw / 25.4, self.ph / 25.4))
-        export_ax = export_fig.add_axes([0, 0, 1, 1])
-        export_ax.axis('off')
+        tile = getattr(self, '_export_tile', None)
+        if tile:
+            # one page of a tiled plot: exactly that page's part of the map, at the same scale
+            export_fig, export_ax = self._export_figure(tile['w'], tile['h'])
+            export_ax.set_xlim(*tile['xlim'])
+            export_ax.set_ylim(*tile['ylim'])
+            return export_fig, export_ax
+        export_fig, export_ax = self._export_figure(self.pw, self.ph)
         if self.chk_circle.isChecked():
             R_p = PLANET_RADII.get(self.active_planet, 6371000.0)
             export_ax.set_aspect('equal')
@@ -4650,13 +4959,19 @@ class PlotterApp(QMainWindow):
             rows.append({'pen_id': p_id, 'name': pen['name'], 'color': pen['color'], 'strokes': n,
                          'feed': pen.get('feed', exporter.DEFAULT_DRAW_FEED)})
         mx, my = exporter.max_plot_area()
-        note = (f"Paper {self.pw:g} x {self.ph:g} mm. With the G28 + G92 (-{exporter.GCODE_OFFSET_MM[0]:g}, "
+        note = (f"Paper {self.tile_w:g} x {self.tile_h:g} mm. With the G28 + G92 (-{exporter.GCODE_OFFSET_MM[0]:g}, "
                 f"-{exporter.GCODE_OFFSET_MM[1]:g}) header the reachable plot area is about {mx:g} x {my:g} mm "
                 f"(edit BED_MM in config.py if your bed differs).")
-        if self.pw > mx + 1e-6 or self.ph > my + 1e-6:
+        if self.tile_w > mx + 1e-6 or self.tile_h > my + 1e-6:
             note = "⚠ " + note + " This paper size is larger than that - check the bed check after export."
+        if self.is_tiled():
+            cols, rws, gap = self.tile_layout()
+            note = (f"Tiled: {cols} \u00d7 {rws} pages of {self.tile_w:g} \u00d7 {self.tile_h:g} mm"
+                    f"{f', {gap:g} mm gaps' if gap else ''} - one set of G-code per page. " + note)
         dlg = ExportDialog(rows, lambda pid, feed: self.estimate_pen_minutes(pid, feed), note, self,
-                           lift_mm=getattr(self, 'pen_lift_mm', None))
+                           lift_mm=getattr(self, 'pen_lift_mm', None),
+                           cutout=self.is_tiled() and self.chk_tile_cut.isChecked(),
+                           tiles=len(self.tile_rects()))
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         st = dlg.settings()
@@ -4708,15 +5023,43 @@ class PlotterApp(QMainWindow):
         dir_path = os.path.dirname(base_filepath)
         base_name = os.path.splitext(os.path.basename(base_filepath))[0]
         text_boxes = self._text_mask_boxes()
-        sx, sy = self._paper_mm_per_data_unit()
+        files, skipped, empty_tiles = [], [], []
+        for label, (x0, y0, w, h) in self.tile_rects():
+            if label:
+                X0, X1, Y0, Y1 = self._paper_rect_to_data(x0, y0, w, h)
+                self._export_tile = {'w': w, 'h': h, 'xlim': (X0, X1), 'ylim': (Y0, Y1),
+                                     'box': shp_box(min(X0, X1), min(Y0, Y1), max(X0, X1), max(Y0, Y1))}
+            try:
+                per_pen, skip = self._build_pen_bodies(st, text_boxes, w, h, label)
+            finally:
+                self._export_tile = None
+            skipped += [s for s in skip if s not in skipped]
+            if not per_pen:
+                if label:
+                    empty_tiles.append(label.upper())
+                continue
+            files += self._gcode_files(st, per_pen, dir_path, base_name + (f"_{label}" if label else ""),
+                                       label.upper() if label else "")
+        if not files:
+            QMessageBox.warning(self, "No Data", "No vector elements found for the selected pens.")
+            self.lbl_status.setText("Ready.")
+            return
+        self._write_gcode_files(st, files, skipped, empty_tiles)
 
+    def _build_pen_bodies(self, st, text_boxes, page_w, page_h, label=None):
+        """Wrapped G-code body per pen for the whole plot, or for one page of a tiled plot (self._export_tile).
+        Returns (per_pen [(pen_id, body)], skipped pen names)."""
+        sx, sy = self._paper_mm_per_data_unit()
+        tile = getattr(self, '_export_tile', None)
         per_pen = []          # (pen_id, wrapped gcode body)
         skipped = []          # pens whose strokes all vanished in the clean-up (nothing to draw)
         for p_id, feed in st['pens']:
             pen = self.pens[p_id]
-            self.lbl_status.setText(f"Optimising {pen['name']}...")
+            self.lbl_status.setText(f"Optimising {pen['name']}" + (f" (page {label.upper()})" if label else "") + "...")
             QApplication.processEvents()
             lines, fine, one_way = self._lines_for_pen(p_id, text_boxes, split=True)
+            if tile:
+                lines, fine, one_way = (self._clip_lines(x, tile['box']) for x in (lines, fine, one_way))
             has_dots = any(it.get('type') == 'stipple' and it['pen_id'] == p_id and self.is_visible(it)
                            for it in self.dem_segments)
             lengths = [float(np.sum(np.hypot(np.diff(np.asarray(ln)[:, 0]) * sx, np.diff(np.asarray(ln)[:, 1]) * sy)))
@@ -4757,19 +5100,17 @@ class PlotterApp(QMainWindow):
             # Card cut-out: the drag knife traces the sheet's outer edge, after everything else (its own
             # tool-change pause in a combined file, its own file otherwise).
             cut_feed = st['feeds'].get('cutter') or self.pens.get('cutter', {}).get('feed', exporter.DEFAULT_DRAW_FEED)
-            cut = exporter.cutout_body(self.pw, self.ph, cut_feed, exporter.TRAVEL_FEED, lift_mm=st['lift_mm'])
+            cut = exporter.cutout_body(page_w, page_h, cut_feed, exporter.TRAVEL_FEED, lift_mm=st['lift_mm'])
             for i, (p_id, body) in enumerate(per_pen):
                 if p_id == 'cutter':
                     per_pen[i] = (p_id, body + cut)
                     break
             else:
                 per_pen.append(('cutter', cut))
+        return per_pen, skipped
 
-        if not per_pen:
-            QMessageBox.warning(self, "No Data", "No vector elements found for the selected pens.")
-            self.lbl_status.setText("Ready.")
-            return
-
+    def _gcode_files(self, st, per_pen, dir_path, base_name, page=""):
+        """[(path, label, gcode lines)] for one page: one combined file or one file per pen."""
         files = []
         if st['combine']:
             names = [self.pens[p]['name'] for p, _ in per_pen]
@@ -4780,15 +5121,18 @@ class PlotterApp(QMainWindow):
                 g += body
             g += exporter.footer("Plot complete!")
             path = f"{dir_path}/{base_name}_all_pens.gcode"
-            files.append((path, "All pens (with pauses)", g))
+            files.append((path, (f"Page {page}: " if page else "") + "All pens (with pauses)", g))
         else:
             for order_no, (p_id, body) in enumerate(per_pen, start=1):
                 pen = self.pens[p_id]
                 safe = re.sub(r'_+', '_', "".join(c if c.isalnum() else "_" for c in pen['name'])).strip('_')
                 g = exporter.header(f"START ROUTINE: {pen['name']}", lift_mm=st['lift_mm']) + body + \
                     exporter.footer(f"{pen['name']} Complete!")
-                files.append((f"{dir_path}/{order_no:02d}_{safe}_{base_name}.gcode", pen['name'], g))
+                files.append((f"{dir_path}/{order_no:02d}_{safe}_{base_name}.gcode",
+                              (f"Page {page}: " if page else "") + pen['name'], g))
+        return files
 
+    def _write_gcode_files(self, st, files, skipped, empty_tiles=()):
         report, total, problems = [], 0.0, []
         for path, label, g in files:
             try:
@@ -4810,6 +5154,8 @@ class PlotterApp(QMainWindow):
                + "\n".join(report))
         if skipped:
             msg += "\n\nNo file for " + ", ".join(skipped) + " - nothing left to draw after clean-up."
+        if empty_tiles:
+            msg += "\n\nNothing to plot on page(s) " + ", ".join(empty_tiles) + " - no file for them."
         if problems:
             msg += ("\n\n⚠ BED CHECK: these moves go outside the reachable area - the plotter would hit its "
                     "limits:\n" + "\n".join(problems) +

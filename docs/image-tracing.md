@@ -15,6 +15,18 @@ for stickers.
    section, or **right-click the layer** in the Layers panel.
 4. Export as usual. Choose **Save SVG** for cutting software or **Export G-code** for the plotter.
 
+## SVG files (vector artwork)
+
+**Open image / SVG…** also opens `.svg` files. Nothing is traced: the vector paths are used as they are.
+
+- Every **layer** in the SVG (an Inkscape layer, or a top-level group) becomes a plot layer with its own
+  pen. The pen starts as the in-stock pen closest to the layer's stroke colour; change it in the table or
+  by right-clicking the layer.
+- The artwork is scaled to fit the sheet (with a 4 mm margin) and centred, keeping its proportions.
+  **Size on the page** shrinks it from there. The button under the sidebar reads **Place SVG**.
+- Curves are converted to short straight segments (0.1 mm). Fills are ignored: only outlines are drawn,
+  so add hatching in your drawing program if you want filled areas.
+
 ## Methods
 
 ### Outlines (logos, clip-art)

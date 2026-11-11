@@ -41,16 +41,18 @@ BUILTIN_PRESETS = {
 # Colourways: paper colour + every pen choice, switched in one go (Paper > Colourway).
 COLORWAYS_FILE = "colorways.json"
 COLORWAY_KEYS = ['paper_color', 'contour_pen', 'index_pen', 'water_pen', 'border_pen', 'mono_pen', 'deco_pen',
-                 'mission_pen_labels', 'mission_pen_orbits', 'mission_pen_belt']
+                 'mission_pen_labels', 'mission_pen_orbits', 'mission_pen_belt', 'ski_run_pen', 'ski_lift_pen']
 BUILTIN_COLORWAYS = {
     "Light paper \u00b7 black G2 (thin / thick)": {
         'paper_color': '#FFFFFF', 'contour_pen': 'base', 'index_pen': 'pen_1', 'water_pen': 'base',
         'border_pen': 'pen_1', 'mono_pen': 'pen_1', 'deco_pen': 'base',
-        'mission_pen_labels': 'base', 'mission_pen_orbits': 'base', 'mission_pen_belt': 'base'},
+        'mission_pen_labels': 'base', 'mission_pen_orbits': 'base', 'mission_pen_belt': 'base',
+        'ski_run_pen': 'base', 'ski_lift_pen': 'pen_1'},
     "Dark paper \u00b7 white gel 0.3 / 0.4": {
         'paper_color': '#1C1C1C', 'contour_pen': 'white_gr05', 'index_pen': 'white_gr08',
         'water_pen': 'white_gr05', 'border_pen': 'white_gr08', 'mono_pen': 'white_gr08', 'deco_pen': 'white_gr05',
-        'mission_pen_labels': 'white_gr05', 'mission_pen_orbits': 'white_gr05', 'mission_pen_belt': 'white_gr05'},
+        'mission_pen_labels': 'white_gr05', 'mission_pen_orbits': 'white_gr05', 'mission_pen_belt': 'white_gr05',
+        'ski_run_pen': 'white_gr05', 'ski_lift_pen': 'white_gr08'},
 }
 
 

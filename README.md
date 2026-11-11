@@ -32,6 +32,12 @@ using real pen colours, white pen on black paper, and Voyager 2's path from NASA
 - **Solar System mode.** Plot real trajectories of 17 deep-space missions (Voyager, Pioneer, Cassini,
   New Horizons, Juno, Parker Solar Probe and more), downloaded from NASA JPL Horizons, on a compressed
   scale with orbits, year markers, labels and a stippled asteroid belt.
+- **Ski resorts.** Grand Targhee, Deer Valley and Sundance runs and lifts from OpenStreetMap, overlaid on
+  30 m contours, with runs optionally coloured by difficulty.
+- **Large plots on several pages.** Split a map across a grid of sheets, with an optional gap between the
+  mounted pages and a cut-out of each page; every page gets its own set of G-code files.
+- **SVG import.** Open multi-layer SVG artwork: each layer gets its own pen, scaled and centred on the
+  paper.
 - **Image tracing.** Trace logos and clip-art into clean colour outlines, with optional hatch fill and an
   offset sticker cut line. Photos can be turned into edge drawings.
 - **Hand edits.** Paint strokes with a different pen, draw lines, add and rotate text, and recolour a
@@ -113,6 +119,7 @@ MoonPlotter/              repository root
     ├── *.py              engines: contours, hatching, decorations, missions, image tracing, export...
     ├── missions/         cached JPL Horizons trajectories
     ├── regions/          downloaded or imported regional rasters (created on demand)
+    ├── ski_resorts/      OpenStreetMap ski runs and lifts for the Ski resorts regions
     ├── projects/         saved projects (*.topo.json): the default save and open folder
     └── tests/            unit tests (python tests/test_engines.py)
 ```
@@ -134,5 +141,6 @@ The app downloads or uses public datasets. Please credit them when you share plo
 - Moon: NASA Goddard SVS CGI Moon Kit (LRO LOLA elevation, LROC colour); USGS LOLA/Kaguya merge.
 - Mars: USGS Astrogeology (MGS MOLA, Viking colour, HRSC/MOLA blend).
 - Borders: Natural Earth (public domain).
+- Ski runs and lifts: © OpenStreetMap contributors (ODbL).
 - Spacecraft trajectories: NASA JPL Horizons System.
 - Lettering: Hershey single-stroke fonts, via vpype.

@@ -9,7 +9,7 @@ from ui_widgets import swatch_icon
 class ExportDialog(QDialog):
     """rows: list of dicts {pen_id, name, color, strokes, minutes, feed}. Read the result with settings()."""
 
-    def __init__(self, rows, estimate_fn, plot_area_note, parent=None, lift_mm=None):
+    def __init__(self, rows, estimate_fn, plot_area_note, parent=None, lift_mm=None, cutout=False, tiles=1):
         super().__init__(parent)
         self.setWindowTitle("Export G-code")
         self.setMinimumWidth(620)
@@ -62,7 +62,9 @@ class ExportDialog(QDialog):
         self.chk_combine = QCheckBox("One combined file with a pause (M0) to swap pens between colours")
         self.chk_combine.setToolTip("Keeps the same home position for every pen - no re-homing between pens.")
         v.addWidget(self.chk_combine)
-        self.chk_cutout = QCheckBox("Cut out the card at the end (drag knife traces the paper's outer edge)")
+        self.chk_cutout = QCheckBox("Cut out the card at the end (drag knife traces the paper's outer edge)" if tiles <= 1
+                                    else f"Cut out each of the {tiles} pages at the end (drag knife, page edges)")
+        self.chk_cutout.setChecked(bool(cutout))
         self.chk_cutout.setToolTip("Adds a last tool: pause (M0) to load the cutter blade, then cut round the sheet\n"
                                    "with a small loop outside each corner. Blade depth: CUTTER_Z_OFFSET_MM in config.py.")
         self.chk_cutout.toggled.connect(self._update_total)

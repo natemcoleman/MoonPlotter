@@ -46,6 +46,12 @@ Other source options:
 - **Clip to region** (Earth only, needs `geopandas`): type a country or US state. The map is clipped to its
   outline. **Lake Tahoe (High-Res Bathymetry)** uses the bundled 10 m lake-bed model with a fixed
   75 ft interval.
+- **Ski resorts** (in the same **Clip to region** list): Grand Targhee, Deer Valley and Sundance. Choosing
+  one frames the resort and overlays its **ski runs** and **lifts** (from OpenStreetMap) on the contours,
+  each on its own layer and pen. Lifts are drawn with small tick marks for the towers. **Colour runs by
+  difficulty** puts green / blue / black / double-black runs on matching pens when you have them in stock.
+  The first time you pick a resort, the app also fetches 30 m elevation for the area around it (needs an
+  internet connection once). See [Data sources](data-sources.md#ski-resorts).
 - **Circle mode (whole hemisphere)**: plots a full disc of the globe. Drag on the map to turn it.
 - **Show points of interest**: markers for landing sites, mountains, craters and other good subjects.
   Hover a marker for details. Click it to add it to the plot (a filled marker means it is plotted).
@@ -72,6 +78,12 @@ window is downloaded, and it is used automatically whenever a selection falls in
   also choose a custom colour. The preview shows the sheet in this colour. Colour fills plan their ink mix
   for it, and the app warns you when a contour pen would barely show on it. See
   [Pens and paper](pens-and-paper.md).
+- **Split into pages (tiles)**: plot one map across several sheets. Set how many pages **across** and
+  **down**; each page is the paper size above, so the map covers the whole mosaic at that scale. **Gap** is
+  the space you will leave between the mounted pages: the map skips that strip so features line up across
+  it. The preview shades the gaps and labels each page (R1C1 is the top-left). **Cut lines** outlines the
+  pages in the preview and ticks **Cut out each page** in the export dialog. G-code export then writes a
+  full set of files for every page, named with its page label, e.g. `01_Thin_G2_Black_mymap_r1c2.gcode`.
 
 ## Contours
 

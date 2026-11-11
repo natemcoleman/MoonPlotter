@@ -15,6 +15,7 @@ from contour_engine import generate_contours, auto_contour_interval
 from hatch_engine import generate_hatches, srgb_to_linear, linear_to_srgb
 from sites import site_segments
 from regions import UNIT_MULT
+import ski
 
 COLOR_PX_PER_MM = 4.0      # colour map resolution requested for hatching (0.25 mm / px)
 MAX_COLOR_PX = 4000
@@ -231,6 +232,7 @@ class RenderWorker(QThread):
         return out
 
     def _read_dem_file(self, lon_min, lon_max, lat_min, lat_max, is_tahoe, max_px=MAX_DEM_PX):
+        regional = self.params.get('regional_dem')
         if is_tahoe:
             mult = TAHOE['multiplier']
             dem, ext, k = read_dem_window(self.dem_path, TAHOE['bounds'], lon_min, lon_max, lat_min, lat_max,
@@ -300,6 +302,13 @@ class RenderWorker(QThread):
             if self.params.get('sites'):
                 segments += site_segments(self.planet, set(self.params['sites']), extent, self.params,
                                           label=self.params.get('site_labels', True))
+
+            # ---------------- Ski resort lifts / runs (OpenStreetMap) ----------------
+            if self.params.get('ski_resort') and not self.params.get('circle_mode'):
+                self.progress.emit("Adding ski lifts and runs...")
+                data = ski.load(self.params['ski_resort'], progress=self.progress.emit)
+                segments += ski.segments(data, extent, float(self.params.get('paper_w_mm', 100.0)),
+                                         float(self.params.get('paper_h_mm', 100.0)), self.params.get('ski_opts') or {})
 
             result['segments'] = segments
             self.result_ready.emit(result)

@@ -55,6 +55,7 @@ Everything the app needs that is not in the repository, and how it gets it:
 | Natural Earth borders (`natural_earth/`) | Earth borders, **Clip to region** | Downloaded automatically on first start (see above) |
 | Earth elevation `BE_dem_v2.tif` | Earth maps | Manual download (table above); selecting Earth without it shows the link |
 | Mars files | Mars | Manual download (table above); Mars stays disabled until they exist |
+| Ski resort runs and lifts (`ski_resorts/*.json`) | **Clip to region › Ski resorts** | In the repo. If a file is deleted, it is downloaded again from OpenStreetMap the next time you pick that resort (see [Ski resorts](#ski-resorts)) |
 | Overviews (`<dem>.tif.ovr`) | faster big areas and circle mode (optional) | **Tools › Speed up global elevation (one time)**, or `python MoonPlotter/dem_prep.py`. The app suggests it on the status line when a large global DEM has none. The original `.tif` is not changed. |
 
 Regional data, missions and pens are fetched or created while you use the app.
@@ -104,6 +105,28 @@ certificate in certificate chain"). When that happens, the app retries with the 
 it is installed, then with Windows' own `curl.exe`, then with PowerShell. These use the system
 certificate store. If downloads still fail, run `pip install truststore`.
 
+## Ski resorts
+
+The **Ski resorts** entries in **Clip to region** overlay ski runs and lifts on the contours. The data
+comes from [OpenStreetMap](https://www.openstreetmap.org/) through the
+[Overpass API](https://overpass-api.de/):
+
+- runs: ways tagged `piste:type=downhill` (their `piste:difficulty` sets the pen when **Colour runs by
+  difficulty** is on),
+- lifts: ways tagged `aerialway=*`,
+- the resort boundary: the `landuse=winter_sports` area whose name matches the resort. Only runs and
+  lifts on or near it are kept, so neighbouring resorts don't leak in.
+
+The three resorts are saved in `MoonPlotter/ski_resorts/` (about 60–220 kB each) and are part of the
+repository, so they work offline. If a file is missing, the app downloads it again (it tries
+overpass-api.de, then two public mirrors); delete a file to refresh it with newer OSM edits. Resorts are
+defined in `RESORTS` in `ski.py`: add one with its name, centre, search radius and a word from its OSM
+name.
+
+The first time you choose a resort, the app also fetches **30 m Copernicus elevation** for a box about
+three times the size of the resort, so you can pan, zoom out or split the map into pages and stay on
+sharp data. It is stored in `regions/` like any other fetched area.
+
 ## Licences and credits
 
 | Data | Licence / terms |
@@ -113,5 +136,6 @@ certificate store. If downloads still fail, run `pip install truststore`.
 | Sentinel-2 cloudless (EOX) | **CC BY-NC-SA 4.0: non-commercial use only.** Credit: "Sentinel-2 cloudless by EOX IT Services GmbH (Contains modified Copernicus Sentinel data 2024)". Don't sell plots made with it. |
 | GEBCO | Public domain, with attribution to the GEBCO Compilation Group |
 | Natural Earth | Public domain |
+| OpenStreetMap (ski runs and lifts) | [ODbL 1.0](https://www.openstreetmap.org/copyright). Credit "© OpenStreetMap contributors" on plots you share. |
 
 Check each provider's current terms before using plots commercially.
