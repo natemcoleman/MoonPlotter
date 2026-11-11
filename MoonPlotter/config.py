@@ -44,14 +44,14 @@ MIN_SEGMENT_MM = 2.0
 
 # Auto contour interval: pick the smallest "nice" interval that gives at most
 # this many contour levels across the selection's relief.
-AUTO_CONTOUR_TARGET_LINES = 20
+AUTO_CONTOUR_TARGET_LINES = 40
 NICE_INTERVALS_FT = [1, 2, 5, 10, 20, 25, 40, 50, 80, 100, 200, 250, 400, 500, 800, 1000,
                      2000, 2500, 4000, 5000, 10000, 20000, 25000, 50000]
 
 # Longest side (pixels) of the DEM array handed to the contour engine. Larger
 # windows are block-averaged down. 4000 px is ~20 px/mm on a 200 mm plot.
-# MAX_DEM_PX = 4000
-MAX_DEM_PX = 8192
+MAX_DEM_PX = 4000
+# MAX_DEM_PX = 8192
 
 # ==========================================
 # HATCHING / COLOR SEPARATION
@@ -83,6 +83,8 @@ PAPER_COLORS = {
     'Pink': '#EC4E9A',
 }
 DEFAULT_PAPER = 'White'
+# Paper colours listed first (above a divider) in the paper-colour drop-down.
+FAVORITE_PAPER_COLORS = ('White', 'Black')
 DEFAULT_MONO_PEN = 'pen_1'
 TOOL_PEN_IDS = {'cutter'}            # never offered as an ink
 
@@ -104,6 +106,11 @@ def pen_available(pen_id, pen):
     return pen_id not in TOOL_PEN_IDS and bool(pen.get('available', True))
 
 
+def pen_favorite(pen):
+    """Favourite pens float to the top of every pen drop-down (tick 'Fav.' in Tools > Pens)."""
+    return bool(pen.get('favorite', False))
+
+
 DEFAULT_HATCH_SPACING_MM = 1.0
 
 # ==========================================
@@ -116,12 +123,18 @@ BED_MM = (235.0, 235.0)
 GCODE_OFFSET_MM = (38.0, 18.0)
 DEFAULT_DRAW_FEED = 1200.0      # mm/min, pen down
 TRAVEL_FEED = 3000.0            # mm/min, pen up
-PEN_LIFT_MM = 3.5               # pen-up height above the paper between strokes (was 1.0); the export dialog can override it
+# PEN_LIFT_MM = 3.5               # pen-up height above the paper between strokes (was 1.0); the export dialog can override it
+PEN_LIFT_MM = 2.5               # pen-up height above the paper between strokes (was 1.0); the export dialog can override it
 # Height of the drawing plane (pen down, Z0) above the homed Z position. The header declares the homed
 # head to be at Z = -PEN_DOWN_ABOVE_HOME_MM. Raise it if the pen drags or hits the plate; lower it if
 # lines come out faint. (Was 4.0; raised 1.5 mm after the pen caught the plate edge.)
-# PEN_DOWN_ABOVE_HOME_MM = 5.5
-PEN_DOWN_ABOVE_HOME_MM = 2.5 #this is for cutter, should raise for other pens
+# This is the plane for the PENS. The drag-knife cutter has its own depth: CUTTER_Z_OFFSET_MM below.
+# (Previous values: 2.5 and 3.5 were cutter settings; 5.5 was the last pen setting.)
+PEN_DOWN_ABOVE_HOME_MM = 5.5
+# Drag-knife cutter ('cutter' pen): blade-down Z relative to the pen drawing plane (Z0). Negative = deeper.
+# -2.0 puts the blade at 3.5 mm above home, the cutter height used before this setting existed. The cutter
+# is plotted last, after its own M0 tool-change pause; pen-up height and travel moves are unchanged.
+CUTTER_Z_OFFSET_MM = -2.0
 # Clearance used for long moves: leaving home for the start point, parking and pen changes.
 SAFE_Z_MM = 5.5
 # SAFE_Z_MM = 0.5
@@ -136,8 +149,8 @@ REGIONS_DIR = "regions"
 # ==========================================
 def default_pens():
     return {
-        'base': {'id': 'base', 'name': 'Thin G2 Black', 'color': '#000000', 'width': 0.38},
-        'pen_1': {'id': 'pen_1', 'name': 'Thick G2 Black', 'color': '#000000', 'width': 0.7},
+        'base': {'id': 'base', 'name': 'Thin G2 Black', 'color': '#000000', 'width': 0.38, 'favorite': True},
+        'pen_1': {'id': 'pen_1', 'name': 'Thick G2 Black', 'color': '#000000', 'width': 0.7, 'favorite': True},
         'blue_038': {'id': 'blue_038', 'name': 'Thin Blue G2 (0.38)', 'color': '#0000B2', 'width': 0.38},
         'red_038': {'id': 'red_038', 'name': 'Thin Red G2 (0.38)', 'color': '#E32636', 'width': 0.38},
         'pink_07': {'id': 'pink_07', 'name': 'Thick Pink G2 (0.7)', 'color': '#FF1493', 'width': 0.70},
@@ -149,13 +162,14 @@ def default_pens():
         'green_07': {'id': 'green_07', 'name': 'Thick Green G2 (0.7)', 'color': '#16934A', 'width': 0.70},
         'yellow_07': {'id': 'yellow_07', 'name': 'Thick Yellow G2 (0.7)', 'color': '#F3DA2C', 'width': 0.70},
         'purple_07': {'id': 'purple_07', 'name': 'Thick Purple G2 (0.7)', 'color': '#6A2C9E', 'width': 0.70},
-        # Sakura Gelly Roll Classic White - opaque, for dark paper
+        # Sakura Gelly Roll Classic White - opaque, for dark paper. The pigment ink skips if the pen moves
+        # too fast, so each size has its own slower feed (mm/min); plotter_pens.json holds the live values.
         'white_gr05': {'id': 'white_gr05', 'name': 'White Gelly Roll 05 (0.3)', 'color': '#F6F6F2',
-                       'width': 0.30, 'opacity': 0.85},
+                       'width': 0.30, 'opacity': 0.85, 'feed': 800, 'favorite': True},
         'white_gr08': {'id': 'white_gr08', 'name': 'White Gelly Roll 08 (0.4)', 'color': '#F6F6F2',
-                       'width': 0.40, 'opacity': 0.85},
+                       'width': 0.40, 'opacity': 0.85, 'feed': 650, 'favorite': True},
         'white_gr10': {'id': 'white_gr10', 'name': 'White Gelly Roll 10 (0.5)', 'color': '#F6F6F2',
-                       'width': 0.50, 'opacity': 0.85},
+                       'width': 0.50, 'opacity': 0.85, 'feed': 500},
         'cutter': {'id': 'cutter', 'name': 'Cutter Blade', 'color': '#0000FF', 'width': 0.1}
     }
 

@@ -252,13 +252,17 @@ def generate_contours(dem_crop, data_extent, view_extent, params, progress_callb
                 append_border(line.coords)
 
         elif "None" in selected_region:
+            # Clip to the selection's latitudes as well as its longitudes: borders above / below the sheet
+            # are off the paper, but used to be kept and gave the border pen an (invisible) G-code layer.
+            # Circle mode shows the whole hemisphere, so it keeps the full latitude range.
+            lat0, lat1 = (-90, 90) if is_circle else (max(-90.0, data_extent[2]), min(90.0, data_extent[3]))
             view_boxes = []
             if data_extent[0] < -180:
-                view_boxes.extend([shp_box(data_extent[0] + 360, -90, 180, 90), shp_box(-180, -90, data_extent[1], 90)])
+                view_boxes.extend([shp_box(data_extent[0] + 360, lat0, 180, lat1), shp_box(-180, lat0, data_extent[1], lat1)])
             elif data_extent[1] > 180:
-                view_boxes.extend([shp_box(data_extent[0], -90, 180, 90), shp_box(-180, -90, data_extent[1] - 360, 90)])
+                view_boxes.extend([shp_box(data_extent[0], lat0, 180, lat1), shp_box(-180, lat0, data_extent[1] - 360, lat1)])
             else:
-                view_boxes.append(shp_box(data_extent[0], -90, data_extent[1], 90))
+                view_boxes.append(shp_box(data_extent[0], lat0, data_extent[1], lat1))
 
             for v_box in view_boxes:
                 minx, miny, maxx, maxy = v_box.bounds

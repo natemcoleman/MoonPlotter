@@ -7,9 +7,24 @@ feed rates, optional settle dwell and pen-change pauses.
 import numpy as np
 
 from config import (GCODE_OFFSET_MM, BED_MM, DEFAULT_DRAW_FEED, TRAVEL_FEED, PEN_LIFT_MM, MIN_SEGMENT_MM,
-                    PEN_DOWN_ABOVE_HOME_MM, SAFE_Z_MM)
+                    PEN_DOWN_ABOVE_HOME_MM, SAFE_Z_MM, CUTTER_Z_OFFSET_MM, TOOL_PEN_IDS)
 
 HOME_XYZ = (-GCODE_OFFSET_MM[0], -GCODE_OFFSET_MM[1], -PEN_DOWN_ABOVE_HOME_MM)
+
+
+def tool_down_z(pen_id):
+    """Z of the tool tip when 'down': 0 (the pen plane) for pens, CUTTER_Z_OFFSET_MM for the drag knife."""
+    return float(CUTTER_Z_OFFSET_MM) if pen_id in TOOL_PEN_IDS else 0.0
+
+
+def _z(v):
+    """Z word value: one decimal when that is exact (keeps 'Z0.0'), else two."""
+    return f"{v:.1f}" if abs(v * 10 - round(v * 10)) < 1e-9 else f"{v:.2f}"
+
+
+def has_drawing_moves(gcode_lines):
+    """True if a G-code body contains at least one pen-down drawing move (G1 with X/Y)."""
+    return any(l.startswith(("G1 X", "G01 X", "G1 Y", "G01 Y")) for l in gcode_lines)
 
 
 def vpype_command(svg_path, gcode_path, has_dots=False):
@@ -47,8 +62,9 @@ def pen_change(pen_name, lift_mm=PEN_LIFT_MM):
 
 
 def wrap_vpype_body(vpype_lines, draw_feed=DEFAULT_DRAW_FEED, travel_feed=TRAVEL_FEED, settle_ms=0,
-                    lift_mm=PEN_LIFT_MM):
-    """Turns vpype gcodemm output into pen-plotter moves: every travel is lift -> move -> lower."""
+                    lift_mm=PEN_LIFT_MM, down_z=0.0):
+    """Turns vpype gcodemm output into pen-plotter moves: every travel is lift -> move -> lower.
+    down_z is the tool-down height (0 for pens, tool_down_z('cutter') for the drag knife)."""
     out = []
     for line in vpype_lines:
         line = line.strip()
@@ -56,7 +72,7 @@ def wrap_vpype_body(vpype_lines, draw_feed=DEFAULT_DRAW_FEED, travel_feed=TRAVEL
             continue
         if line.startswith("G0 X") or line.startswith("G00 X"):
             out.extend([f"G0 Z{lift_mm:.1f} F1500", "M400", f"{line} F{travel_feed:.0f}", "M400",
-                        "G1 Z0.0 F1000", "M400"])
+                        f"G1 Z{_z(down_z)} F1000", "M400"])
             if settle_ms > 0:
                 out.append(f"G4 P{int(settle_ms)}")          # let the ink start flowing before moving
         elif line.startswith("G1 X") or line.startswith("G01 X"):

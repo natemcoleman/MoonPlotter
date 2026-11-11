@@ -13,6 +13,7 @@ STYLE_KEYS = [
     'blue_water', 'plot_borders', 'contour_pen', 'index_pen', 'water_pen', 'border_pen',
     'fill_on', 'pattern', 'tone_source', 'inks', 'mono_pen', 'spacing', 'tone', 'auto_contrast', 'join',
     'deco_title', 'deco_scale', 'deco_north', 'deco_graticule', 'deco_frame', 'site_labels', 'deco_text_size', 'deco_scale_units',
+    'deco_sub_planet', 'deco_sub_coords', 'deco_sub_interval',
 ]
 
 BUILTIN_PRESETS = {

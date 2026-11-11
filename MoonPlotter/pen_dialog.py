@@ -14,8 +14,9 @@ HELP = ("How to calibrate: plot the calibration sheet, scan it at 600 dpi (or ph
         "daylight). Measure one single line's width in mm and enter it as Line width. Sample the colour "
         "from the middle of the solid swatch and paste it as the pen colour. The colour separation, the "
         "ink preview and the time estimates then match your real pens. 'In stock' = offered to the colour "
-        "fill (untick a pen that has run dry). 'Opacity' = how much the ink hides what is under it: ~0.1 for "
-        "normal gel / fineliner ink, ~0.85 for opaque white gel on dark paper.")
+        "fill (untick a pen that has run dry). 'Fav.' = listed first in the pen drop-downs. 'Opacity' = how "
+        "much the ink hides what is under it: ~0.1 for normal gel / fineliner ink, ~0.85 for opaque white gel "
+        "on dark paper.")
 
 
 class PenManagerDialog(QDialog):
@@ -32,14 +33,14 @@ class PenManagerDialog(QDialog):
         title.setObjectName("panelTitle")
         v.addWidget(title)
 
-        self.table = QTableWidget(0, 9)
-        self.table.setHorizontalHeaderLabels(["Cal.", "In stock", "Name", "Colour", "Tip (mm)", "Line width (mm)",
-                                              "Opacity", "Feed (mm/min)", "ID"])
+        self.table = QTableWidget(0, 10)
+        self.table.setHorizontalHeaderLabels(["Cal.", "In stock", "Fav.", "Name", "Colour", "Tip (mm)",
+                                              "Line width (mm)", "Opacity", "Feed (mm/min)", "ID"])
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         hh = self.table.horizontalHeader()
-        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        for c in (0, 1, 3, 4, 5, 6, 7, 8):
+        hh.setSectionResizeMode(self.COL_NAME, QHeaderView.ResizeMode.Stretch)
+        for c in (0, 1, 2, 4, 5, 6, 7, 8, 9):
             hh.setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
         v.addWidget(self.table, 1)
         self._fill()
@@ -76,7 +77,7 @@ class PenManagerDialog(QDialog):
         for pid, pen in self.pens.items():
             self._append_row(pid, pen)
 
-    COL_CAL, COL_STOCK, COL_NAME, COL_COLOR, COL_TIP, COL_LINE, COL_OPAC, COL_FEED, COL_ID = range(9)
+    COL_CAL, COL_STOCK, COL_FAV, COL_NAME, COL_COLOR, COL_TIP, COL_LINE, COL_OPAC, COL_FEED, COL_ID = range(10)
 
     def _append_row(self, pid, pen):
         r = self.table.rowCount()
@@ -88,6 +89,10 @@ class PenManagerDialog(QDialog):
         stock.setEnabled(pid not in TOOL_PEN_IDS)
         stock.setToolTip("Untick when this pen is empty or broken - the colour fill will stop using it.")
         self.table.setCellWidget(r, self.COL_STOCK, stock)
+        fav = QCheckBox()
+        fav.setChecked(bool(pen.get('favorite', False)))
+        fav.setToolTip("Favourite: listed first (above a divider) in every pen drop-down.")
+        self.table.setCellWidget(r, self.COL_FAV, fav)
         self.table.setItem(r, self.COL_NAME, QTableWidgetItem(pen.get('name', pid)))
         btn = QPushButton(pen.get('color', '#000000'))
         btn.setProperty('color', pen.get('color', '#000000'))
@@ -147,7 +152,8 @@ class PenManagerDialog(QDialog):
                    'width': round(self.table.cellWidget(r, self.COL_TIP).value(), 3),
                    'feed': int(self.table.cellWidget(r, self.COL_FEED).value()),
                    'opacity': round(self.table.cellWidget(r, self.COL_OPAC).value(), 3),
-                   'available': self.table.cellWidget(r, self.COL_STOCK).isChecked()}
+                   'available': self.table.cellWidget(r, self.COL_STOCK).isChecked(),
+                   'favorite': self.table.cellWidget(r, self.COL_FAV).isChecked()}
             if lw > 0:
                 pen['line_mm'] = round(lw, 3)
             pens[pid] = pen

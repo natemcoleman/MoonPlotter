@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QProgressBar, QDoubleSpinBox, QGridLayout, QDialog, QListWidget,
                              QListWidgetItem, QToolButton, QMenu, QTableWidget, QTableWidgetItem,
                              QAbstractItemView, QHeaderView)
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QThread, QUrl, QStandardPaths
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QThread, QUrl, QStandardPaths, QObject, QEvent
 from PyQt6.QtGui import (QDoubleValidator, QIntValidator, QShortcut, QKeySequence, QIcon, QAction, QColor,
                          QDesktopServices)
 
@@ -38,7 +38,7 @@ import matplotlib.patches as patches
 from shapely.geometry import box as shp_box, LineString
 from config import (DATA_FILES, PAPER_SIZES, PT_PER_MM, PLANET_RADII, PAPER_COLORS, DEFAULT_PAPER, DEFAULT_MONO_PEN,
                     TAHOE, MIN_SEGMENT_MM, DEFAULT_HATCH_SPACING_MM, load_pens, save_pens, pen_available,
-                    pen_opacity, ink_lightness, TOOL_PEN_IDS)
+                    pen_opacity, ink_lightness, TOOL_PEN_IDS, FAVORITE_PAPER_COLORS, pen_favorite)
 from workers import RenderWorker
 from hatch_engine import composite_ink_layers, STRATEGIES
 from theme import apply_theme, style_axes, SEPIA, ACCENT, TEXT, MUTED
@@ -194,6 +194,65 @@ class _ImageTrace(QThread):
             self.failed.emit(f"{type(e).__name__}: {e}")
             return
         self.done.emit(layers, info, self.token)
+
+
+class _TrackpadNav(QObject):
+    """Trackpad navigation for a plot canvas, so no middle mouse button is needed.
+
+    Two-finger scroll pans, pinch (or Ctrl + scroll) zooms. A classic notched mouse wheel (whole
+    120-unit steps, vertical only) is passed through untouched, so it still zooms as before.
+    Windows precision touchpads report pinch as Ctrl + wheel; macOS / Linux send a zoom gesture."""
+    PX_PER_NOTCH = 100.0          # logical pixels panned per 120 units of wheel delta
+
+    def __init__(self, app, canvas):
+        super().__init__(canvas)
+        self.app = app
+        self.canvas = canvas
+        canvas.installEventFilter(self)
+
+    def _display_xy(self, pos):
+        """Qt widget position -> matplotlib display coordinates (physical pixels, origin bottom-left)."""
+        try:
+            return self.canvas.mouseEventCoords(pos)
+        except Exception:
+            dpr = float(getattr(self.canvas, 'device_pixel_ratio', 1.0) or 1.0)
+            return pos.x() * dpr, (self.canvas.height() - pos.y()) * dpr
+
+    def eventFilter(self, obj, ev):
+        if obj is not self.canvas:
+            return False
+        t = ev.type()
+        if t == QEvent.Type.NativeGesture:
+            if ev.gestureType() == Qt.NativeGestureType.ZoomNativeGesture:
+                x, y = self._display_xy(ev.position())
+                self.app.nav_zoom(self.canvas, x, y, 1.0 + float(ev.value()))
+                return True
+            return False
+        if t != QEvent.Type.Wheel:
+            return False
+        ad, pd = ev.angleDelta(), ev.pixelDelta()
+        if ad.x() == 0 and ad.y() == 0 and pd.isNull():
+            return False
+        precise = (not pd.isNull()) or ad.x() != 0 or ad.y() % 120 != 0 \
+            or ev.phase() != Qt.ScrollPhase.NoScrollPhase
+        if not precise:
+            return False                          # mouse wheel: matplotlib's scroll handlers zoom
+        if self.canvas is self.app.canvas_prev and self.app.canvas_mode == 'transform':
+            return False                          # scroll rotates / scales the picked text there
+        if ev.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            steps = ad.y() / 120.0 if ad.y() else pd.y() / self.PX_PER_NOTCH
+            if steps:
+                x, y = self._display_xy(ev.position())
+                self.app.nav_zoom(self.canvas, x, y, 1.2 ** steps)
+            return True
+        dpr = float(getattr(self.canvas, 'device_pixel_ratio', 1.0) or 1.0)
+        if not pd.isNull():
+            dx, dy = pd.x(), pd.y()
+        else:
+            dx, dy = ad.x() / 120.0 * self.PX_PER_NOTCH, ad.y() / 120.0 * self.PX_PER_NOTCH
+        # Scroll up / left moves the view up / left (like scrolling a page); the OS applies "natural" reversal.
+        self.app.nav_pan(self.canvas, -dx * dpr, dy * dpr)
+        return True
 
 
 class PlotterApp(QMainWindow):
@@ -518,8 +577,14 @@ class PlotterApp(QMainWindow):
         h_paper.addWidget(self.btn_orientation)
         sec_paper.add(self._field("Bed / paper size", h_paper))
         self.combo_paper_color = QComboBox()
-        for name, hx in PAPER_COLORS.items():
-            self.combo_paper_color.addItem(swatch_icon([hx]), name, hx)
+        fav_papers = [n for n in PAPER_COLORS if n in FAVORITE_PAPER_COLORS]
+        other_papers = [n for n in PAPER_COLORS if n not in FAVORITE_PAPER_COLORS]
+        for name in fav_papers:
+            self.combo_paper_color.addItem(swatch_icon([PAPER_COLORS[name]]), name, PAPER_COLORS[name])
+        if fav_papers and other_papers:
+            self.combo_paper_color.insertSeparator(self.combo_paper_color.count())
+        for name in other_papers:
+            self.combo_paper_color.addItem(swatch_icon([PAPER_COLORS[name]]), name, PAPER_COLORS[name])
         self.combo_paper_color.addItem(swatch_icon(['#FFFFFF']), "Custom colour\u2026", None)
         self.combo_paper_color.setCurrentText(DEFAULT_PAPER)
         self.combo_paper_color.setToolTip("The sheet you will plot on. The preview shows it, and the colour\n"
@@ -694,7 +759,7 @@ class PlotterApp(QMainWindow):
         vbox.addWidget(self.sec_contours)
 
         # ---------- FILL / HATCHING LAYER ----------
-        self.sec_fill = CollapsibleSection("Fill / Hatching", checkable=True, checked=False)
+        self.sec_fill = CollapsibleSection("Fill / Hatching", expanded=False, checkable=True, checked=False)
         self.sec_fill.enabled_changed.connect(self.on_layers_changed)
         self.combo_hatch = QComboBox()
         self.combo_hatch.addItems(STRATEGIES)
@@ -783,7 +848,7 @@ class PlotterApp(QMainWindow):
         vbox.addWidget(self.sec_fill)
 
         # ---------- MAP FURNITURE ----------
-        sec_deco = self.sec_deco = CollapsibleSection("Map furniture", expanded=False)
+        sec_deco = self.sec_deco = CollapsibleSection("Map furniture", expanded=True)
         self.chk_deco_title = QCheckBox("Title block")
         self.chk_deco_title.toggled.connect(self.update_decorations)
         sec_deco.add(self.chk_deco_title)
@@ -791,6 +856,21 @@ class PlotterApp(QMainWindow):
         self.txt_title.setPlaceholderText("Title (e.g. Mare Imbrium)")
         self.txt_title.textChanged.connect(lambda _: self.decor_timer.start(400))
         sec_deco.add(self.txt_title)
+        # What the line under the title shows (only drawn when the title block is on)
+        sub_box = QWidget()
+        sub_l = QGridLayout(sub_box)
+        sub_l.setContentsMargins(0, 0, 0, 0)
+        self.chk_sub_planet = QCheckBox("Planet")
+        self.chk_sub_coords = QCheckBox("Coordinates")
+        self.chk_sub_interval = QCheckBox("Contour interval")
+        self.chk_sub_interval.setChecked(True)
+        self.chk_sub_planet.setToolTip("Body name, e.g. MARS")
+        self.chk_sub_coords.setToolTip("Centre of the map, e.g. 24.80\u00b0N 146.90\u00b0E")
+        self.chk_sub_interval.setToolTip("Contour spacing, e.g. 750 ft contours (only when contours are plotted)")
+        for i, c in enumerate((self.chk_sub_planet, self.chk_sub_coords, self.chk_sub_interval)):
+            c.toggled.connect(self.update_decorations)
+            sub_l.addWidget(c, i // 2, i % 2)
+        self.widget_subtitle = sec_deco.add(self._field("Subtitle shows", sub_box))
         self.chk_deco_scale = QCheckBox("Scale bar")
         self.chk_deco_scale.toggled.connect(self.update_decorations)
         sec_deco.add(self.chk_deco_scale)
@@ -805,8 +885,7 @@ class PlotterApp(QMainWindow):
         self.combo_graticule.currentTextChanged.connect(self.update_decorations)
         sec_deco.add(self._field("Coordinate grid", self.combo_graticule))
         self.combo_deco_pen = QComboBox()
-        for pid, pen in self.pens.items():
-            self.combo_deco_pen.addItem(pen['name'], pid)
+        self._add_pen_items(self.combo_deco_pen, list(self.pens.items()))
         idx = self.combo_deco_pen.findData('base')
         if idx >= 0:
             self.combo_deco_pen.setCurrentIndex(idx)
@@ -896,8 +975,9 @@ class PlotterApp(QMainWindow):
         self.btn_clear_sel = QPushButton("Clear")
         self.btn_clear_sel.setObjectName("ghost")
         self.btn_clear_sel.clicked.connect(self.clear_selection)
-        hint_map = QLabel("Drag to select · scroll to zoom · middle-drag to pan")
+        hint_map = QLabel("Drag to select · two-finger scroll or middle-drag to pan · pinch / wheel to zoom")
         hint_map.setObjectName("hint")
+        hint_map.setWordWrap(True)
         h_toolbar.addWidget(self.btn_zoom_tool)
         h_toolbar.addWidget(self.btn_home)
         h_toolbar.addWidget(hint_map, 1)
@@ -930,8 +1010,9 @@ class PlotterApp(QMainWindow):
         self.btn_prev_home = QPushButton("Fit page")
         self.btn_prev_home.setObjectName("ghost")
         self.btn_prev_home.clicked.connect(self.reset_prev_view)
-        hint_prev = QLabel("Scroll to zoom · middle-drag to pan")
+        hint_prev = QLabel("Two-finger scroll or middle-drag to pan · pinch / wheel to zoom")
         hint_prev.setObjectName("hint")
+        hint_prev.setWordWrap(True)
         h_prev_toolbar.addWidget(self.btn_prev_zoom)
         h_prev_toolbar.addWidget(self.btn_prev_home)
         h_prev_toolbar.addWidget(hint_prev, 1)
@@ -1059,7 +1140,10 @@ class PlotterApp(QMainWindow):
         self.canvas_prev.mpl_connect('button_release_event', self.on_prev_release)
         self.canvas_prev.mpl_connect('scroll_event', self.on_prev_scroll)
         self.canvas_prev.mpl_connect('pick_event', self.on_prev_pick)
-        self.canvas_prev.mpl_connect('resize_event', lambda e: self.schedule_ink_sim(150))
+        self.canvas_prev.mpl_connect('resize_event',
+                                     lambda e: (self._apply_screen_linewidths(redraw=False), self.schedule_ink_sim(150)))
+        self._nav_map = _TrackpadNav(self, self.canvas_map)
+        self._nav_prev = _TrackpadNav(self, self.canvas_prev)
 
         self.update_paper_dims()
         self.context_ui_update()
@@ -1103,7 +1187,7 @@ class PlotterApp(QMainWindow):
             self.lbl_region.setVisible(False)
             self.chk_borders.setVisible(False)
         for w in (self.chk_deco_scale, self.chk_deco_north, self.combo_graticule.parentWidget(),
-                  self.combo_scale_units.parentWidget(), self.chk_deco_title):
+                  self.combo_scale_units.parentWidget(), self.chk_deco_title, self.widget_subtitle):
             w.setVisible(not solar)
         if hasattr(self, 'btn_draw'):
             self.btn_draw.setText({'Solar System': "Draw Mission Plot", 'Image': "Trace Image"}.get(planet, "Draw Map"))
@@ -1560,8 +1644,7 @@ class PlotterApp(QMainWindow):
         self.list_inks.blockSignals(False)
         self.combo_mono_pen.blockSignals(True)
         self.combo_mono_pen.clear()
-        for pid, pen in sorted(self.ink_pens(), key=lambda kv: ink_lightness(kv[1]['color'])):
-            self.combo_mono_pen.addItem(swatch_icon([pen['color']]), pen['name'], pid)
+        self._add_pen_items(self.combo_mono_pen, sorted(self.ink_pens(), key=lambda kv: ink_lightness(kv[1]['color'])))
         i = self.combo_mono_pen.findData(prev_mono if prev_mono else DEFAULT_MONO_PEN)
         self.combo_mono_pen.setCurrentIndex(max(0, i))
         self.combo_mono_pen.blockSignals(False)
@@ -1576,8 +1659,7 @@ class PlotterApp(QMainWindow):
         cur = cb.currentData()
         cb.blockSignals(True)
         cb.clear()
-        for pid, pen in sorted(self.ink_pens(), key=lambda kv: ink_lightness(kv[1]['color'])):
-            cb.addItem(swatch_icon([pen['color']]), pen['name'], pid)
+        self._add_pen_items(cb, sorted(self.ink_pens(), key=lambda kv: ink_lightness(kv[1]['color'])))
         for want in (cur, default):
             i = cb.findData(want) if want else -1
             if i >= 0:
@@ -1586,6 +1668,23 @@ class PlotterApp(QMainWindow):
         else:
             cb.setCurrentIndex(0)
         cb.blockSignals(False)
+
+    @staticmethod
+    def _split_favorites(items):
+        """(pen_id, pen) pairs -> (favourites, others), each keeping the given order."""
+        items = list(items)
+        return [kv for kv in items if pen_favorite(kv[1])], [kv for kv in items if not pen_favorite(kv[1])]
+
+    def _add_pen_items(self, cb, items):
+        """Adds pens to a drop-down: favourites first, a divider, then the rest. The divider is not
+        selectable and carries no data, so findData()/currentData() never return it."""
+        favs, rest = self._split_favorites(items)
+        for pid, pen in favs:
+            cb.addItem(swatch_icon([pen['color']]), pen['name'], pid)
+        if favs and rest:
+            cb.insertSeparator(cb.count())
+        for pid, pen in rest:
+            cb.addItem(swatch_icon([pen['color']]), pen['name'], pid)
 
     def _update_contrast_warning(self):
         """Warns when a contour pen will hardly show on the chosen paper colour."""
@@ -1676,9 +1775,13 @@ class PlotterApp(QMainWindow):
         menu = QMenu(self)
         title = menu.addAction("Set pen for whole layer:")
         title.setEnabled(False)
-        for pid, pen in sorted(self.ink_pens(), key=lambda kv: ink_lightness(kv[1]['color'])):
-            a = menu.addAction(swatch_icon([pen['color']]), pen['name'])
-            a.triggered.connect(lambda _=False, p=pid: self.set_layer_pen(key, p))
+        favs, rest = self._split_favorites(sorted(self.ink_pens(), key=lambda kv: ink_lightness(kv[1]['color'])))
+        for group in (favs, rest):
+            if group is rest and favs and rest:
+                menu.addSeparator()
+            for pid, pen in group:
+                a = menu.addAction(swatch_icon([pen['color']]), pen['name'])
+                a.triggered.connect(lambda _=False, p=pid: self.set_layer_pen(key, p))
         menu.exec(global_pos)
 
     def set_layer_pen(self, key, pen_id):
@@ -1807,7 +1910,8 @@ class PlotterApp(QMainWindow):
 
     def plot_order_pens(self):
         """Pens that have visible strokes, lightest ink first (dark inks last so they sit on top
-        and wet light ink is never dragged through dark ink)."""
+        and wet light ink is never dragged through dark ink). Tools (the drag-knife cutter) always come
+        after every ink, so nothing is drawn on paper that has already been cut."""
         used = []
         for item in self.dem_segments:
             if self.is_visible(item) and item['pen_id'] not in used:
@@ -1822,7 +1926,7 @@ class PlotterApp(QMainWindow):
             h = self.pens[p]['color'].lstrip('#')
             r, g, b = (int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
             return 0.2126 * r + 0.7152 * g + 0.0722 * b
-        return sorted(used, key=lightness, reverse=True)
+        return sorted(used, key=lambda p: (p in TOOL_PEN_IDS, -lightness(p)))
 
     # --- HIGH PERFORMANCE RENDERER ---
     def render_canvas(self):
@@ -1833,6 +1937,7 @@ class PlotterApp(QMainWindow):
         self.ax_prev.set_xticks([]);
         self.ax_prev.set_yticks([])
         style_axes(self.fig_prev, self.ax_prev)
+        self._lw_artists = []                 # (artist, line width(s) in paper mm) - see _apply_screen_linewidths
 
         # Show the paper colour of the active ink set
         self.ax_prev.set_facecolor(self.current_paper_color())
@@ -1851,9 +1956,10 @@ class PlotterApp(QMainWindow):
             vis = [self.dem_segments[i] for i in self._visible_idx]
             segs = [item['seg'] for item in vis]
             colors = [self.pens.get(item['pen_id'], self.pens['base'])['color'] for item in vis]
-            lws = [self.pens.get(item['pen_id'], self.pens['base'])['width'] * PT_PER_MM for item in vis]
-            self.dem_collection = LineCollection(segs, colors=colors, linewidths=lws, picker=True, pickradius=5,
+            lws = [self._pen_mm(self.pens.get(item['pen_id'], self.pens['base'])) for item in vis]
+            self.dem_collection = LineCollection(segs, colors=colors, linewidths=1.0, picker=True, pickradius=5,
                                                  zorder=10)
+            self._lw_artists.append((self.dem_collection, lws))
             if self.is_ink_sim_mode():
                 # Hatching is shown by the subtractive ink simulation image (see _refresh_ink_sim).
                 # This collection stays as an invisible layer so Paint-mode clicking still works.
@@ -1865,8 +1971,9 @@ class PlotterApp(QMainWindow):
             if item['type'] == 'line':
                 seg = np.array(item['points'])
                 line, = self.ax_prev.plot(seg[:, 0], seg[:, 1], color=pen['color'],
-                                          linewidth=pen['width'] * PT_PER_MM, picker=True, pickradius=5, zorder=11)
+                                          linewidth=1.0, picker=True, pickradius=5, zorder=11)
                 line.item_ref = ('custom', idx)
+                self._lw_artists.append((line, self._pen_mm(pen)))
 
             elif item['type'] == 'text':
                 polys, bbox = self.text_item_polys(item)
@@ -1880,8 +1987,9 @@ class PlotterApp(QMainWindow):
 
                 for poly in polys:
                     line, = self.ax_prev.plot(poly[:, 0], poly[:, 1], color=pen['color'],
-                                              linewidth=pen['width'] * PT_PER_MM, picker=True, pickradius=5, zorder=15)
+                                              linewidth=1.0, picker=True, pickradius=5, zorder=15)
                     line.item_ref = ('custom', idx)
+                    self._lw_artists.append((line, self._pen_mm(pen)))
 
         for (x0, y0, x1, y1) in self.decor_masks:
             self.ax_prev.add_patch(patches.Rectangle((x0, y0), x1 - x0, y1 - y0, facecolor=self.current_paper_color(),
@@ -1890,8 +1998,10 @@ class PlotterApp(QMainWindow):
         top = [it for it in self.dem_segments if it.get('layer') in self.TOP_LAYERS and self.is_visible(it)]
         if top:
             tpens = [self.pens.get(it['pen_id'], self.pens['base']) for it in top]
-            self.ax_prev.add_collection(LineCollection([it['seg'] for it in top], colors=[p['color'] for p in tpens],
-                                                       linewidths=[p['width'] * PT_PER_MM for p in tpens], zorder=14))
+            top_coll = self.ax_prev.add_collection(LineCollection([it['seg'] for it in top],
+                                                                  colors=[p['color'] for p in tpens],
+                                                                  linewidths=1.0, zorder=14))
+            self._lw_artists.append((top_coll, [self._pen_mm(p) for p in tpens]))
 
         if is_fresh and self.current_view_extent:
             if self.chk_circle.isChecked():
@@ -1908,9 +2018,54 @@ class PlotterApp(QMainWindow):
             self.ax_prev.set_xlim(xlim)
             self.ax_prev.set_ylim(ylim)
 
+        self._apply_screen_linewidths(redraw=False)
         self.ink_image = None                 # ax.clear() above removed the old one
         self.canvas_prev.draw_idle()
         self.schedule_ink_sim(0)
+
+    # --- TRUE-WIDTH LINES IN THE PREVIEW ---
+    MIN_PREVIEW_LW_PT = 0.1                   # keep hair-thin strokes visible when zoomed far out
+
+    @staticmethod
+    def _pen_mm(pen):
+        """Physical stroke width on paper: the measured line width if calibrated, else the tip size."""
+        return float(pen.get('line_mm') or pen.get('width', 0.5))
+
+    def _screen_pt_per_mm(self):
+        """Matplotlib points per paper millimetre at the preview's current zoom (same scale as the ink
+        simulation), so a 0.38 mm pen is drawn 0.38 mm wide on the page as shown on screen."""
+        try:
+            if not self.current_view_extent:
+                return PT_PER_MM
+            ax = self.ax_prev
+            ax.apply_aspect()
+            w = ax.get_window_extent().width
+            xl = ax.get_xlim()
+            span = abs(xl[1] - xl[0])
+            mm_per_unit = self._paper_mm_per_data_unit_x()
+            if w <= 1 or span <= 0 or not mm_per_unit or mm_per_unit <= 0:
+                return PT_PER_MM
+            return (w / span) / mm_per_unit * 72.0 / self.fig_prev.dpi
+        except Exception:
+            return PT_PER_MM
+
+    def _apply_screen_linewidths(self, redraw=True):
+        """Re-scales every preview stroke to its true pen width for the current zoom / window size."""
+        arts = getattr(self, '_lw_artists', None)
+        if not arts:
+            return
+        k = self._screen_pt_per_mm()
+        lo = self.MIN_PREVIEW_LW_PT
+        for art, mm in arts:
+            try:
+                if isinstance(mm, (list, tuple)):
+                    art.set_linewidths([max(lo, m * k) for m in mm])
+                else:
+                    art.set_linewidth(max(lo, mm * k))
+            except Exception:
+                pass
+        if redraw:
+            self.canvas_prev.draw_idle()
 
     # --- SUBTRACTIVE INK PREVIEW (hatch modes) ---
     def is_ink_sim_mode(self):
@@ -2013,6 +2168,7 @@ class PlotterApp(QMainWindow):
         y1, y2 = sorted([eclick.ydata, erelease.ydata])
         self.ax_prev.set_xlim(x1, x2);
         self.ax_prev.set_ylim(y1, y2)
+        self._apply_screen_linewidths(redraw=False)
         self.canvas_prev.draw_idle();
         self.btn_prev_zoom.setChecked(False)
         self.schedule_ink_sim()
@@ -2042,7 +2198,9 @@ class PlotterApp(QMainWindow):
             self.current_freehand = [(event.xdata, event.ydata)]
             pen = self.pens[self.active_pen_id]
             self.temp_draw_line, = self.ax_prev.plot([event.xdata], [event.ydata], color=pen['color'],
-                                                     lw=pen['width'] * PT_PER_MM, zorder=20)
+                                                     lw=max(self.MIN_PREVIEW_LW_PT,
+                                                            self._pen_mm(pen) * self._screen_pt_per_mm()),
+                                                     zorder=20)
             self.canvas_prev.draw_idle()
 
         elif self.canvas_mode == 'text':
@@ -2153,15 +2311,48 @@ class PlotterApp(QMainWindow):
             return
 
         scale = 1 / 1.2 if event.step > 0 else 1.2
-        cx, cy = self.ax_prev.get_xlim(), self.ax_prev.get_ylim()
         x, y = event.xdata, event.ydata
         if x is None or y is None: return
+        self._zoom_prev_at(x, y, scale)
+
+    def _zoom_prev_at(self, x, y, scale):
+        """Zooms the plot preview about data point (x, y); scale < 1 zooms in."""
+        cx, cy = self.ax_prev.get_xlim(), self.ax_prev.get_ylim()
         nw, nh = (cx[1] - cx[0]) * scale, (cy[1] - cy[0]) * scale
         rx, ry = (cx[1] - x) / (cx[1] - cx[0]), (cy[1] - y) / (cy[1] - cy[0])
         self.ax_prev.set_xlim([x - nw * (1 - rx), x + nw * rx])
         self.ax_prev.set_ylim([y - nh * (1 - ry), y + nh * ry])
+        self._apply_screen_linewidths(redraw=False)
         self.canvas_prev.draw_idle()
         self.schedule_ink_sim(150)
+
+    # --- TRACKPAD NAVIGATION (see _TrackpadNav) ---
+    def nav_pan(self, canvas, dx, dy):
+        """Moves the view of a canvas by (dx, dy) display pixels (+x right, +y up)."""
+        ax = self.ax_map if canvas is self.canvas_map else self.ax_prev
+        inv = ax.transData.inverted()
+        (x0, y0), (x1, y1) = inv.transform([(0.0, 0.0), (dx, dy)])
+        xl, yl = ax.get_xlim(), ax.get_ylim()
+        ax.set_xlim(xl[0] + (x1 - x0), xl[1] + (x1 - x0))
+        ax.set_ylim(yl[0] + (y1 - y0), yl[1] + (y1 - y0))
+        canvas.draw_idle()
+        if ax is self.ax_prev:
+            self.schedule_ink_sim(150)
+
+    def nav_zoom(self, canvas, x_disp, y_disp, factor):
+        """Zooms a canvas about a display-pixel point; factor > 1 zooms in."""
+        if factor <= 0:
+            return
+        ax = self.ax_map if canvas is self.canvas_map else self.ax_prev
+        x, y = ax.transData.inverted().transform((x_disp, y_disp))
+        if not (np.isfinite(x) and np.isfinite(y)):
+            return
+        if ax is self.ax_map:
+            if self.mission_mode and self.image_mode:
+                return                             # same as the wheel: the image overview doesn't zoom
+            self._zoom_map_at(x, y, 1.0 / factor)
+        else:
+            self._zoom_prev_at(x, y, 1.0 / factor)
 
     def on_prev_pick(self, event):
         """Painting is handled on press/drag (see _paint_at), so a click and a drag behave the same."""
@@ -2649,9 +2840,13 @@ class PlotterApp(QMainWindow):
     def zoom_map(self, event):
         if event.inaxes != self.ax_map: return
         scale = 1 / 1.2 if event.button == 'up' else 1.2
-        cx, cy = self.ax_map.get_xlim(), self.ax_map.get_ylim()
         x, y = event.xdata, event.ydata
         if x is None or y is None: return
+        self._zoom_map_at(x, y, scale)
+
+    def _zoom_map_at(self, x, y, scale):
+        """Zooms the source map about data point (x, y); scale < 1 zooms in."""
+        cx, cy = self.ax_map.get_xlim(), self.ax_map.get_ylim()
         nw, nh = (cx[1] - cx[0]) * scale, (cy[1] - cy[0]) * scale
         rx, ry = (cx[1] - x) / (cx[1] - cx[0]), (cy[1] - y) / (cy[1] - cy[0])
         if self.mission_mode:
@@ -2735,14 +2930,15 @@ class PlotterApp(QMainWindow):
             return ""
         lat = 0.5 * (e[2] + e[3])
         lon = ((0.5 * (e[0] + e[1]) + 180) % 360) - 180
-        # parts = [self.active_planet.upper(), f"{abs(lat):.2f}°{'N' if lat >= 0 else 'S'} "
-        #                                     f"{abs(lon):.2f}°{'E' if lon >= 0 else 'W'}"]
-        # if self.sec_contours.is_enabled() and any(i.get('layer') == 'contours' for i in self.map_segments):
-        #     parts.append(f"{self.interval_ft:,} ft contours")
-        # return "  ·  ".join(parts)
-        if self.sec_contours.is_enabled() and any(i.get('layer') == 'contours' for i in self.map_segments):
-            return f"{self.interval_ft:,} ft contours"
-        return ""
+        parts = []
+        if self.chk_sub_planet.isChecked():
+            parts.append(self.active_planet.upper())
+        if self.chk_sub_coords.isChecked():
+            parts.append(f"{abs(lat):.2f}°{'N' if lat >= 0 else 'S'} {abs(lon):.2f}°{'E' if lon >= 0 else 'W'}")
+        if self.chk_sub_interval.isChecked() and self.sec_contours.is_enabled() and \
+                any(i.get('layer') == 'contours' for i in self.map_segments):
+            parts.append(f"{self.interval_ft:,} ft contours")
+        return "  ·  ".join(parts)
 
     def _build_decorations(self):
         self.decor_segments, self.decor_masks = [], []
@@ -2787,6 +2983,8 @@ class PlotterApp(QMainWindow):
             'tone': (self.slider_tone, 'value'), 'auto_contrast': (self.chk_auto_contrast, 'check'),
             'join': (self.chk_join, 'check'),
             'deco_title': (self.chk_deco_title, 'check'), 'deco_title_text': (self.txt_title, 'text'),
+            'deco_sub_planet': (self.chk_sub_planet, 'check'), 'deco_sub_coords': (self.chk_sub_coords, 'check'),
+            'deco_sub_interval': (self.chk_sub_interval, 'check'),
             'deco_scale': (self.chk_deco_scale, 'check'), 'deco_north': (self.chk_deco_north, 'check'),
             'deco_graticule': (self.combo_graticule, 'combo'), 'deco_frame': (self.chk_deco_frame, 'check'),
             'deco_pen': (self.combo_deco_pen, 'data'), 'site_labels': (self.chk_site_labels, 'check'),
@@ -3154,9 +3352,8 @@ class PlotterApp(QMainWindow):
         cur = self.combo_deco_pen.currentData()
         self.combo_deco_pen.blockSignals(True)
         self.combo_deco_pen.clear()
-        for pid, pen in self.pens.items():
-            self.combo_deco_pen.addItem(pen['name'], pid)
-        i = self.combo_deco_pen.findData(cur)
+        self._add_pen_items(self.combo_deco_pen, list(self.pens.items()))
+        i = self.combo_deco_pen.findData(cur) if cur else -1
         self.combo_deco_pen.setCurrentIndex(max(0, i))
         self.combo_deco_pen.blockSignals(False)
         if dlg.calibration_request:
@@ -3308,11 +3505,10 @@ class PlotterApp(QMainWindow):
             cb = SwatchCombo()
             cb.setFixedWidth(48)                         # swatch only when closed; names in the drop-down
             cb.view().setMinimumWidth(200)
-            for pid, pen in pens:
-                cb.addItem(swatch_icon([pen['color']]), pen['name'], pid)
+            self._add_pen_items(cb, pens)
             want = self._mission_pens.get(m['key']) or next(
                 (p for p in self.MISSION_PEN_CYCLE if cb.findData(p) >= 0), None)
-            cb.setCurrentIndex(max(0, cb.findData(want)))
+            cb.setCurrentIndex(max(0, cb.findData(want) if want else -1))
             self._mission_pens[m['key']] = cb.currentData()
             cb.setToolTip(f"Pen for {m['name']}: " + self.pens.get(cb.currentData(), {}).get('name', ''))
             cb.currentIndexChanged.connect(lambda _, k=m['key'], c=cb, n=m['name']: (
@@ -3728,8 +3924,7 @@ class PlotterApp(QMainWindow):
             cb = SwatchCombo()
             cb.setFixedWidth(48)
             cb.view().setMinimumWidth(200)
-            for pid, pen in self._image_pen_choices(k):
-                cb.addItem(swatch_icon([pen['color']]), pen['name'], pid)
+            self._add_pen_items(cb, self._image_pen_choices(k))
             cb.setCurrentIndex(max(0, cb.findData(self._image_pens[k])))
             cb.setToolTip("Pen: " + self.pens.get(cb.currentData(), {}).get('name', ''))
             cb.currentIndexChanged.connect(lambda _, key=k, c=cb: (
@@ -4040,6 +4235,7 @@ class PlotterApp(QMainWindow):
         sx, sy = self._paper_mm_per_data_unit()
 
         per_pen = []          # (pen_id, wrapped gcode body)
+        skipped = []          # pens whose strokes all vanished in the clean-up (nothing to draw)
         for p_id, feed in st['pens']:
             pen = self.pens[p_id]
             self.lbl_status.setText(f"Optimising {pen['name']}...")
@@ -4070,8 +4266,13 @@ class PlotterApp(QMainWindow):
             if not ok:
                 QMessageBox.warning(self, "Export", f"vpype could not optimise {pen['name']} - skipped.")
                 continue
-            per_pen.append((p_id, exporter.wrap_vpype_body(body, feed, exporter.TRAVEL_FEED, st['settle_ms'],
-                                                                    lift_mm=st['lift_mm'])))
+            wrapped = exporter.wrap_vpype_body(body, feed, exporter.TRAVEL_FEED, st['settle_ms'],
+                                               lift_mm=st['lift_mm'], down_z=exporter.tool_down_z(p_id))
+            if not exporter.has_drawing_moves(wrapped):
+                # Everything for this pen was filtered out or lay off the sheet: no file, no pen-change pause.
+                skipped.append(pen['name'])
+                continue
+            per_pen.append((p_id, wrapped))
 
         if not per_pen:
             QMessageBox.warning(self, "No Data", "No vector elements found for the selected pens.")
@@ -4116,6 +4317,8 @@ class PlotterApp(QMainWindow):
         msg = (f"Generated {len(files)} G-code file(s), total ≈ {exporter.fmt_duration(total)}.\n"
                + ("Plot in this order - lightest ink first:\n\n" if not st['combine'] else "\n")
                + "\n".join(report))
+        if skipped:
+            msg += "\n\nNo file for " + ", ".join(skipped) + " - nothing left to draw after clean-up."
         if problems:
             msg += ("\n\n⚠ BED CHECK: these moves go outside the reachable area - the plotter would hit its "
                     "limits:\n" + "\n".join(problems) +
