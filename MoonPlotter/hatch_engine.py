@@ -572,6 +572,24 @@ OCEAN_MAX_DENSITY = 0.85          # Maximum wave density on deepest/darkest wate
 
 # Keep every scanline unbroken across the full disc in Circle Mode (bright ice caps become flat 0-amplitude lines)
 FULL_DISC_IN_CIRCLE_MODE = True
+# "Idealized" Earth globe: any part of the disc that neither the land nor the ocean ink would draw (polar ice
+# caps, gaps in the colour map near the poles) is drawn as ocean, so the globe reads as one filled sphere.
+EARTH_CIRCLE_FILL_GAPS_WITH_OCEAN = True
+
+
+class _GapFillRaster:
+    """Ocean density for the idealized Earth globe: the ocean map, plus a fixed density wherever no
+    ink map (land or ocean) has anything to draw. Drop-in for _Raster.sample."""
+
+    def __init__(self, own, all_rasters, fill):
+        self.own, self.all, self.fill = own, list(all_rasters), float(fill)
+
+    def sample(self, lon, lat):
+        d = self.own.sample(lon, lat)
+        empty = np.ones(d.shape, dtype=bool)
+        for r in self.all:
+            empty &= ~(r.sample(lon, lat) > 0.0)
+        return np.where(empty, np.float32(self.fill), d).astype(np.float32)
 
 
 def _normalize_region(vals, mask, auto_contrast, tone_gamma, d_min, d_max):
@@ -631,6 +649,8 @@ def _earth_land_ocean_separate(rgb, valid, rgb_bounds, elev, pens, ids, auto_con
 
     # Order lightest ink first to match the plotter pipeline
     pairs = [(green_pen, land_dmap), (blue_pen, ocean_dmap)]
+    ocean_vals = ocean_dmap[is_ocean]
+    ocean_fill = float(np.median(ocean_vals)) if ocean_vals.size else OCEAN_MIN_DENSITY
     pairs.sort(key=lambda item: ink_lightness(pens[item[0]]['color']), reverse=True)
 
     if EARTH_CIRCLE_SHARED_ANGLE is not None:
@@ -638,7 +658,8 @@ def _earth_land_ocean_separate(rgb, valid, rgb_bounds, elev, pens, ids, auto_con
     else:
         inks = [(pid, BASE_ANGLES[i % len(BASE_ANGLES)]) for i, (pid, _) in enumerate(pairs)]
     dens_maps = [dmap for _, dmap in pairs]
-    return inks, dens_maps
+    ocean_idx = next(i for i, (pid, _) in enumerate(pairs) if pid == blue_pen)
+    return inks, dens_maps, ocean_idx, ocean_fill
 
 
 def generate_hatches(rgb, rgb_bounds, view_extent, params, progress_callback=None, elev=None):
@@ -715,7 +736,7 @@ def generate_hatches(rgb, rgb_bounds, view_extent, params, progress_callback=Non
     if is_earth_circle_color:
         if progress_callback:
             progress_callback("Separating Earth into Green (land) and Blue (ocean) layers...")
-        inks, dens_maps = _earth_land_ocean_separate(
+        inks, dens_maps, ocean_idx, ocean_fill = _earth_land_ocean_separate(
             rgb, valid, rgb_bounds, elev, pens, ids, auto_contrast, tone_gamma
         )
         line_w = [float(pens[pid].get('line_mm', pens[pid]['width'])) for pid, _ in inks]
@@ -731,8 +752,11 @@ def generate_hatches(rgb, rgb_bounds, view_extent, params, progress_callback=Non
     golden = 0.6180339887
     align_phases = is_earth_circle_color and (EARTH_CIRCLE_SHARED_ANGLE is not None)
 
+    all_rasters = [_Raster(m, rgb_bounds) for m in dens_maps]
     for ink_idx, ((pen_id, base_angle), dmap, lw, cmax) in enumerate(zip(inks, dens_maps, line_w, max_cov)):
-        raster = _Raster(dmap, rgb_bounds)
+        raster = all_rasters[ink_idx]
+        if is_earth_circle_color and EARTH_CIRCLE_FILL_GAPS_WITH_OCEAN and ink_idx == ocean_idx:
+            raster = _GapFillRaster(raster, all_rasters, ocean_fill)
         level = 1000 * (ink_idx + 1)
         if progress_callback: progress_callback(f"{strategy}: {pens[pen_id]['name']}...")
 
@@ -764,9 +788,13 @@ def generate_hatches(rgb, rgb_bounds, view_extent, params, progress_callback=Non
             wave = np.sin(2.0 * np.pi * ts / wavelength)[None, :]
             Ud, Vd = frame.clamp(U + A * wave * nx, V + A * wave * ny)
             rows, lines = _run_polylines(on, Ud, Vd)
-            if join:
-                lines = join_neighbouring_runs(rows, lines, 1.6 * line_spacing)
-            segments.extend(_emit(frame, lines, pen_id, level))
+            # One-way strokes: every squiggle is drawn in the same direction (left to right; upward for
+            # vertical waves) and never joined into a zigzag - the pen lifts and travels back between
+            # lines. Drawing back and forth makes the ball catch on the paper and the waves come out flat.
+            ex, ey = np.cos(np.radians(base_angle)), np.sin(np.radians(base_angle))
+            if ex < -1e-9 or (abs(ex) <= 1e-9 and ey < 0):
+                lines = [ln[::-1] for ln in lines]
+            segments.extend(_emit(frame, lines, pen_id, level, seg_type='squiggle'))
 
         elif "Variable" in strategy:
             dt = SAMPLE_STEP_MM
@@ -804,4 +832,4 @@ def generate_hatches(rgb, rgb_bounds, view_extent, params, progress_callback=Non
                 segments.extend(_emit(frame, lines, pen_id, level + p))
 
     if progress_callback: progress_callback(f"Fill complete ({len(segments):,} strokes).")
-    return segments
+    return segments

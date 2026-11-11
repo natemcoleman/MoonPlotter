@@ -7,7 +7,8 @@ feed rates, optional settle dwell and pen-change pauses.
 import numpy as np
 
 from config import (GCODE_OFFSET_MM, BED_MM, DEFAULT_DRAW_FEED, TRAVEL_FEED, PEN_LIFT_MM, MIN_SEGMENT_MM,
-                    PEN_DOWN_ABOVE_HOME_MM, SAFE_Z_MM, CUTTER_Z_OFFSET_MM, TOOL_PEN_IDS)
+                    PEN_DOWN_ABOVE_HOME_MM, SAFE_Z_MM, CUTTER_Z_OFFSET_MM, TOOL_PEN_IDS,
+                    CUTTER_BLADE_OFFSET_MM, CUTTER_CORNER_LOOP_MM, CUTOUT_OVERLAP_MM, CUTOUT_PASSES)
 
 HOME_XYZ = (-GCODE_OFFSET_MM[0], -GCODE_OFFSET_MM[1], -PEN_DOWN_ABOVE_HOME_MM)
 
@@ -27,14 +28,20 @@ def has_drawing_moves(gcode_lines):
     return any(l.startswith(("G1 X", "G01 X", "G1 Y", "G01 Y")) for l in gcode_lines)
 
 
-def vpype_command(svg_path, gcode_path, has_dots=False):
+def vpype_command(svg_path, gcode_path, has_dots=False, no_flip=False):
     """vpype pipeline. has_dots=True ("fine" mode) only re-orders strokes: used for stipple dots and for
-    lettering / map furniture, whose short strokes must not be simplified, merged or length-filtered."""
+    lettering / map furniture, whose short strokes must not be simplified, merged or length-filtered.
+    no_flip=True keeps every stroke's drawing direction (one-way sine squiggles: draw, lift, return).
+    Otherwise 'reloop' moves the start / end of every closed curve to a random point, so the seams of
+    nested contours don't line up into a visible streak."""
     if has_dots:
         return f'read "{svg_path}" linesort gwrite --profile gcodemm "{gcode_path}"'
+    if no_flip:
+        return (f'read "{svg_path}" linemerge --no-flip -t 0.3mm '
+                f'filter --min-length {MIN_SEGMENT_MM:g}mm linesort --no-flip gwrite --profile gcodemm "{gcode_path}"')
     # return (f'read "{svg_path}" linesimplify -t 0.1mm linemerge -t 0.3mm '
     #         f'filter --min-length {MIN_SEGMENT_MM:g}mm linesort gwrite --profile gcodemm "{gcode_path}"')
-    return (f'read "{svg_path}" linemerge -t 0.3mm '
+    return (f'read "{svg_path}" linemerge -t 0.3mm reloop '
             f'filter --min-length {MIN_SEGMENT_MM:g}mm linesort gwrite --profile gcodemm "{gcode_path}"')
 
 
@@ -77,6 +84,49 @@ def wrap_vpype_body(vpype_lines, draw_feed=DEFAULT_DRAW_FEED, travel_feed=TRAVEL
                 out.append(f"G4 P{int(settle_ms)}")          # let the ink start flowing before moving
         elif line.startswith("G1 X") or line.startswith("G01 X"):
             out.append(f"{line} F{draw_feed:.0f}")
+    return out
+
+
+def cutout_path(pw, ph, loop_mm=CUTTER_CORNER_LOOP_MM, blade_offset_mm=CUTTER_BLADE_OFFSET_MM,
+                overlap_mm=CUTOUT_OVERLAP_MM, passes=CUTOUT_PASSES, arc_steps=24):
+    """Drag-knife path (plot mm, origin bottom-left) around the sheet's outer edge 0..pw x 0..ph.
+
+    Starts mid-way along the bottom edge going right, then anticlockwise. At each corner C (arriving
+    along a, leaving along b) the knife goes on to C + d*a, swings clockwise 270 deg round a circle of
+    radius d centred at C + d*(a - b) - entirely outside the card - and arrives at C - d*b heading
+    along b. The trailing blade has turned before it reaches the corner, so both edges are cut through
+    the corner. Ends overlap_mm past the start."""
+    d = max(float(loop_mm), 3.0 * float(blade_offset_mm), 0.1)
+    corners = [(pw, 0.0), (pw, ph), (0.0, ph), (0.0, 0.0)]
+    dirs = [(1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0)]          # edge leaving corner i-1 ...
+    pts = [(pw / 2.0, 0.0)]
+    for _ in range(max(1, int(passes))):
+        for i, (cx, cy) in enumerate(corners):
+            ax, ay = dirs[i]                       # arriving direction
+            bx, by = dirs[(i + 1) % 4]             # leaving direction
+            qx, qy = cx + d * (ax - bx), cy + d * (ay - by)
+            th0 = np.arctan2(by, bx)               # P1 = Q + d*b
+            for k in range(arc_steps + 1):         # clockwise 270 deg: P1 -> Q - d*a = C - d*b
+                th = th0 - 1.5 * np.pi * k / arc_steps
+                pts.append((qx + d * np.cos(th), qy + d * np.sin(th)))
+        pts.append((pw / 2.0, 0.0))                # back to the start of the bottom edge
+    pts.append((min(pw, pw / 2.0 + max(0.0, overlap_mm)), 0.0))
+    out = [pts[0]]
+    for p in pts[1:]:
+        if np.hypot(p[0] - out[-1][0], p[1] - out[-1][1]) > 1e-6:
+            out.append(p)
+    return np.array(out)
+
+
+def cutout_body(pw, ph, feed, travel_feed=TRAVEL_FEED, lift_mm=PEN_LIFT_MM, down_z=None, **kw):
+    """G-code body (no header) that cuts the card outline with the drag knife."""
+    if down_z is None:
+        down_z = tool_down_z('cutter')
+    p = cutout_path(pw, ph, **kw)
+    out = ["; --- CARD CUT-OUT (drag knife) ---", f"G0 Z{lift_mm:.1f} F1500", "M400",
+           f"G0 X{p[0, 0]:.4f} Y{p[0, 1]:.4f} F{travel_feed:.0f}", "M400", f"G1 Z{_z(down_z)} F1000", "M400"]
+    out += [f"G1 X{x:.4f} Y{y:.4f} F{feed:.0f}" for x, y in p[1:]]
+    out += [f"G0 Z{lift_mm:.1f} F1500", "M400"]
     return out
 
 

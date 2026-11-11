@@ -135,6 +135,18 @@ PEN_DOWN_ABOVE_HOME_MM = 5.5
 # -2.0 puts the blade at 3.5 mm above home, the cutter height used before this setting existed. The cutter
 # is plotted last, after its own M0 tool-change pause; pen-up height and travel moves are unchanged.
 CUTTER_Z_OFFSET_MM = -2.0
+# Card cut-out (Export dialog > "Cut out the card"): the drag knife traces the paper's outer edge last.
+# The blade tip trails the knife's pivot by about this much (2 mm-shank 45 deg blades: ~0.25 mm; 60 deg
+# blades trail further, ~0.5 mm).
+CUTTER_BLADE_OFFSET_MM = 0.25
+# At each corner the knife runs past the corner, swings round a small loop OUTSIDE the card and comes back
+# in along the next edge, so the blade is already turned when it reaches the corner (sharp corners, and
+# both edges are cut right through the corner). Kept at least 3x the blade offset.
+CUTTER_CORNER_LOOP_MM = 1.0
+# The cut runs this far past its starting point so the outline closes cleanly.
+CUTOUT_OVERLAP_MM = 5.0
+# Laps of the outline (2 for thick card stock).
+CUTOUT_PASSES = 1
 # Clearance used for long moves: leaving home for the start point, parking and pen changes.
 SAFE_Z_MM = 5.5
 # SAFE_Z_MM = 0.5

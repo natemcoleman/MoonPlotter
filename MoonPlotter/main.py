@@ -1171,7 +1171,8 @@ class PlotterApp(QMainWindow):
         self.lbl_ink_set.setVisible(is_color)
         self.lbl_mono_pen.setVisible(not is_color)
         self.chk_auto_contrast.setVisible(not is_hachure)
-        self.chk_join.setVisible(not ("Stipp" in strategy or is_hachure))
+        # Squiggles are always drawn one way (no zigzag joining), so the option doesn't apply to them.
+        self.chk_join.setVisible(not ("Stipp" in strategy or is_hachure or "Squiggle" in strategy))
         self._update_contrast_warning()
         # Solar System mode: mission controls instead of the map / terrain controls
         solar = planet in ('Solar System', 'Image')
@@ -4094,14 +4095,17 @@ class PlotterApp(QMainWindow):
 
     def _lines_for_pen(self, p_id, text_boxes, split=False):
         """All plot lines (in data coords) for one pen, with text blanking applied.
-        split=True returns (map_lines, fine_lines) where fine_lines are lettering and map furniture."""
-        lines, fine = [], []
+        split=True returns (map_lines, fine_lines, one_way_lines): fine_lines are lettering and map furniture,
+        one_way_lines are sine squiggles, whose drawing direction must be kept."""
+        lines, fine, one_way = [], [], []
         for item in getattr(self, 'dem_segments', []):
             if item.get('pen_id') == p_id and self.is_visible(item):
                 if item.get('layer') in self.FINE_LAYERS or str(item.get('layer', '')).startswith('img:'):
                     fine.append(np.asarray(item['seg']))         # furniture / labels are never blanked
                 elif item.get('type') == 'stipple':
                     lines.append(np.asarray(item['seg']))
+                elif split and item.get('type') == 'squiggle':
+                    one_way.extend(self._mask_line(item['seg'], text_boxes))
                 else:
                     lines.extend(self._mask_line(item['seg'], text_boxes))
         for item in (getattr(self, 'custom_items', []) if self.annotations_visible() else []):
@@ -4110,7 +4114,7 @@ class PlotterApp(QMainWindow):
                 lines.extend(self._mask_line(item['points'], text_boxes))
             elif item['type'] == 'text':
                 fine.extend(self.text_item_polys(item)[0])
-        return (lines, fine) if split else lines + fine
+        return (lines, fine, one_way) if split else lines + fine
 
     def _make_export_axes(self):
         export_fig = Figure(figsize=(self.pw / 25.4, self.ph / 25.4))
@@ -4195,7 +4199,7 @@ class PlotterApp(QMainWindow):
             self.update_time_estimate()
         self._export_gcode(st)
 
-    def _vpype_body(self, lines, has_dots, tag):
+    def _vpype_body(self, lines, has_dots, tag, no_flip=False):
         """lines (data coords) -> list of vpype gcodemm lines, or None on failure."""
         if not lines:
             return []
@@ -4207,7 +4211,7 @@ class PlotterApp(QMainWindow):
         with matplotlib.rc_context({'path.simplify': False}):      # keep every tiny letter stroke
             export_fig.savefig(t_svg, format='svg')
         try:
-            vpype_cli.execute(exporter.vpype_command(t_svg, t_gcode, has_dots))
+            vpype_cli.execute(exporter.vpype_command(t_svg, t_gcode, has_dots, no_flip=no_flip))
             with open(t_gcode) as f:
                 body = f.read().splitlines()
         except Exception as e:
@@ -4240,7 +4244,7 @@ class PlotterApp(QMainWindow):
             pen = self.pens[p_id]
             self.lbl_status.setText(f"Optimising {pen['name']}...")
             QApplication.processEvents()
-            lines, fine = self._lines_for_pen(p_id, text_boxes, split=True)
+            lines, fine, one_way = self._lines_for_pen(p_id, text_boxes, split=True)
             has_dots = any(it.get('type') == 'stipple' and it['pen_id'] == p_id and self.is_visible(it)
                            for it in self.dem_segments)
             lengths = [float(np.sum(np.hypot(np.diff(np.asarray(ln)[:, 0]) * sx, np.diff(np.asarray(ln)[:, 1]) * sy)))
@@ -4250,15 +4254,18 @@ class PlotterApp(QMainWindow):
                         if (len(ln) == 7 and np.allclose(ln[0], ln[-1])) or lengths[i] >= MIN_SEGMENT_MM]
                 lines = [lines[i] for i in keep]
                 lengths = [lengths[i] for i in keep]
-            if not lines and not fine:
+            if not lines and not fine and not one_way:
                 continue
             prime, rest = exporter.split_for_priming(lines, lengths, st['prime'] if not has_dots else 0)
             body = []
             ok = True
             # map lines (primed, cleaned up), then lettering last - by then the ink is flowing well
-            for part, tag, dots in ((prime, f"{p_id}_prime", has_dots), (rest, p_id, has_dots),
-                                    (fine, f"{p_id}_text", True)):
-                b = self._vpype_body(part, dots, tag)
+            # (one-way squiggles keep their direction: draw, lift, travel back, draw the next one)
+            for part, tag, dots, no_flip in ((prime, f"{p_id}_prime", has_dots, False),
+                                             (rest, p_id, has_dots, False),
+                                             (one_way, f"{p_id}_oneway", False, True),
+                                             (fine, f"{p_id}_text", True, False)):
+                b = self._vpype_body(part, dots, tag, no_flip=no_flip)
                 if b is None:
                     ok = False
                     break
@@ -4273,6 +4280,18 @@ class PlotterApp(QMainWindow):
                 skipped.append(pen['name'])
                 continue
             per_pen.append((p_id, wrapped))
+
+        if st.get('cutout'):
+            # Card cut-out: the drag knife traces the sheet's outer edge, after everything else (its own
+            # tool-change pause in a combined file, its own file otherwise).
+            cut_feed = st['feeds'].get('cutter') or self.pens.get('cutter', {}).get('feed', exporter.DEFAULT_DRAW_FEED)
+            cut = exporter.cutout_body(self.pw, self.ph, cut_feed, exporter.TRAVEL_FEED, lift_mm=st['lift_mm'])
+            for i, (p_id, body) in enumerate(per_pen):
+                if p_id == 'cutter':
+                    per_pen[i] = (p_id, body + cut)
+                    break
+            else:
+                per_pen.append(('cutter', cut))
 
         if not per_pen:
             QMessageBox.warning(self, "No Data", "No vector elements found for the selected pens.")

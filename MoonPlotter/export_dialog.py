@@ -62,6 +62,11 @@ class ExportDialog(QDialog):
         self.chk_combine = QCheckBox("One combined file with a pause (M0) to swap pens between colours")
         self.chk_combine.setToolTip("Keeps the same home position for every pen - no re-homing between pens.")
         v.addWidget(self.chk_combine)
+        self.chk_cutout = QCheckBox("Cut out the card at the end (drag knife traces the paper's outer edge)")
+        self.chk_cutout.setToolTip("Adds a last tool: pause (M0) to load the cutter blade, then cut round the sheet\n"
+                                   "with a small loop outside each corner. Blade depth: CUTTER_Z_OFFSET_MM in config.py.")
+        self.chk_cutout.toggled.connect(self._update_total)
+        v.addWidget(self.chk_cutout)
         h = QHBoxLayout()
         h.addWidget(QLabel("Settle after each pen-down:"))
         self.spin_settle = QSpinBox()
@@ -128,8 +133,9 @@ class ExportDialog(QDialog):
         from exporter import fmt_duration
         total = sum(self._row_minutes(r) for r in range(len(self.rows)) if self.checks[r].isChecked())
         n = sum(c.isChecked() for c in self.checks)
-        self.lbl_total.setText(f"{n} pen(s) · total ≈ {fmt_duration(total)}")
-        self.btn_ok.setEnabled(n > 0)
+        cut = " + card cut-out" if self.chk_cutout.isChecked() else ""
+        self.lbl_total.setText(f"{n} pen(s){cut} · total ≈ {fmt_duration(total)}")
+        self.btn_ok.setEnabled(n > 0 or self.chk_cutout.isChecked())
 
     def settings(self):
         return {
@@ -137,6 +143,7 @@ class ExportDialog(QDialog):
                      if self.checks[r].isChecked()],
             'feeds': {row['pen_id']: self.feeds[r].value() for r, row in enumerate(self.rows)},
             'combine': self.chk_combine.isChecked(),
+            'cutout': self.chk_cutout.isChecked(),
             'settle_ms': self.spin_settle.value(),
             'lift_mm': self.spin_lift.value(),
             'prime': self.spin_prime.value(),
