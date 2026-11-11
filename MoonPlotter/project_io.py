@@ -89,6 +89,22 @@ def delete_user_colorway(name):
     return True
 
 
+# Favourite paper colours and regions (the star buttons next to those drop-downs). Per machine.
+FAVORITES_FILE = "favorites.json"
+
+
+def load_favorites(default_papers=(), default_regions=()):
+    d = _read_json_dict(FAVORITES_FILE)
+    return {'paper_colors': list(d.get('paper_colors', default_papers)),
+            'regions': list(d.get('regions', default_regions))}
+
+
+def save_favorites(fav):
+    with open(FAVORITES_FILE, 'w') as f:
+        json.dump({'paper_colors': list(fav.get('paper_colors', [])), 'regions': list(fav.get('regions', []))},
+                  f, indent=2)
+
+
 def _jsonable(obj):
     if isinstance(obj, dict):
         return {str(k): _jsonable(v) for k, v in obj.items()}

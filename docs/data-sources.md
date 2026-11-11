@@ -36,8 +36,28 @@ Notes:
   it.
 - `tahoe_lake_wgs84.tif` (in the repo) is a 10 m Lake Tahoe bathymetry model. It is used when you choose
   **Clip to region › Lake Tahoe (High-Res Bathymetry)**. `tools/make_tahoe.py` shows how it was built.
-- Country and state borders come from [Natural Earth](https://www.naturalearthdata.com/). They are
-  downloaded automatically when the app starts, if `geopandas` is installed and you are online.
+- Country and state borders come from [Natural Earth](https://www.naturalearthdata.com/). The first time
+  the app starts (with `geopandas` installed and an internet connection) it downloads two small zips into
+  `MoonPlotter/natural_earth/`; after that it loads them from disk, so starts are faster and work offline.
+  If that first download fails, selecting Earth explains what happened. To set up by hand, save
+  [ne_110m_admin_0_countries.zip](https://naturalearth.s3.amazonaws.com/110m_cultural/ne_110m_admin_0_countries.zip)
+  and
+  [ne_110m_admin_1_states_provinces.zip](https://naturalearth.s3.amazonaws.com/110m_cultural/ne_110m_admin_1_states_provinces.zip)
+  (still zipped, names unchanged) in that folder.
+
+## One-time setup checklist (after cloning)
+
+Everything the app needs that is not in the repository, and how it gets it:
+
+| What | Needed for | How you get it |
+|---|---|---|
+| Python packages | everything | `pip install -r requirements.txt` |
+| Natural Earth borders (`natural_earth/`) | Earth borders, **Clip to region** | Downloaded automatically on first start (see above) |
+| Earth elevation `BE_dem_v2.tif` | Earth maps | Manual download (table above); selecting Earth without it shows the link |
+| Mars files | Mars | Manual download (table above); Mars stays disabled until they exist |
+| Overviews (`<dem>.tif.ovr`) | faster big areas and circle mode (optional) | **Tools › Speed up global elevation (one time)**, or `python MoonPlotter/dem_prep.py`. The app suggests it on the status line when a large global DEM has none. The original `.tif` is not changed. |
+
+Regional data, missions and pens are fetched or created while you use the app.
 
 ## Regional data
 

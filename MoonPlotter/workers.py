@@ -1,5 +1,7 @@
 import os
+import threading
 import traceback
+from collections import OrderedDict
 
 import numpy as np
 import rasterio
@@ -174,6 +176,18 @@ def _read_color_regional(path, ds_bounds, lon_min, lon_max, lat_min, lat_max, dp
 # ==========================================
 # BACKGROUND RENDER THREAD
 # ==========================================
+# Last few elevation windows read (keyed by file, its mtime/size, the box and the pixel cap). A whole-
+# hemisphere Earth window is ~50 MB, so only a handful are kept.
+DEM_CACHE_ENTRIES = 3
+_DEM_CACHE = OrderedDict()
+_DEM_CACHE_LOCK = threading.Lock()
+
+
+def clear_dem_cache():
+    with _DEM_CACHE_LOCK:
+        _DEM_CACHE.clear()
+
+
 class RenderWorker(QThread):
     # NOTE: deliberately NOT named 'finished' - that would shadow QThread.finished,
     # which main.py uses to know when the thread has really exited.
@@ -191,7 +205,32 @@ class RenderWorker(QThread):
 
     # ------------------------------------------------------------------
     def _read_dem(self, lon_min, lon_max, lat_min, lat_max, is_tahoe, max_px=MAX_DEM_PX):
+        """Elevation window (cached in memory: slider tweaks and pen changes don't re-read the file)."""
         regional = self.params.get('regional_dem')
+        src = TAHOE['dem'] if is_tahoe else (regional['path'] if regional else self.dem_path)
+        try:
+            stamp = (os.path.getmtime(src), os.path.getsize(src))
+        except OSError:
+            stamp = None
+        key = (src, stamp, is_tahoe, bool(regional), self.planet,
+               round(lon_min, 9), round(lon_max, 9), round(lat_min, 9), round(lat_max, 9), int(max_px))
+        with _DEM_CACHE_LOCK:
+            hit = _DEM_CACHE.get(key)
+            if hit is not None:
+                _DEM_CACHE.move_to_end(key)
+        if hit is not None:
+            dem, ext, k, mult = hit
+            self.progress.emit("Elevation window reused from memory...")
+            return dem.copy(), list(ext), k, mult
+        out = self._read_dem_file(lon_min, lon_max, lat_min, lat_max, is_tahoe, max_px)
+        dem, ext, k, mult = out
+        with _DEM_CACHE_LOCK:
+            _DEM_CACHE[key] = (dem.copy(), list(ext), k, mult)
+            while len(_DEM_CACHE) > DEM_CACHE_ENTRIES:
+                _DEM_CACHE.popitem(last=False)
+        return out
+
+    def _read_dem_file(self, lon_min, lon_max, lat_min, lat_max, is_tahoe, max_px=MAX_DEM_PX):
         if is_tahoe:
             mult = TAHOE['multiplier']
             dem, ext, k = read_dem_window(self.dem_path, TAHOE['bounds'], lon_min, lon_max, lat_min, lat_max,

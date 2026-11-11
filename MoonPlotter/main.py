@@ -126,7 +126,10 @@ except ImportError:
     print("WARNING: vpype API not found. Please 'pip install vpype vpype-gcode'")
 
 # Natural Earth borders are downloaded once, in contour_engine (shared with the worker).
-from contour_engine import HAS_GPD, world_borders, state_borders
+from contour_engine import HAS_GPD, world_borders, state_borders, BORDERS_ERROR, NATURAL_EARTH_DIR, \
+    NATURAL_EARTH_FILES
+import dem_prep
+from workers import clear_dem_cache
 
 # Cache for UI map previews
 loaded_maps_cache = {}
@@ -174,6 +177,26 @@ class _MissionFetch(QThread):
             self.failed.emit(f"{type(e).__name__}: {e}")
             return
         self.done.emit(out)
+
+
+class _DemPrep(QThread):
+    """Builds elevation overviews in the background (Tools > Speed up global elevation)."""
+    done = pyqtSignal(str)
+    progress = pyqtSignal(str)
+
+    def __init__(self, paths):
+        super().__init__()
+        self.paths = paths
+
+    def run(self):
+        msgs = []
+        for p in self.paths:
+            try:
+                dem_prep.build_overviews(p, log=self.progress.emit)
+                msgs.append(f"{os.path.basename(p)} ready")
+            except Exception as e:
+                msgs.append(f"{os.path.basename(p)} failed: {type(e).__name__}: {e}")
+        self.done.emit("Global elevation: " + "; ".join(msgs) + ".")
 
 
 class _ImageTrace(QThread):
@@ -353,6 +376,7 @@ class PlotterApp(QMainWindow):
         self.redo_stack = []
 
         self.pens = load_pens()
+        self.favorites = project_io.load_favorites(FAVORITE_PAPER_COLORS, FAVORITE_REGIONS)
         self.active_pen_id = 'base'
         self.canvas_mode = 'paint'
 
@@ -431,6 +455,7 @@ class PlotterApp(QMainWindow):
         act(m_tools, "Pens\u2026", self.open_pen_manager)
         act(m_tools, "Pen calibration sheet\u2026", self.open_pen_manager)
         act(m_tools, "Data sources (sharper regional data)\u2026", self.open_data_dialog)
+        act(m_tools, "Speed up global elevation (one time)\u2026", self.prepare_dem_files)
 
     # ------------------------------------------------------------------
     # UI CONSTRUCTION
@@ -579,7 +604,11 @@ class PlotterApp(QMainWindow):
             completer.setFilterMode(Qt.MatchFlag.MatchContains)
             self.combo_region.setCompleter(completer)
         self.combo_region.currentTextChanged.connect(self.on_region_changed)
-        self.lbl_region = sec_src.add(self._field("Clip to region", self.combo_region))
+        self.btn_fav_region = self._fav_button("region", self.toggle_fav_region)
+        region_row = QHBoxLayout()
+        region_row.addWidget(self.combo_region, 1)
+        region_row.addWidget(self.btn_fav_region)
+        self.lbl_region = sec_src.add(self._field("Clip to region", region_row))
 
         self.combo_scale = QComboBox()
         self.combo_scale.addItem("Free (drag any area)")
@@ -625,21 +654,17 @@ class PlotterApp(QMainWindow):
         h_paper.addWidget(self.btn_orientation)
         sec_paper.add(self._field("Bed / paper size", h_paper))
         self.combo_paper_color = QComboBox()
-        fav_papers = [n for n in PAPER_COLORS if n in FAVORITE_PAPER_COLORS]
-        other_papers = [n for n in PAPER_COLORS if n not in FAVORITE_PAPER_COLORS]
-        for name in fav_papers:
-            self.combo_paper_color.addItem(swatch_icon([PAPER_COLORS[name]]), name, PAPER_COLORS[name])
-        if fav_papers and other_papers:
-            self.combo_paper_color.insertSeparator(self.combo_paper_color.count())
-        for name in other_papers:
-            self.combo_paper_color.addItem(swatch_icon([PAPER_COLORS[name]]), name, PAPER_COLORS[name])
-        self.combo_paper_color.addItem(swatch_icon(['#FFFFFF']), "Custom colour\u2026", None)
+        self._fill_paper_combo()
         self.combo_paper_color.setCurrentText(DEFAULT_PAPER)
         self.combo_paper_color.setToolTip("The sheet you will plot on. The preview shows it, and the colour\n"
                                           "fill works out the best ink mix for this paper colour.")
         self._paper_color_index = self.combo_paper_color.currentIndex()
         self.combo_paper_color.currentIndexChanged.connect(self.on_paper_color_changed)
-        sec_paper.add(self._field("Paper colour", self.combo_paper_color))
+        self.btn_fav_paper = self._fav_button("paper colour", self.toggle_fav_paper)
+        paper_row = QHBoxLayout()
+        paper_row.addWidget(self.combo_paper_color, 1)
+        paper_row.addWidget(self.btn_fav_paper)
+        sec_paper.add(self._field("Paper colour", paper_row))
         cw_row = QHBoxLayout()
         self.combo_colorway = QComboBox()
         self.combo_colorway.setToolTip("Switches the paper colour and every pen (contours, index lines, water,\n"
@@ -1236,6 +1261,7 @@ class PlotterApp(QMainWindow):
 
         self.update_paper_dims()
         self.context_ui_update()
+        self._update_fav_stars()
 
     def context_ui_update(self):
         """Shows only the options that apply to the current planet, layers and fill pattern."""
@@ -1286,10 +1312,90 @@ class PlotterApp(QMainWindow):
 
     REGION_NONE = "None (Plot Full Selection)"
 
+    # --- FAVOURITES (paper colours and regions; pens use the 'Fav.' column in Tools > Pens) ---
+    def _fav_button(self, what, slot):
+        b = QToolButton()
+        b.setCheckable(True)
+        b.setText("\u2606")
+        b.setToolTip(f"Favourite: list this {what} at the top of the drop-down")
+        b.setFixedWidth(28)
+        b.toggled.connect(slot)
+        return b
+
+    @staticmethod
+    def _set_star(btn, on, enabled=True):
+        btn.blockSignals(True)
+        btn.setChecked(bool(on))
+        btn.setText("\u2605" if on else "\u2606")
+        btn.setEnabled(enabled)
+        btn.blockSignals(False)
+
+    def _update_fav_stars(self):
+        if hasattr(self, 'btn_fav_paper'):
+            name = self.combo_paper_color.currentText()
+            self._set_star(self.btn_fav_paper, name in self.favorites['paper_colors'], name in PAPER_COLORS)
+        if hasattr(self, 'btn_fav_region'):
+            name = self.combo_region.currentText()
+            self._set_star(self.btn_fav_region, name in self.favorites['regions'],
+                           bool(name) and name != self.REGION_NONE and self.combo_region.findText(name) >= 0)
+
+    def _toggle_favorite(self, kind, name, on):
+        lst = self.favorites[kind]
+        if on and name not in lst:
+            lst.append(name)
+        elif not on and name in lst:
+            lst.remove(name)
+        project_io.save_favorites(self.favorites)
+
+    def toggle_fav_paper(self, on):
+        name = self.combo_paper_color.currentText()
+        if name not in PAPER_COLORS:
+            return
+        self._toggle_favorite('paper_colors', name, on)
+        self._fill_paper_combo()
+        self._update_fav_stars()
+
+    def toggle_fav_region(self, on):
+        name = self.combo_region.currentText()
+        if not name or name == self.REGION_NONE:
+            return
+        self._toggle_favorite('regions', name, on)
+        cb = self.combo_region
+        cb.blockSignals(True)
+        self._fill_region_combo()
+        cb.setCurrentText(name)
+        cb.blockSignals(False)
+        self._update_fav_stars()
+
+    def _fill_paper_combo(self):
+        """Paper colours: favourites, a divider, the rest, then 'Custom colour...'. Keeps the selection."""
+        cb = self.combo_paper_color
+        cur = cb.currentData() if cb.count() else None
+        cb.blockSignals(True)
+        cb.clear()
+        favs = [n for n in PAPER_COLORS if n in self.favorites['paper_colors']]
+        others = [n for n in PAPER_COLORS if n not in self.favorites['paper_colors']]
+        for name in favs:
+            cb.addItem(swatch_icon([PAPER_COLORS[name]]), name, PAPER_COLORS[name])
+        if favs and others:
+            cb.insertSeparator(cb.count())
+        for name in others:
+            cb.addItem(swatch_icon([PAPER_COLORS[name]]), name, PAPER_COLORS[name])
+        cb.addItem(swatch_icon(['#FFFFFF']), "Custom colour\u2026", None)
+        if cur:
+            i = cb.findData(cur)
+            if i >= 0:
+                cb.setCurrentIndex(i)
+            else:
+                self._set_custom_paper(cur)
+            self._paper_color_index = cb.currentIndex()
+        cb.blockSignals(False)
+
     def _fill_region_combo(self):
         """'Clip to region': None, favourites, a divider, then Lakes / States / Countries under headers.
         Returns every selectable region name (for the type-to-search completer)."""
         cb = self.combo_region
+        cb.clear()
         cb.addItem(self.REGION_NONE)
         states, countries = [], []
         if HAS_GPD:
@@ -1299,7 +1405,7 @@ class PlotterApp(QMainWindow):
             if w_col: countries = sorted(set(world_borders[w_col].dropna().tolist()))
         lakes = list(REGION_LAKES)
         known = set(lakes) | set(states) | set(countries)
-        favs = [r for r in FAVORITE_REGIONS if r in known]
+        favs = [r for r in self.favorites['regions'] if r in known]
         for r in favs:
             cb.addItem(r)
         groups = [("Lakes", lakes), ("States", states), ("Countries", countries)]
@@ -1482,6 +1588,7 @@ class PlotterApp(QMainWindow):
         self.set_panel_visible('layers', not on)
 
     def on_region_changed(self, text):
+        self._update_fav_stars()
         if "Tahoe" in text:
             self.slider_int.blockSignals(True);
             self.txt_int.blockSignals(True)
@@ -1881,6 +1988,7 @@ class PlotterApp(QMainWindow):
             self.combo_paper_color.blockSignals(False)
         self._paper_color_index = self.combo_paper_color.currentIndex()
         self._update_contrast_warning()
+        self._update_fav_stars()
         if self.has_drawn:
             self.render_canvas()
             if self.sec_fill.is_enabled():
@@ -1910,6 +2018,7 @@ class PlotterApp(QMainWindow):
             self._set_custom_paper(hx)
         self.combo_paper_color.blockSignals(False)
         self._paper_color_index = self.combo_paper_color.currentIndex()
+        self._update_fav_stars()
 
     # --- FILL INKS ---
     def ink_pens(self):
@@ -2918,6 +3027,54 @@ class PlotterApp(QMainWindow):
         if box.clickedButton() is b_open:
             QDesktopServices.openUrl(QUrl(url))
 
+    def explain_missing_borders(self):
+        """Once per session: why there are no country / state borders, and how to get them."""
+        if HAS_GPD or self.__dict__.get('_borders_help_shown'):
+            return
+        self._borders_help_shown = True
+        files = "".join(f"<li><a href='{u}'>{u.rsplit('/', 1)[-1]}</a></li>" for u in NATURAL_EARTH_FILES.values())
+        QMessageBox.information(
+            self, "Country and state borders",
+            "<p>Borders and <b>Clip to region</b> need the Natural Earth outlines, which are downloaded "
+            "automatically the first time the app starts. That didn't work:</p>"
+            f"<p><i>{BORDERS_ERROR}</i></p>"
+            "<p>Check the internet connection and restart the app, or download these two files and put them "
+            f"(still zipped) in <b>{os.path.join(APP_DIR, NATURAL_EARTH_DIR)}</b>:</p><ul>{files}</ul>")
+
+    def suggest_dem_prep(self):
+        """Status-line tip when the current body's global elevation file hasn't been prepared yet."""
+        p = DATA_FILES.get(self.active_planet, {}).get('dem')
+        if p and dem_prep.needs_overviews(p):
+            self.lbl_status.setText("Tip: Tools \u203a Speed up global elevation (one time) makes big areas "
+                                    "and circle mode load several times faster.")
+
+    def prepare_dem_files(self):
+        todo = [f['dem'] for f in DATA_FILES.values() if dem_prep.needs_overviews(f['dem'])]
+        if not todo:
+            QMessageBox.information(self, "Global elevation", "Every global elevation file is already prepared.")
+            return
+        names = "\n".join(f"\u2022 {p}" for p in todo)
+        if QMessageBox.question(
+                self, "Speed up global elevation",
+                "Build reduced-resolution copies (overviews) of:\n\n" + names +
+                "\n\nThey are saved next to each file as .ovr (about a third of its size). The original files "
+                "are not changed. This takes a minute or two per file.") != QMessageBox.StandardButton.Yes:
+            return
+        self.is_calculating = True
+        self.btn_draw.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self._prep_job = _DemPrep(todo)
+        self._prep_job.progress.connect(self.lbl_status.setText)
+        self._prep_job.done.connect(self._on_dem_prep_done)
+        self._prep_job.start()
+
+    def _on_dem_prep_done(self, msg):
+        clear_dem_cache()
+        self.is_calculating = False
+        self.btn_draw.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.lbl_status.setText(msg)
+
     def switch_planet(self):
         if self.selected_planet() == 'Solar System':
             self._enter_mission_mode()
@@ -2931,6 +3088,9 @@ class PlotterApp(QMainWindow):
         self.context_ui_update()
         if not self._loading:
             QTimer.singleShot(0, lambda p=self.active_planet: self.explain_missing_dem(p))
+            if self.active_planet == 'Earth':
+                QTimer.singleShot(0, self.explain_missing_borders)
+            QTimer.singleShot(0, self.suggest_dem_prep)
 
         _, base_img = load_planet_data(self.active_planet)
         self.ax_map.clear()

@@ -1,3 +1,4 @@
+import os
 import warnings
 
 import numpy as np
@@ -11,22 +12,55 @@ from geometry_utils import chaikin_smooth, ortho_project
 MAX_CONTOUR_LEVELS = 600
 
 # Natural Earth borders are loaded ONCE here; main.py imports them from this module.
+# They are downloaded the first time the app runs and kept in NATURAL_EARTH_DIR, so later starts are
+# instant and work offline. To set up by hand, save the two zips below into that folder (keep the names).
+NATURAL_EARTH_DIR = "natural_earth"
+NATURAL_EARTH_FILES = {
+    'countries': "https://naturalearth.s3.amazonaws.com/110m_cultural/ne_110m_admin_0_countries.zip",
+    'states': "https://naturalearth.s3.amazonaws.com/110m_cultural/ne_110m_admin_1_states_provinces.zip",
+}
 world_borders = None
 state_borders = None
 HAS_GPD = False
+BORDERS_ERROR = None        # why borders are unavailable (shown once in the app), or None
+
+
+def natural_earth_path(kind):
+    return os.path.join(NATURAL_EARTH_DIR, NATURAL_EARTH_FILES[kind].rsplit('/', 1)[-1])
+
+
+def ensure_natural_earth():
+    """Downloads any missing Natural Earth zip into NATURAL_EARTH_DIR. Returns {kind: local path}."""
+    paths = {}
+    for kind, url in NATURAL_EARTH_FILES.items():
+        path = natural_earth_path(kind)
+        if not os.path.exists(path):
+            from net import fetch_bytes
+            print(f"Downloading Natural Earth {kind} borders (one time)...")
+            data = fetch_bytes(url, timeout=20)       # short: this runs before the window opens
+            os.makedirs(NATURAL_EARTH_DIR, exist_ok=True)
+            tmp = path + ".part"
+            with open(tmp, 'wb') as f:
+                f.write(data)
+            os.replace(tmp, path)
+        paths[kind] = path
+    return paths
+
+
 try:
     import geopandas as gpd
 
+    _ne = ensure_natural_earth()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        world_borders = gpd.read_file(
-            "https://naturalearth.s3.amazonaws.com/110m_cultural/ne_110m_admin_0_countries.zip")
-        state_borders = gpd.read_file(
-            "https://naturalearth.s3.amazonaws.com/110m_cultural/ne_110m_admin_1_states_provinces.zip")
+        world_borders = gpd.read_file(_ne['countries'])
+        state_borders = gpd.read_file(_ne['states'])
     HAS_GPD = True
 except ImportError:
+    BORDERS_ERROR = "geopandas is not installed (pip install -r requirements.txt)."
     print("WARNING: geopandas not installed - borders and region masking disabled.")
-except Exception as e:  # offline, server error, bad download...
+except Exception as e:  # offline on first run, server error, bad download...
+    BORDERS_ERROR = f"{type(e).__name__}: {e}"
     print(f"WARNING: could not load Natural Earth borders ({e}) - borders and region masking disabled.")
     world_borders = None
     state_borders = None

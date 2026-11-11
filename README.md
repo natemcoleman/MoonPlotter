@@ -66,6 +66,11 @@ Earth without it, the app explains where to get it. To download it ahead of time
 
 Mars needs two large USGS files. See [Data sources](docs/data-sources.md) for these and every other dataset.
 
+On first start the app also downloads the country and state outlines (Natural Earth, a few hundred KB)
+into `MoonPlotter/natural_earth/`. Once the Earth DEM is in place, **Tools › Speed up global elevation (one
+time)** makes large areas and circle mode load several times faster. The
+[one-time setup checklist](docs/data-sources.md#one-time-setup-checklist-after-cloning) lists everything.
+
 ### Your first plot
 
 1. The **Moon** is selected under **Source**. On the **Source map**, scroll to zoom and drag a box around an
