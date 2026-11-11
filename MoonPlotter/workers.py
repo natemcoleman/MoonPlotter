@@ -241,7 +241,8 @@ class RenderWorker(QThread):
                 max_e = 0.0 if all_nan else float(np.nanmax(crop_ft))
 
                 # Auto interval for fresh draws, computed BEFORE contouring (single pass).
-                if (self.fresh or self.params.get('force_auto_interval')) and not is_tahoe and not all_nan:
+                if (self.fresh or self.params.get('force_auto_interval')) and not is_tahoe and not all_nan \
+                        and not self.params.get('fixed_interval'):          # a map-scale preset fixes it
                     lo = max(min_e, 0.0) if (self.planet == 'Earth' and not self.params.get('show_ocean', True)) else min_e
                     step = auto_contour_interval(max_e - lo, self.params.get('contour_target_lines', 20))
                     if step:

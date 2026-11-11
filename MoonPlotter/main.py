@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QAbstractItemView, QHeaderView)
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QThread, QUrl, QStandardPaths, QObject, QEvent
 from PyQt6.QtGui import (QDoubleValidator, QIntValidator, QShortcut, QKeySequence, QIcon, QAction, QColor,
-                         QDesktopServices)
+                         QDesktopServices, QFont)
 
 # Matplotlib Imports
 import matplotlib
@@ -38,7 +38,8 @@ import matplotlib.patches as patches
 from shapely.geometry import box as shp_box, LineString
 from config import (DATA_FILES, PAPER_SIZES, PT_PER_MM, PLANET_RADII, PAPER_COLORS, DEFAULT_PAPER, DEFAULT_MONO_PEN,
                     TAHOE, MIN_SEGMENT_MM, DEFAULT_HATCH_SPACING_MM, load_pens, save_pens, pen_available,
-                    pen_opacity, ink_lightness, TOOL_PEN_IDS, FAVORITE_PAPER_COLORS, pen_favorite)
+                    pen_opacity, ink_lightness, TOOL_PEN_IDS, FAVORITE_PAPER_COLORS, pen_favorite,
+                    FAVORITE_REGIONS, REGION_LAKES, SCALE_PRESETS)
 from workers import RenderWorker
 from hatch_engine import composite_ink_layers, STRATEGIES
 from theme import apply_theme, style_axes, SEPIA, ACCENT, TEXT, MUTED
@@ -194,6 +195,46 @@ class _ImageTrace(QThread):
             self.failed.emit(f"{type(e).__name__}: {e}")
             return
         self.done.emit(layers, info, self.token)
+
+
+class AspectRectangleSelector(RectangleSelector):
+    """Rectangle selector that keeps every new / resized box at the paper's shape.
+
+    ratio_fn(mid_lat) returns the box's width/height in DATA units (degrees) that prints at the paper's
+    aspect ratio: paper_aspect / cos(mid_lat). Matplotlib's 'square' state is kept on permanently with
+    that ratio as its aspect correction."""
+
+    def __init__(self, ax, onselect, ratio_fn, **kw):
+        self._ratio_fn = ratio_fn
+        super().__init__(ax, onselect, use_data_coordinates=True, **kw)
+        self.add_state('square')
+
+    def _ratio(self, mid_lat):
+        try:
+            r = float(self._ratio_fn(mid_lat))
+        except Exception:
+            return None
+        return r if np.isfinite(r) and r > 0 else None
+
+    def _set_aspect_ratio_correction(self):
+        super()._set_aspect_ratio_correction()
+        if getattr(self, '_ratio_fn', None) is not None:
+            try:
+                y0, y1 = self.extents[2:] if getattr(self, '_selection_completed', False) else (0.0, 0.0)
+            except Exception:
+                y0 = y1 = 0.0
+            r = self._ratio(0.5 * (y0 + y1))
+            if r:
+                self._aspect_ratio_correction = r
+
+    def _onmove(self, event):
+        self._state.add('square')        # always on (releasing Shift would otherwise switch it off)
+        # Ratio for the latitude the box is being drawn at (the press point and the cursor).
+        if self._eventpress is not None and event.ydata is not None and self._eventpress.ydata is not None:
+            r = self._ratio(0.5 * (self._eventpress.ydata + event.ydata))
+            if r:
+                self._aspect_ratio_correction = r
+        return super()._onmove(event)
 
 
 class _TrackpadNav(QObject):
@@ -372,6 +413,20 @@ class PlotterApp(QMainWindow):
         act(m_file, "Export G-code\u2026", self.export_action, "Ctrl+E")
         m_file.addSeparator()
         act(m_file, "Quit", self.close, "Ctrl+Q")
+        m_view = mb.addMenu("&View")
+        self.act_show_map = QAction("Source map", self, checkable=True, checked=True)
+        self.act_show_map.setShortcut(QKeySequence("Ctrl+1"))
+        self.act_show_map.toggled.connect(lambda on: self.set_panel_visible('map', on))
+        self.act_show_layers = QAction("Layers panel", self, checkable=True, checked=True)
+        self.act_show_layers.setShortcut(QKeySequence("Ctrl+2"))
+        self.act_show_layers.toggled.connect(lambda on: self.set_panel_visible('layers', on))
+        act_focus = QAction("Focus on the preview", self)
+        act_focus.setShortcut(QKeySequence("F11"))
+        act_focus.triggered.connect(lambda: self.btn_focus.toggle())
+        for a in (self.act_show_map, self.act_show_layers):
+            m_view.addAction(a)
+        m_view.addSeparator()
+        m_view.addAction(act_focus)
         m_tools = mb.addMenu("&Tools")
         act(m_tools, "Pens\u2026", self.open_pen_manager)
         act(m_tools, "Pen calibration sheet\u2026", self.open_pen_manager)
@@ -495,49 +550,45 @@ class PlotterApp(QMainWindow):
 
         # ---------- SOURCE ----------
         sec_src = CollapsibleSection("Source")
-        self.radio_earth = QRadioButton("Earth")
-        self.radio_moon = QRadioButton("Moon")
-        self.radio_mars = QRadioButton("Mars")
-        self.radio_solar = QRadioButton("Solar System")
-        self.radio_solar.setToolTip("Spacecraft trajectories through the solar system (Voyager, Cassini, New Horizons...)")
-        self.radio_image = QRadioButton("Image")
-        self.radio_image.setToolTip("Trace a logo, drawing or photo into pen outlines (and sticker cut lines)")
-        self.radio_moon.setChecked(True)            # works straight after cloning (data is in the repo)
+        self.combo_subject = QComboBox()
+        for name, tip in (("Earth", ""), ("Moon", ""), ("Mars", ""),
+                          ("Solar System", "Spacecraft trajectories through the solar system (Voyager, Cassini, "
+                                           "New Horizons...)"),
+                          ("Image", "Trace a logo, drawing or photo into pen outlines (and sticker cut lines)")):
+            self.combo_subject.addItem(name)
+            if tip:
+                self.combo_subject.setItemData(self.combo_subject.count() - 1, tip, Qt.ItemDataRole.ToolTipRole)
+        self.combo_subject.setCurrentText("Moon")      # works straight after cloning (data is in the repo)
         mars_files = DATA_FILES['Mars']
         if not (os.path.exists(mars_files['dem']) or os.path.exists(mars_files['color'])):
-            self.radio_mars.setEnabled(False)
-            self.radio_mars.setToolTip("Download the USGS Mars files into the project folder:\n"
-                                       f"{mars_files['dem']}\n{mars_files['color']}")
-        for r in (self.radio_earth, self.radio_moon, self.radio_mars, self.radio_solar, self.radio_image):
-            r.toggled.connect(lambda checked: checked and self.switch_planet())
-        h_planet = QGridLayout()
-        h_planet.setContentsMargins(0, 0, 0, 0)
-        h_planet.addWidget(self.radio_earth, 0, 0)
-        h_planet.addWidget(self.radio_moon, 0, 1)
-        h_planet.addWidget(self.radio_mars, 0, 2)
-        h_planet.addWidget(self.radio_solar, 1, 0, 1, 2)
-        h_planet.addWidget(self.radio_image, 1, 2)
-        sec_src.add(self._field("Subject", h_planet))
+            i = self.combo_subject.findText("Mars")
+            self.combo_subject.model().item(i).setEnabled(False)
+            self.combo_subject.setItemData(i, "Download the USGS Mars files into the project folder:\n"
+                                              f"{mars_files['dem']}\n{mars_files['color']}",
+                                           Qt.ItemDataRole.ToolTipRole)
+        self.combo_subject.currentIndexChanged.connect(lambda _: self.switch_planet())
+        sec_src.add(self._field("Subject", self.combo_subject))
 
         self.combo_region = QComboBox()
         self.combo_region.setEditable(True)
         self.combo_region.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        self.combo_region.addItem("None (Plot Full Selection)")
-        self.combo_region.addItem("Lake Tahoe (High-Res Bathymetry)")
-        if HAS_GPD:
-            regions = []
-            w_col = 'NAME' if 'NAME' in world_borders.columns else 'name' if 'name' in world_borders.columns else None
-            s_col = 'name' if 'name' in state_borders.columns else None
-            if w_col: regions.extend(world_borders[w_col].dropna().tolist())
-            if s_col: regions.extend(state_borders[s_col].dropna().tolist())
-            regions = sorted(list(set(regions)))
-            self.combo_region.addItems(regions)
+        regions = self._fill_region_combo()
+        if regions:
             completer = QCompleter(regions)
             completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
             completer.setFilterMode(Qt.MatchFlag.MatchContains)
             self.combo_region.setCompleter(completer)
         self.combo_region.currentTextChanged.connect(self.on_region_changed)
         self.lbl_region = sec_src.add(self._field("Clip to region", self.combo_region))
+
+        self.combo_scale = QComboBox()
+        self.combo_scale.addItem("Free (drag any area)")
+        for label, miles, ft in SCALE_PRESETS:
+            self.combo_scale.addItem(label, (miles, ft))
+        self.combo_scale.setToolTip("Fixed map scales, so plots of different places match. With a scale picked,\n"
+                                    "click (or drag) on the source map to place a frame of that width.")
+        self.combo_scale.currentIndexChanged.connect(self.apply_scale_preset)
+        self.widget_scale = sec_src.add(self._field("Map scale", self.combo_scale))
 
         self.chk_circle = QCheckBox("Circle mode (whole hemisphere)")
         self.chk_circle.toggled.connect(self.toggle_circle_mode)
@@ -546,20 +597,17 @@ class PlotterApp(QMainWindow):
         self.chk_borders.setChecked(True)
         self.chk_borders.toggled.connect(self.toggle_borders)
         sec_src.add(self.chk_borders)
-        self.chk_sites = QCheckBox("Show points of interest")
+        self.chk_sites = QCheckBox("Show points of interest on the source map")
         self.chk_sites.setChecked(True)
         self.chk_sites.setToolTip("Landing sites, mountains, craters and other good plot subjects.")
         self.chk_sites.toggled.connect(self.toggle_sites)
-        sec_src.add(self.chk_sites)
-        self.chk_site_labels = QCheckBox("Label plotted sites")
+        self.chk_site_labels = QCheckBox("Label plotted points of interest")
         self.chk_site_labels.setChecked(True)
         self.chk_site_labels.toggled.connect(self.trigger_recalc)
-        sec_src.add(self.chk_site_labels)
         self.lbl_sites_hint = QLabel("Hover a marker for details \u00b7 click to add it to the plot "
                                      "(filled = plotted) \u00b7 double-click to frame the area")
         self.lbl_sites_hint.setObjectName("hint")
         self.lbl_sites_hint.setWordWrap(True)
-        sec_src.add(self.lbl_sites_hint)
         vbox.addWidget(sec_src)
         self._build_missions_section(vbox)
         self._build_image_section(vbox)
@@ -592,6 +640,23 @@ class PlotterApp(QMainWindow):
         self._paper_color_index = self.combo_paper_color.currentIndex()
         self.combo_paper_color.currentIndexChanged.connect(self.on_paper_color_changed)
         sec_paper.add(self._field("Paper colour", self.combo_paper_color))
+        cw_row = QHBoxLayout()
+        self.combo_colorway = QComboBox()
+        self.combo_colorway.setToolTip("Switches the paper colour and every pen (contours, index lines, water,\n"
+                                       "borders, fill, map furniture, Solar System labels) in one go.")
+        self.combo_colorway.activated.connect(self.apply_selected_colorway)
+        b_cw_save = QPushButton("Save\u2026")
+        b_cw_save.setObjectName("ghost")
+        b_cw_save.setToolTip("Save the current paper colour and pens as a colourway")
+        b_cw_save.clicked.connect(self.save_colorway_dialog)
+        b_cw_del = QPushButton("Delete")
+        b_cw_del.setObjectName("ghost")
+        b_cw_del.clicked.connect(self.delete_selected_colorway)
+        cw_row.addWidget(self.combo_colorway, 1)
+        cw_row.addWidget(b_cw_save)
+        cw_row.addWidget(b_cw_del)
+        sec_paper.add(self._field("Colourway", cw_row))
+        self.reload_colorways()
         self.widget_custom = QWidget()
         h_custom = QHBoxLayout(self.widget_custom)
         h_custom.setContentsMargins(0, 0, 0, 0)
@@ -742,7 +807,6 @@ class PlotterApp(QMainWindow):
         self.chk_tanaka = QCheckBox("Illuminated contours (Tanaka)")
         self.chk_tanaka.setToolTip("Thin pen on slopes facing a north-west light, thick pen on the shadowed side.")
         self.chk_tanaka.toggled.connect(self.trigger_recalc)
-        self.sec_contours.add(self.chk_tanaka)
         self.chk_ocean = QCheckBox("Plot ocean / crater depths")
         self.chk_ocean.setChecked(True)
         self.chk_ocean.toggled.connect(self.trigger_recalc)
@@ -838,14 +902,31 @@ class PlotterApp(QMainWindow):
 
         self.chk_auto_contrast = QCheckBox("Auto contrast")
         self.chk_auto_contrast.setChecked(True)
+        self.chk_auto_contrast.setToolTip("Stretches the fill's tones to use the full light-to-dark range.")
         self.chk_auto_contrast.toggled.connect(self.trigger_recalc)
-        self.sec_fill.add(self.chk_auto_contrast)
-        self.chk_join = QCheckBox("Join neighbouring lines (zigzag)")
+        self.chk_join = QCheckBox("Join neighbouring fill lines (zigzag)")
         self.chk_join.setChecked(True)
         self.chk_join.setToolTip("Links the end of each stroke to the next line - far fewer pen lifts.")
         self.chk_join.toggled.connect(self.trigger_recalc)
-        self.sec_fill.add(self.chk_join)
         vbox.addWidget(self.sec_fill)
+
+        # ---------- ADVANCED (less-used switches, grouped) ----------
+        sec_adv = self.sec_advanced = CollapsibleSection("Advanced", expanded=False)
+
+        def adv_header(text):
+            lab = QLabel(text)
+            lab.setObjectName("fieldLabel")
+            sec_adv.add(lab)
+            return lab
+        self.lbl_adv_sites = adv_header("Points of interest")
+        for w in (self.chk_sites, self.chk_site_labels, self.lbl_sites_hint):
+            sec_adv.add(w)
+        self.lbl_adv_contours = adv_header("Contours")
+        sec_adv.add(self.chk_tanaka)
+        self.lbl_adv_fill = adv_header("Fill / hatching")
+        sec_adv.add(self.chk_auto_contrast)
+        sec_adv.add(self.chk_join)
+        vbox.addWidget(sec_adv)
 
         # ---------- MAP FURNITURE ----------
         sec_deco = self.sec_deco = CollapsibleSection("Map furniture", expanded=True)
@@ -954,7 +1035,7 @@ class PlotterApp(QMainWindow):
         splitter.setChildrenCollapsible(False)
 
         # --- Source map card ---
-        map_card = QFrame()
+        map_card = self.map_card = QFrame()
         map_card.setObjectName("card")
         v_map = QVBoxLayout(map_card)
         v_map.setContentsMargins(10, 10, 10, 8)
@@ -1013,8 +1094,13 @@ class PlotterApp(QMainWindow):
         hint_prev = QLabel("Two-finger scroll or middle-drag to pan · pinch / wheel to zoom")
         hint_prev.setObjectName("hint")
         hint_prev.setWordWrap(True)
+        self.btn_focus = QPushButton("Focus")
+        self.btn_focus.setCheckable(True)
+        self.btn_focus.setToolTip("Hide the source map and layers panel so the preview fills the window (F11)")
+        self.btn_focus.toggled.connect(self.toggle_focus_preview)
         h_prev_toolbar.addWidget(self.btn_prev_zoom)
         h_prev_toolbar.addWidget(self.btn_prev_home)
+        h_prev_toolbar.addWidget(self.btn_focus)
         h_prev_toolbar.addWidget(hint_prev, 1)
         prev_top_l.addLayout(h_prev_toolbar)
 
@@ -1116,9 +1202,12 @@ class PlotterApp(QMainWindow):
         self.fig_prev.subplots_adjust(left=0.01, right=0.99, top=0.99, bottom=0.01)
 
         # Map Canvas Events
-        self.selector = RectangleSelector(self.ax_map, self.on_select, useblit=True, button=[1], interactive=True,
-                                          props=dict(facecolor=SEL_FILL, edgecolor=SEL_EDGE, alpha=0.25, fill=True,
-                                                     linewidth=1.5))
+        # New boxes keep the paper's shape while you drag (what you frame is what gets plotted).
+        self.selector = AspectRectangleSelector(
+            self.ax_map, self.on_select,
+            lambda mid_lat: self.paper_aspect / max(np.cos(np.radians(np.clip(mid_lat, -89.0, 89.0))), 1e-3),
+            useblit=True, button=[1], interactive=True,
+            props=dict(facecolor=SEL_FILL, edgecolor=SEL_EDGE, alpha=0.25, fill=True, linewidth=1.5))
         self.zoom_selector = RectangleSelector(self.ax_map, self.on_zoom_select, useblit=True, button=[1],
                                                interactive=False,
                                                props=dict(facecolor=ZOOM_FILL, edgecolor=ZOOM_FILL, alpha=0.2,
@@ -1182,8 +1271,10 @@ class PlotterApp(QMainWindow):
             self._update_image_controls()
         for w in (self.sec_contours, self.sec_fill):
             w.setVisible(not solar)
-        for w in (self.chk_circle, self.chk_sites, self.chk_site_labels, self.lbl_sites_hint):
+        for w in (self.chk_circle, self.chk_sites, self.chk_site_labels, self.lbl_sites_hint, self.widget_scale,
+                  self.sec_advanced):
             w.setVisible(not solar)
+        self.lbl_adv_fill.setVisible(not is_hachure)       # auto contrast (and join) only apply then
         if solar:
             self.lbl_region.setVisible(False)
             self.chk_borders.setVisible(False)
@@ -1192,6 +1283,203 @@ class PlotterApp(QMainWindow):
             w.setVisible(not solar)
         if hasattr(self, 'btn_draw'):
             self.btn_draw.setText({'Solar System': "Draw Mission Plot", 'Image': "Trace Image"}.get(planet, "Draw Map"))
+
+    REGION_NONE = "None (Plot Full Selection)"
+
+    def _fill_region_combo(self):
+        """'Clip to region': None, favourites, a divider, then Lakes / States / Countries under headers.
+        Returns every selectable region name (for the type-to-search completer)."""
+        cb = self.combo_region
+        cb.addItem(self.REGION_NONE)
+        states, countries = [], []
+        if HAS_GPD:
+            w_col = 'NAME' if 'NAME' in world_borders.columns else 'name' if 'name' in world_borders.columns else None
+            s_col = 'name' if 'name' in state_borders.columns else None
+            if s_col: states = sorted(set(state_borders[s_col].dropna().tolist()))
+            if w_col: countries = sorted(set(world_borders[w_col].dropna().tolist()))
+        lakes = list(REGION_LAKES)
+        known = set(lakes) | set(states) | set(countries)
+        favs = [r for r in FAVORITE_REGIONS if r in known]
+        for r in favs:
+            cb.addItem(r)
+        groups = [("Lakes", lakes), ("States", states), ("Countries", countries)]
+        model = cb.model()
+        for title, names in groups:
+            names = [n for n in names if n not in favs]
+            if not names:
+                continue
+            cb.insertSeparator(cb.count())
+            cb.addItem(title.upper())
+            hdr = model.item(cb.count() - 1)
+            hdr.setEnabled(False)                       # a heading, not a choice
+            f = QFont(hdr.font())
+            f.setBold(True)
+            hdr.setFont(f)
+            for n in names:
+                cb.addItem(n)
+        return sorted(set(favs) | known)
+
+    # --- MAP SCALE PRESETS ---
+    def scale_preset(self):
+        """(miles across, contour ft) of the chosen map scale, or None for free selection."""
+        return self.combo_scale.currentData() if hasattr(self, 'combo_scale') else None
+
+    def apply_scale_preset(self, _index=None):
+        sp = self.scale_preset()
+        if sp is None:
+            self.interval_auto_done = False
+            self.lbl_usgs_interval.setText("Interval: Auto")
+            self.lbl_status.setText("Map scale: free - drag any area on the source map.")
+            return
+        miles, ft = sp
+        self.slider_int.blockSignals(True)
+        self.txt_int.blockSignals(True)
+        self.interval_ft = int(ft)
+        self.slider_int.setValue(min(max(int(ft), self.slider_int.minimum()), self.slider_int.maximum()))
+        self.txt_int.setText(str(int(ft)))
+        self.slider_int.blockSignals(False)
+        self.txt_int.blockSignals(False)
+        self.lbl_usgs_interval.setText(f"Interval: Map scale \u00b7 {int(ft):,} ft")
+        if self._loading:
+            return
+        e = self.current_view_extent
+        if e and not self.chk_circle.isChecked() and not self.mission_mode and not self.calibration_mode:
+            self.frame_scale_at(0.5 * (e[0] + e[1]), 0.5 * (e[2] + e[3]))
+        else:
+            self.lbl_status.setText(f"Click the source map to place a {miles:g}-mile-wide frame.")
+
+    def scale_box(self, cx, cy):
+        """Lon/lat box centred on (cx, cy) whose printed width spans the preset's miles at paper aspect."""
+        miles, _ = self.scale_preset()
+        R = PLANET_RADII.get(self.active_planet, 6371000.0)
+        km_per_deg = 2.0 * np.pi * R / 360.0 / 1000.0
+        width_km = miles * 1.609344
+        cy = float(np.clip(cy, -85.0, 85.0))
+        w_deg = width_km / (km_per_deg * max(np.cos(np.radians(cy)), 1e-3))
+        h_deg = width_km / self.paper_aspect / km_per_deg
+        return cx - w_deg / 2, cx + w_deg / 2, cy - h_deg / 2, cy + h_deg / 2
+
+    def frame_scale_at(self, cx, cy):
+        x1, x2, y1, y2 = self.scale_box(cx, cy)
+        self.last_drag_coords = (x1, x2, y1, y2)
+        self.process_selection(x1, x2, y1, y2)
+        self.selector.set_visible(True)
+        self.selector.extents = (x1, x2, y1, y2)
+        # keep the frame in view (zoom out if it is bigger than the current view)
+        xl, yl = self.ax_map.get_xlim(), self.ax_map.get_ylim()
+        if x1 < xl[0] or x2 > xl[1] or y1 < yl[0] or y2 > yl[1]:
+            px, py = (x2 - x1) * 1.5, (y2 - y1) * 1.5
+            self.ax_map.set_xlim(max(-180, x1 - px), min(180, x2 + px))
+            self.ax_map.set_ylim(max(-90, y1 - py), min(90, y2 + py))
+        self.canvas_map.draw_idle()
+        miles, ft = self.scale_preset()
+        self.lbl_status.setText(f"Framed {miles:g} miles across with {ft:,} ft contours - click Draw Map.")
+
+    # --- COLOURWAYS ---
+    def reload_colorways(self, select=None):
+        self.colorways = project_io.load_colorways()
+        cb = self.combo_colorway
+        cb.blockSignals(True)
+        cb.clear()
+        cb.addItem("Choose a colourway\u2026", None)
+        for name in self.colorways:
+            tag = "  (built-in)" if name in project_io.BUILTIN_COLORWAYS else ""
+            cb.addItem(name + tag, name)
+        cb.setCurrentIndex(max(0, cb.findData(select)) if select else 0)
+        cb.blockSignals(False)
+
+    def _colorway_widgets(self):
+        return {'contour_pen': self.combo_contour_pen, 'index_pen': self.combo_index_pen,
+                'water_pen': self.combo_water_pen, 'border_pen': self.combo_border_pen,
+                'mono_pen': self.combo_mono_pen, 'deco_pen': self.combo_deco_pen,
+                'mission_pen_labels': self.combo_mpen_labels, 'mission_pen_orbits': self.combo_mpen_orbits,
+                'mission_pen_belt': self.combo_mpen_belt}
+
+    def current_colorway(self):
+        out = {'paper_color': self.current_paper_color()}
+        for k, cb in self._colorway_widgets().items():
+            out[k] = cb.currentData()
+        return out
+
+    def apply_selected_colorway(self, _index=None):
+        name = self.combo_colorway.currentData()
+        if name and name in self.colorways:
+            self.apply_colorway(name, self.colorways[name])
+
+    def apply_colorway(self, name, cw):
+        missing = []
+        self._loading = True
+        try:
+            if cw.get('paper_color'):
+                self.set_paper_color(cw['paper_color'])
+            for k, cb in self._colorway_widgets().items():
+                pid = cw.get(k)
+                if not pid:
+                    continue
+                i = cb.findData(pid)
+                if i >= 0:
+                    cb.blockSignals(True)
+                    cb.setCurrentIndex(i)
+                    cb.blockSignals(False)
+                elif pid in self.pens:
+                    if self.pens[pid]['name'] not in missing:
+                        missing.append(self.pens[pid]['name'])
+        finally:
+            self._loading = False
+        self._image_pens = {}                       # traced image layers re-pick pens for the new paper
+        self._update_contrast_warning()
+        note = f" Not in stock: {', '.join(missing)}." if missing else ""
+        if self.mission_mode:
+            if self.image_mode:
+                self._fill_image_table()
+            self.update_paper_plot()
+        elif self.has_drawn:
+            self.render_canvas()
+            self.trigger_recalc()                   # contour / fill pens are baked into the strokes
+        else:
+            self.render_canvas()
+        self.lbl_status.setText(f"Colourway '{name}' applied.{note}")
+
+    def save_colorway_dialog(self):
+        name, ok = QInputDialog.getText(self, "Save colourway", "Colourway name:")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        if name in project_io.BUILTIN_COLORWAYS:
+            QMessageBox.information(self, "Colourways", "That name is a built-in colourway - choose another name.")
+            return
+        project_io.save_user_colorway(name, self.current_colorway())
+        self.reload_colorways(select=name)
+        self.lbl_status.setText(f"Saved colourway '{name}'.")
+
+    def delete_selected_colorway(self):
+        name = self.combo_colorway.currentData()
+        if not name:
+            return
+        if name in project_io.BUILTIN_COLORWAYS:
+            QMessageBox.information(self, "Colourways", "Built-in colourways can't be deleted.")
+            return
+        if project_io.delete_user_colorway(name):
+            self.reload_colorways()
+
+    # --- HIDEABLE PANELS ---
+    def set_panel_visible(self, which, visible):
+        w = {'map': self.map_card, 'layers': self.layer_panel}[which]
+        w.setVisible(bool(visible))
+        act = {'map': self.act_show_map, 'layers': self.act_show_layers}[which]
+        if act.isChecked() != bool(visible):
+            act.blockSignals(True)
+            act.setChecked(bool(visible))
+            act.blockSignals(False)
+        self.btn_focus.blockSignals(True)
+        self.btn_focus.setChecked(not (self.map_card.isVisible() or self.layer_panel.isVisible()))
+        self.btn_focus.blockSignals(False)
+        QTimer.singleShot(0, lambda: (self._apply_screen_linewidths(), self.schedule_ink_sim(150)))
+
+    def toggle_focus_preview(self, on):
+        """Hide (or bring back) the source map and the layers panel so the preview gets the space."""
+        self.set_panel_visible('map', not on)
+        self.set_panel_visible('layers', not on)
 
     def on_region_changed(self, text):
         if "Tahoe" in text:
@@ -1419,6 +1707,7 @@ class PlotterApp(QMainWindow):
             'layer_contours': self.sec_contours.is_enabled(),
             'layer_fill': self.sec_fill.is_enabled(),
             'force_auto_interval': not self.interval_auto_done,
+            'fixed_interval': self.scale_preset() is not None,
             'tanaka': self.chk_tanaka.isChecked(),
             'fill_source': self.combo_source.currentText(),
             'fill_inks': 'color' if self.combo_inks.currentText() == "Color separation" else 'mono',
@@ -2489,6 +2778,8 @@ class PlotterApp(QMainWindow):
             return
         if event.button == 1:
             hit = self._site_at(event)
+            self._site_click = hit is not None
+            self._map_press_px = (event.x, event.y)
             if hit is not None:
                 if event.dblclick:
                     self.frame_site(hit[1])
@@ -2539,6 +2830,18 @@ class PlotterApp(QMainWindow):
             self._update_site_hover(event)
 
     def on_mouse_release_map(self, event):
+        press = getattr(self, '_map_press_px', None)
+        if (event.button == 1 and press is not None and self.scale_preset() is not None
+                and not getattr(self, '_site_click', False) and not self.mission_mode
+                and not self.chk_circle.isChecked() and not self.btn_zoom_tool.isChecked()
+                and event.inaxes == self.ax_map and event.xdata is not None
+                and abs(event.x - press[0]) < 4 and abs(event.y - press[1]) < 4):
+            self._map_press_px = None
+            # a plain click with a map-scale preset: centre a frame of that width here (after the
+            # selector has finished with the click)
+            x, y = event.xdata, event.ydata
+            QTimer.singleShot(0, lambda: self.frame_scale_at(x, y))
+            return
         if event.button == 2:
             self.pan_active = False
         elif event.button == 1 and self.chk_circle.isChecked():
@@ -2575,13 +2878,7 @@ class PlotterApp(QMainWindow):
         self.update_paper_dims()
 
     def selected_planet(self):
-        if self.radio_image.isChecked():
-            return 'Image'
-        if self.radio_solar.isChecked():
-            return 'Solar System'
-        if self.radio_mars.isChecked():
-            return 'Mars'
-        return 'Moon' if self.radio_moon.isChecked() else 'Earth'
+        return self.combo_subject.currentText() or 'Moon'
 
     def explain_missing_dem(self, planet, force=False):
         """Earth / Mars elevation files are too big for the repository: explain where to get them
@@ -2866,6 +3163,17 @@ class PlotterApp(QMainWindow):
         x1, x2 = sorted([eclick.xdata, erelease.xdata]);
         y1, y2 = sorted([eclick.ydata, erelease.ydata])
         tiny = abs(erelease.x - eclick.x) < 4 or abs(erelease.y - eclick.y) < 4
+        site_click = getattr(self, '_site_click', False)
+        if self.scale_preset() is not None:
+            # Fixed map scale: the centre of a drag places a frame of the preset width (plain clicks are
+            # handled in on_mouse_release_map - matplotlib reports them here only sometimes).
+            if not tiny and not site_click:
+                self.frame_scale_at(0.5 * (x1 + x2), 0.5 * (y1 + y2))
+            elif self.last_drag_coords:
+                self.selector.set_visible(True)
+                self.selector.extents = tuple(self.current_view_extent or self.last_drag_coords)
+                self.canvas_map.draw_idle()
+            return
         if tiny:
             # A click (e.g. on a point of interest), not a drag: keep the existing selection.
             if self.last_drag_coords:
@@ -2892,6 +3200,8 @@ class PlotterApp(QMainWindow):
         ex1, ex2 = cx - pad_geo_w / 2, cx + pad_geo_w / 2
         ey1, ey2 = cy - pad_geo_h / 2, cy + pad_geo_h / 2
         self.current_view_extent = [ex1, ex2, ey1, ey2]
+        if self.selector.get_visible() and not self.mission_mode:
+            self.selector.extents = (ex1, ex2, ey1, ey2)      # the box shows exactly what will be plotted
         self._render_token += 1
         self.last_relief_ft = None
         self.interval_auto_done = False
@@ -3096,6 +3406,7 @@ class PlotterApp(QMainWindow):
         st = self._get_widget_state()
         st.update({
             'planet': self.active_planet, 'region': self.combo_region.currentText(),
+            'map_scale': self.combo_scale.currentText(),
             'paper_name': self.paper_name, 'custom_w': self.txt_cw.text(), 'custom_h': self.txt_ch.text(),
             'landscape': self.is_landscape, 'circle_mode': self.chk_circle.isChecked(),
             'circle_center_lon': getattr(self, 'circle_center_lon', 0.0),
@@ -3140,8 +3451,7 @@ class PlotterApp(QMainWindow):
                 self._fill_mission_table()
             if st.get('image'):
                 self._apply_image_state(st['image'])
-            {'Earth': self.radio_earth, 'Moon': self.radio_moon, 'Mars': self.radio_mars,
-             'Solar System': self.radio_solar, 'Image': self.radio_image}[planet].setChecked(True)
+            self.combo_subject.setCurrentText(planet)
             if self.active_planet != planet:
                 self.switch_planet()
             self.selected_sites = {k: set(v) for k, v in st.get('selected_sites', {}).items()}
@@ -3154,6 +3464,8 @@ class PlotterApp(QMainWindow):
             self.update_paper_dims()
             self._set_widget_state(st)
             self.combo_region.setCurrentText(st.get('region', "None (Plot Full Selection)"))
+            i = self.combo_scale.findText(st.get('map_scale') or '')
+            self.combo_scale.setCurrentIndex(max(0, i))
             if st.get('circle_mode'):
                 self.circle_center_lon = float(st.get('circle_center_lon', 0.0))
                 self.chk_circle.setChecked(True)
@@ -3801,8 +4113,8 @@ class PlotterApp(QMainWindow):
         self._image_cache = {}
         self._image_pens = {}
         self.lbl_image_file.setText(f"{os.path.basename(path)}  ({rgb.shape[1]}×{rgb.shape[0]} px)")
-        if not self.radio_image.isChecked():
-            self.radio_image.setChecked(True)          # -> switch_planet -> _enter_image_mode
+        if self.combo_subject.currentText() != 'Image':
+            self.combo_subject.setCurrentText('Image')     # -> switch_planet -> _enter_image_mode
         else:
             self._draw_image_overview()
         if not self._loading:

@@ -85,6 +85,25 @@ PAPER_COLORS = {
 DEFAULT_PAPER = 'White'
 # Paper colours listed first (above a divider) in the paper-colour drop-down.
 FAVORITE_PAPER_COLORS = ('White', 'Black')
+
+# "Clip to region" drop-down: these come first (above a divider), then the rest grouped by category.
+FAVORITE_REGIONS = ('Lake Tahoe (High-Res Bathymetry)', 'Wyoming', 'Utah', 'California', 'Washington')
+# Region entries that are lakes (bathymetry); ski resorts are added in Phase 4.
+REGION_LAKES = ('Lake Tahoe (High-Res Bathymetry)',)
+
+# Map scale presets (Source > Map scale): (label, width of the printed map in miles, contour interval ft).
+# Picking one sizes the selection to that real-world width (at the paper's aspect ratio) and fixes the
+# contour interval, so plots of different places share one scale.
+SCALE_PRESETS = [
+    ("1 mi wide \u00b7 20 ft contours", 1, 20),
+    ("2 mi wide \u00b7 40 ft contours", 2, 40),
+    ("5 mi wide \u00b7 100 ft contours", 5, 100),
+    ("10 mi wide \u00b7 200 ft contours", 10, 200),
+    ("25 mi wide \u00b7 500 ft contours", 25, 500),
+    ("50 mi wide \u00b7 1,000 ft contours", 50, 1000),
+    ("100 mi wide \u00b7 2,000 ft contours", 100, 2000),
+    ("250 mi wide \u00b7 5,000 ft contours", 250, 5000),
+]
 DEFAULT_MONO_PEN = 'pen_1'
 TOOL_PEN_IDS = {'cutter'}            # never offered as an ink
 
