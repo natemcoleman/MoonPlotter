@@ -1,7 +1,7 @@
 """Reusable widgets: collapsible sidebar sections and the preview layer list."""
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QEvent, QCoreApplication
 from PyQt6.QtGui import QPixmap, QColor, QIcon, QPainter, QPen
-from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QToolButton, QCheckBox, QFrame,
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QToolButton, QCheckBox, QFrame, QPushButton,
                              QListWidget, QListWidgetItem, QLabel, QComboBox, QAbstractSpinBox, QSlider,
                              QStylePainter, QStyleOptionComboBox, QStyle)
 
@@ -128,15 +128,26 @@ class LayerPanel(QWidget):
     context_requested(layer_key, global_pos) on right-click (used for 'set pen for whole layer')."""
     visibility_changed = pyqtSignal(str, bool)
     context_requested = pyqtSignal(str, object)
+    hide_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(6)
+        head = QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
         title = QLabel("LAYERS")
         title.setObjectName("panelTitle")
-        v.addWidget(title)
+        head.addWidget(title)
+        head.addStretch(1)
+        b_hide = QPushButton("Hide \u25B8")
+        b_hide.setObjectName("ghost")
+        b_hide.setToolTip("Hide the layers panel so the preview gets more room (Ctrl+2).\n"
+                          "Bring it back with 'Layers' above the preview or View > Layers panel.")
+        b_hide.clicked.connect(self.hide_requested.emit)
+        head.addWidget(b_hide)
+        v.addLayout(head)
         self.list = QListWidget()
         self.list.setObjectName("layers")
         self.list.itemChanged.connect(self._changed)

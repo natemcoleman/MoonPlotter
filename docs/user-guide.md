@@ -8,6 +8,10 @@ The window has three parts:
 - **The plot preview** shows the sheet exactly as it will be drawn. The editing tools are below it and
   the **Layers** panel is to its right.
 
+Need more room for the preview? Click **Hide** in the top corner of the source map or the Layers panel.
+A **Source map** / **Layers** button then appears above the preview to bring it back. **Focus** (F11) hides
+both at once, and **View › Source map / Layers panel** (Ctrl+1 / Ctrl+2) does the same from the menu.
+
 The buttons at the bottom of the sidebar are **Draw Map**, **Save SVG** and **Export G-code**. The status
 line above them tells you what the app is doing.
 
