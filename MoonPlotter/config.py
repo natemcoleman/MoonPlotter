@@ -24,6 +24,26 @@ TAHOE = {
     'surface_ft': 6225.0,
 }
 
+# Lakes plotted as bathymetry (Clip to region > Lakes): see lakes.py.
+#   kind 'survey': a bundled lake-only raster from a real depth survey.
+#   kind 'model' : lake bed modelled from the OpenStreetMap shoreline and published depths (no public
+#                  survey grid exists). surface_ft = lake surface elevation; interval_ft = contour step.
+LAKES = {
+    'Lake Tahoe (High-Res Bathymetry)': {
+        'kind': 'survey', 'dem': TAHOE['dem'], 'bounds': TAHOE['bounds'], 'multiplier': TAHOE['multiplier'],
+        'surface_ft': TAHOE['surface_ft'], 'interval_ft': 75},
+    # Max ~73 m, mean ~43 m: Larsen et al. 2016, Quaternary Science Reviews (doi:10.1016/j.quascirev.2016.02.024).
+    # Surface 6,783 ft (Wikipedia).
+    'Jenny Lake (modelled depth)': {
+        'kind': 'model', 'osm_name': 'Jenny Lake', 'center': (43.7639, -110.7300), 'radius_km': 3.0,
+        'max_depth_m': 73.0, 'mean_depth_m': 43.0, 'surface_ft': 6783.0, 'interval_ft': 20},
+    # Max 134 m at full capacity: Rhea et al. 2005, USGS-CERC-91344. Surface 6,772 ft (Wikipedia).
+    # No published mean depth: DEFAULT_MEAN_RATIO in lakes.py is used.
+    'Jackson Lake (modelled depth)': {
+        'kind': 'model', 'osm_name': 'Jackson Lake', 'center': (43.93, -110.67), 'radius_km': 15.0,
+        'max_depth_m': 134.0, 'mean_depth_m': None, 'surface_ft': 6772.0, 'interval_ft': 40},
+}
+
 PLANET_RADII = {'Earth': 6371000.0, 'Moon': 1737400.0, 'Mars': 3389500.0}
 
 PAPER_SIZES = {
@@ -88,8 +108,8 @@ FAVORITE_PAPER_COLORS = ('White', 'Black')
 
 # "Clip to region" drop-down: these come first (above a divider), then the rest grouped by category.
 FAVORITE_REGIONS = ('Lake Tahoe (High-Res Bathymetry)', 'Wyoming', 'Utah', 'California', 'Washington')
-# Region entries that are lakes (bathymetry); ski resorts are added in Phase 4.
-REGION_LAKES = ('Lake Tahoe (High-Res Bathymetry)',)
+# Region entries that are lakes (bathymetry), listed under LAKES in the drop-down.
+REGION_LAKES = tuple(LAKES)
 
 # Map scale presets (Source > Map scale): (label, width of the printed map in miles, contour interval ft).
 # Picking one sizes the selection to that real-world width (at the paper's aspect ratio) and fixes the

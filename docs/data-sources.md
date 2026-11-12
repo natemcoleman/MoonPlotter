@@ -36,6 +36,7 @@ Notes:
   it.
 - `tahoe_lake_wgs84.tif` (in the repo) is a 10 m Lake Tahoe bathymetry model. It is used when you choose
   **Clip to region › Lake Tahoe (High-Res Bathymetry)**. `tools/make_tahoe.py` shows how it was built.
+  Other lakes are described in [Lakes](#lakes).
 - Country and state borders come from [Natural Earth](https://www.naturalearthdata.com/). The first time
   the app starts (with `geopandas` installed and an internet connection) it downloads two small zips into
   `MoonPlotter/natural_earth/`; after that it loads them from disk, so starts are faster and work offline.
@@ -55,6 +56,7 @@ Everything the app needs that is not in the repository, and how it gets it:
 | Natural Earth borders (`natural_earth/`) | Earth borders, **Clip to region** | Downloaded automatically on first start (see above) |
 | Earth elevation `BE_dem_v2.tif` | Earth maps | Manual download (table above); selecting Earth without it shows the link |
 | Mars files | Mars | Manual download (table above); Mars stays disabled until they exist |
+| Lake shorelines (`lakes/*.json`) | **Clip to region › Lakes** (Jenny, Jackson) | In the repo; the modelled lake-bed `.tif` is built on first use (see [Lakes](#lakes)) |
 | Ski resort runs and lifts (`ski_resorts/*.json`) | **Clip to region › Ski resorts** | In the repo. If a file is deleted, it is downloaded again from OpenStreetMap the next time you pick that resort (see [Ski resorts](#ski-resorts)) |
 | Overviews (`<dem>.tif.ovr`) | faster big areas and circle mode (optional) | **Tools › Speed up global elevation (one time)**, or `python MoonPlotter/dem_prep.py`. The app suggests it on the status line when a large global DEM has none. The original `.tif` is not changed. |
 
@@ -105,6 +107,29 @@ certificate in certificate chain"). When that happens, the app retries with the 
 it is installed, then with Windows' own `curl.exe`, then with PowerShell. These use the system
 certificate store. If downloads still fail, run `pip install truststore`.
 
+## Lakes
+
+Lakes are listed in `LAKES` in `config.py` and handled by `lakes.py`. Each is plotted from a lake-only
+elevation raster (feet, NaN outside the shoreline), contoured every `interval_ft` below `surface_ft`.
+
+| Lake | Kind | Data |
+|---|---|---|
+| Lake Tahoe | survey | `tahoe_lake_wgs84.tif`, 10 m, in the repo |
+| Jenny Lake | modelled | shoreline `lakes/jenny_lake.json` (OpenStreetMap, in the repo); max depth ~73 m and mean ~43 m from Larsen et al. 2016, *Quaternary Science Reviews* (seismic survey) |
+| Jackson Lake | modelled | shoreline `lakes/jackson_lake.json` (OpenStreetMap, in the repo, islands included); max depth 134 m at full capacity from Rhea et al. 2005 (USGS-CERC-91344); no published mean, so a mean of 0.45 x max is assumed |
+
+No downloadable depth grid could be found for Jenny or Jackson Lake (surveys exist, such as the National
+Park Service raster used by Larsen et al., but they are not published as downloads), so these two beds are
+**modelled**: depth
+grows smoothly with distance from the shore and is scaled so the deepest point and the average depth match
+the published values. The outline and depth range are real; the shape of the bed is an idealisation, not a
+survey. The model is built the first time you pick the lake and saved as `lakes/<lake>.tif` (not in the
+repo; rebuilt from the shoreline file if deleted). If a shoreline file is missing it is downloaded again
+from OpenStreetMap (Overpass API).
+
+To use a real survey instead, save it as a GeoTIFF in feet (EPSG:4326, NaN outside the lake), then in
+`LAKES` set the lake's `'kind'` to `'survey'`, `'dem'` to the file name and `'bounds'` to its extent.
+
 ## Ski resorts
 
 The **Ski resorts** entries in **Clip to region** overlay ski runs and lifts on the contours. The data
@@ -136,6 +161,6 @@ sharp data. It is stored in `regions/` like any other fetched area.
 | Sentinel-2 cloudless (EOX) | **CC BY-NC-SA 4.0: non-commercial use only.** Credit: "Sentinel-2 cloudless by EOX IT Services GmbH (Contains modified Copernicus Sentinel data 2024)". Don't sell plots made with it. |
 | GEBCO | Public domain, with attribution to the GEBCO Compilation Group |
 | Natural Earth | Public domain |
-| OpenStreetMap (ski runs and lifts) | [ODbL 1.0](https://www.openstreetmap.org/copyright). Credit "© OpenStreetMap contributors" on plots you share. |
+| OpenStreetMap (ski runs and lifts, lake shorelines) | [ODbL 1.0](https://www.openstreetmap.org/copyright). Credit "© OpenStreetMap contributors" on plots you share. |
 
 Check each provider's current terms before using plots commercially.

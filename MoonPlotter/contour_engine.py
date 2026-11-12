@@ -6,7 +6,7 @@ import scipy.ndimage
 from shapely.geometry import box as shp_box, LineString, MultiLineString
 from matplotlib.figure import Figure
 
-from config import DATA_FILES, PLANET_RADII, AUTO_CONTOUR_TARGET_LINES, NICE_INTERVALS_FT, TAHOE
+from config import DATA_FILES, PLANET_RADII, AUTO_CONTOUR_TARGET_LINES, NICE_INTERVALS_FT
 from geometry_utils import chaikin_smooth, ortho_project
 
 MAX_CONTOUR_LEVELS = 600
@@ -97,7 +97,8 @@ def generate_contours(dem_crop, data_extent, view_extent, params, progress_callb
 
     planet = params.get('active_planet', 'Earth')
     selected_region = params.get('selected_region', 'None (Plot Full Selection)')
-    is_tahoe = (planet == 'Earth' and "Tahoe" in selected_region)
+    lake = params.get('lake') if planet == 'Earth' else None      # lake bathymetry region (lakes.render_info)
+    is_lake = bool(lake)
     is_circle = params.get('circle_mode', False)
     mult = params.get('dem_multiplier', DATA_FILES[planet]['multiplier'])
     dem_extent = params.get('dem_extent', data_extent)
@@ -118,10 +119,10 @@ def generate_contours(dem_crop, data_extent, view_extent, params, progress_callb
     if interval_ft <= 0:
         return segments
 
-    if is_tahoe:
+    if is_lake:
         # Bathymetric contours every interval below the lake surface. The shoreline itself is
         # drawn from the lake mask further down (the DEM is NaN outside the lake).
-        surface = TAHOE['surface_ft']
+        surface = float(lake['surface_ft'])
         levels = np.sort(np.arange(surface - interval_ft, min_e, -interval_ft)).tolist()
     else:
         s_lvl = np.floor(min_e / interval_ft) * interval_ft
@@ -160,7 +161,7 @@ def generate_contours(dem_crop, data_extent, view_extent, params, progress_callb
 
     region_geom = None
     mask_polygon = None
-    if HAS_GPD and planet == 'Earth' and not is_tahoe and "None" not in selected_region:
+    if HAS_GPD and planet == 'Earth' and not is_lake and "None" not in selected_region:
         if progress_callback: progress_callback(f"Generating region mask for {selected_region}...")
         w_col = 'NAME' if 'NAME' in world_borders.columns else 'name' if 'name' in world_borders.columns else None
         s_col = 'name' if 'name' in state_borders.columns else None
@@ -182,10 +183,10 @@ def generate_contours(dem_crop, data_extent, view_extent, params, progress_callb
     if progress_callback: progress_callback(f"Smoothing and projecting {len(cs.levels)} vector layers...")
     index_interval = params.get('index_interval', 5)
     contour_sets = [(level, cs.allsegs[i]) for i, level in enumerate(cs.levels)]
-    if is_tahoe:
+    if is_lake:
         # Shoreline = outline of the lake mask, drawn with the index pen.
         cs_shore = ax_temp.contour(valid_mask.astype(np.float32), levels=[0.5], extent=dem_extent, origin='upper')
-        contour_sets.append((TAHOE['surface_ft'], cs_shore.allsegs[0]))
+        contour_sets.append((surface, cs_shore.allsegs[0]))
 
     # Illuminated (Tanaka) contours: each contour is split where it turns toward / away from a
     # light in the north-west. Lit stretches use the thin pen, shadowed stretches the thick pen.
@@ -228,8 +229,8 @@ def generate_contours(dem_crop, data_extent, view_extent, params, progress_callb
         is_index = False
         is_water = (planet == 'Earth' and level < 0 and params.get('blue_water', True))
 
-        if is_tahoe:
-            steps_down = round((TAHOE['surface_ft'] - level) / interval_ft)
+        if is_lake:
+            steps_down = round((surface - level) / interval_ft)
             if steps_down == 0:
                 is_index = True                       # shoreline
             elif params.get('auto_index', True) and steps_down % index_interval == 0:
@@ -267,7 +268,7 @@ def generate_contours(dem_crop, data_extent, view_extent, params, progress_callb
 
     # Geopolitical reference borders. Border LINES are clipped (not polygons), so no fake
     # border segments appear along the edges of the selection.
-    if params.get('show_borders', True) and planet == 'Earth' and not is_tahoe and HAS_GPD:
+    if params.get('show_borders', True) and planet == 'Earth' and not is_lake and HAS_GPD:
         if progress_callback: progress_callback("Extracting geopolitical borders...")
 
         def append_border(coords):

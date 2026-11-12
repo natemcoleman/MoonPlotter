@@ -5,6 +5,22 @@ trajectory charts.
 
 <p align="center"><img src="images/voyager2.png" width="50%" alt="Voyager 2 trajectory plot"></p>
 
+## Two kinds of plot
+
+**Plot** at the top of the **Solar System** section chooses:
+
+- **Mission trajectories**: real spacecraft paths, described below.
+- **Solar System diagram (all planets)**: a poster-style schematic of the whole Solar System. The Sun's edge
+  sits at the left with rays, concentric orbit arcs run off the frame, and the eight planets line up along
+  the middle with their names: banded Jupiter, ringed Saturn, Uranus (vertical ring) and Neptune, plus a
+  few moons, a stippled asteroid belt with small rocks, and scattered background stars. The title goes
+  under the frame: type `Title | subtitle` in **Title** (blank = "THE SOLAR SYSTEM / OUR CELESTIAL
+  NEIGHBORHOOD"). Tick boxes switch **Labels**, **Asteroid belt**, **Moons**, **Background stars**, **Sun
+  rays** and the **Frame** on or off; the **Pens** settings work as for missions (orbits and frame use the
+  Orbits pen; the belt and stars the Asteroid belt pen). Click **Draw Solar System**. Sizes and distances
+  are schematic, not to scale, and the layout is meant for landscape paper. On black or navy paper,
+  click **Use light pens**.
+
 ## Making a plot
 
 1. Under **Source › Subject**, choose **Solar System**. The **Missions** section replaces the map and

@@ -592,6 +592,47 @@ class _GapFillRaster:
         return np.where(empty, np.float32(self.fill), d).astype(np.float32)
 
 
+# Idealized globes (circle mode): every point of the disc gets at least the lightest level of ink, so
+# the globe reads as one filled sphere whatever the fill style - no white holes for polar ice, bright
+# deserts, bright lunar highlands or gaps in the colour map. Floors per style (density 0..1):
+DISC_FLOOR_VARIABLE = 0.22      # Variable Spacing Scanlines: 4 lines of every 16 (densest light tone)
+DISC_FLOOR_STIPPLE = 0.12       # Stippling: about one dot in eight grid cells
+DISC_FLOOR_SQUIGGLE = 1e-3      # Sine squiggles: a flat (zero-amplitude) line
+DISC_OVERLAP_MM = 0.8           # strokes run this far past their area's edge, so where two inks meet (coasts)
+                                # and in narrow strips (straits, thin peninsulas) nothing is left white
+
+
+def _extend_runs(on, inside, dt):
+    """Globes: lengthens every run of 'on' samples by DISC_OVERLAP_MM at both ends (within the disc)."""
+    k = int(round(DISC_OVERLAP_MM / dt))
+    if k < 1:
+        return on
+    return scipy.ndimage.binary_dilation(on, structure=np.ones((1, 2 * k + 1), dtype=bool)) & inside
+# Crosshatch: just enough to switch the first pass on (depends on the pen width, see generate_hatches).
+
+
+class _DiscFloorRaster:
+    """Raises one ink's density to `floor` where that ink 'owns' the disc, so exactly one ink covers
+    every point. exclusive=True (Earth land / ocean, whose maps don't overlap): wherever the ink has any
+    density. Otherwise: where it is the strongest ink; where no ink has any, the lightest ink (index 0)
+    owns it. Drop-in for _Raster.sample."""
+
+    def __init__(self, own, all_rasters, idx, exclusive, floor=0.0):
+        self.own, self.all, self.idx = own, list(all_rasters), idx
+        self.exclusive, self.floor = exclusive, float(floor)
+
+    def sample(self, lon, lat):
+        d = self.own.sample(lon, lat)
+        if len(self.all) <= 1:
+            owned = np.ones(d.shape, dtype=bool)
+        elif self.exclusive:
+            owned = d > 0.0
+        else:
+            stack = np.stack([r.sample(lon, lat) for r in self.all])
+            owned = np.argmax(stack, axis=0) == self.idx          # ties (all zero) -> lightest ink
+        return np.where(owned, np.maximum(d, np.float32(self.floor)), d).astype(np.float32)
+
+
 def _normalize_region(vals, mask, auto_contrast, tone_gamma, d_min, d_max):
     """Normalizes lightness within a specific mask (land or ocean) and maps it to [d_min, d_max]."""
     if not mask.any():
@@ -752,15 +793,22 @@ def generate_hatches(rgb, rgb_bounds, view_extent, params, progress_callback=Non
     golden = 0.6180339887
     align_phases = is_earth_circle_color and (EARTH_CIRCLE_SHARED_ANGLE is not None)
 
+    full_disc = FULL_DISC_IN_CIRCLE_MODE and frame.circle
     all_rasters = [_Raster(m, rgb_bounds) for m in dens_maps]
     for ink_idx, ((pen_id, base_angle), dmap, lw, cmax) in enumerate(zip(inks, dens_maps, line_w, max_cov)):
         raster = all_rasters[ink_idx]
         if is_earth_circle_color and EARTH_CIRCLE_FILL_GAPS_WITH_OCEAN and ink_idx == ocean_idx:
             raster = _GapFillRaster(raster, all_rasters, ocean_fill)
+        if full_disc:
+            # Earth land / ocean: the ocean ink already covers every gap, so each ink keeps to its own area.
+            # Other globes: the strongest ink at each point, or the lightest where none would draw.
+            raster = _DiscFloorRaster(raster, all_rasters, ink_idx, exclusive=is_earth_circle_color)
         level = 1000 * (ink_idx + 1)
         if progress_callback: progress_callback(f"{strategy}: {pens[pen_id]['name']}...")
 
         if "Stipp" in strategy:
+            if full_disc:
+                raster.floor = DISC_FLOOR_STIPPLE
             dots = _stipple_dots(frame, raster, spacing, ink_idx, rng)
             segments.extend(_emit(frame, dots, pen_id, level, seg_type='stipple'))
 
@@ -768,6 +816,8 @@ def generate_hatches(rgb, rgb_bounds, view_extent, params, progress_callback=Non
             line_spacing, _, wavelength = _squiggle_params(spacing)
             amps, covs = _squiggle_table(lw, spacing)
             dt = wavelength / 16.0
+            if full_disc:
+                raster.floor = DISC_FLOOR_SQUIGGLE
             phase_offset = 0.0 if align_phases else (golden * ink_idx * line_spacing)
             offs, ts, U, V, (nx, ny) = _scan_grid(frame, base_angle, line_spacing, dt, phase_offset)
             inside = frame.inside(U, V)
@@ -775,11 +825,10 @@ def generate_hatches(rgb, rgb_bounds, view_extent, params, progress_callback=Non
             c = d * cmax
             c0 = covs[0]                                   # coverage of a straight line
 
-            # Keep the full circle intact on monochrome globes (white ice caps draw as flat 0-amplitude lines)
-            if FULL_DISC_IN_CIRCLE_MODE and frame.circle and use_mono:
-                on = inside.copy()
-            elif FULL_DISC_IN_CIRCLE_MODE and is_earth_circle_color:
-                on = (d > 0.0) & inside
+            # Globes: keep every line unbroken across the part of the disc this ink owns (white ice caps
+            # draw as flat 0-amplitude lines)
+            if full_disc:
+                on = _extend_runs((d > 0.0) & inside, inside, dt)
             else:
                 on = (c >= 0.5 * c0) & inside
 
@@ -797,6 +846,8 @@ def generate_hatches(rgb, rgb_bounds, view_extent, params, progress_callback=Non
             segments.extend(_emit(frame, lines, pen_id, level, seg_type='squiggle'))
 
         elif "Variable" in strategy:
+            if full_disc:
+                raster.floor = DISC_FLOOR_VARIABLE
             dt = SAMPLE_STEP_MM
             offs, ts, U, V, _ = _scan_grid(frame, base_angle, spacing, dt, golden * ink_idx * spacing)
             inside = frame.inside(U, V)
@@ -805,6 +856,8 @@ def generate_hatches(rgb, rgb_bounds, view_extent, params, progress_callback=Non
             j = np.arange(len(offs))
             thr = (_bitrev(j % 16, 4) + 0.5) / 16.0
             on = (d >= thr[:, None]) & inside
+            if full_disc:
+                on = _extend_runs(on, inside, dt)
             on = _clean_runs(on, inside, dt)
             rows, lines = _straight_runs(on, U, V)
             if join:
@@ -817,6 +870,8 @@ def generate_hatches(rgb, rgb_bounds, view_extent, params, progress_callback=Non
             k = min(1.0, lw / spacing)
             levels = np.array([1.0 - (1.0 - k) ** n for n in range(n_passes + 1)])
             levels = levels / levels[-1]
+            if full_disc:
+                raster.floor = min(1.0, 0.5 * (levels[0] + levels[1]) + 0.02)    # first pass always on
             angles = [base_angle, base_angle + 90.0, base_angle + 45.0, base_angle + 135.0][:n_passes]
             dt = SAMPLE_STEP_MM
             for p, ang in enumerate(angles):
@@ -825,6 +880,8 @@ def generate_hatches(rgb, rgb_bounds, view_extent, params, progress_callback=Non
                 inside = frame.inside(U, V)
                 d = raster.sample(*frame.to_lonlat(U, V)) * inside
                 on = (d >= thr) & inside
+                if full_disc and p == 0:
+                    on = _extend_runs(on, inside, dt)             # the base pass covers the whole disc
                 on = _clean_runs(on, inside, dt)
                 rows, lines = _straight_runs(on, U, V)
                 if join:

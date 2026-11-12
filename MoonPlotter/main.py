@@ -37,9 +37,9 @@ import matplotlib.patches as patches
 # Geometry & Local Imports
 from shapely.geometry import box as shp_box, LineString
 from config import (DATA_FILES, PAPER_SIZES, PT_PER_MM, PLANET_RADII, PAPER_COLORS, DEFAULT_PAPER, DEFAULT_MONO_PEN,
-                    TAHOE, MIN_SEGMENT_MM, DEFAULT_HATCH_SPACING_MM, load_pens, save_pens, pen_available,
+                    MIN_SEGMENT_MM, DEFAULT_HATCH_SPACING_MM, load_pens, save_pens, pen_available,
                     pen_opacity, ink_lightness, TOOL_PEN_IDS, FAVORITE_PAPER_COLORS, pen_favorite,
-                    FAVORITE_REGIONS, REGION_LAKES, SCALE_PRESETS)
+                    FAVORITE_REGIONS, REGION_LAKES, LAKES, SCALE_PRESETS)
 from workers import RenderWorker
 from hatch_engine import composite_ink_layers, STRATEGIES
 from theme import apply_theme, style_axes, SEPIA, ACCENT, TEXT, MUTED
@@ -52,6 +52,7 @@ from stroke_font import stroke_text
 from calibration import build_calibration_sheet
 import missions as MS
 from mission_plot import build_mission_plot, PATH_STYLES
+from system_diagram import build_system_diagram
 import image_trace as IT
 from export_dialog import ExportDialog
 from pen_dialog import PenManagerDialog
@@ -66,7 +67,8 @@ ZOOM_FILL = ACCENT
 LAYER_LABELS = {'contours': 'Contours', 'borders': 'Borders & outlines', 'sites': 'Points of interest',
                 'decor': 'Map furniture', 'calibration': 'Calibration sheet',
                 'orbits': 'Planet orbits', 'trajectory': 'Trajectories', 'markers': 'Sun, planets & year marks',
-                'belt': 'Asteroid belt', 'labels': 'Labels & title',
+                'belt': 'Asteroid belt', 'labels': 'Labels & title', 'stars': 'Background stars',
+                'frame': 'Frame',
                 'annotations': 'Text & drawn lines', 'img:cut': 'Sticker cut line',
                 'ski_runs': 'Ski runs', 'ski_lifts': 'Ski lifts'}
 
@@ -132,6 +134,7 @@ from contour_engine import HAS_GPD, world_borders, state_borders, BORDERS_ERROR,
 import dem_prep
 import ski
 import svg_import
+import lakes
 from workers import clear_dem_cache
 
 # Cache for UI map previews
@@ -180,6 +183,25 @@ class _MissionFetch(QThread):
             self.failed.emit(f"{type(e).__name__}: {e}")
             return
         self.done.emit(out)
+
+
+class _LakeBuild(QThread):
+    """Downloads a lake's shoreline (OpenStreetMap) and models its bed, once, in the background."""
+    done = pyqtSignal(str)
+    failed = pyqtSignal(str, str)
+    progress = pyqtSignal(str)
+
+    def __init__(self, lake):
+        super().__init__()
+        self.lake = lake
+
+    def run(self):
+        try:
+            lakes.ensure(self.lake, progress=self.progress.emit)
+        except Exception as e:
+            self.failed.emit(self.lake, f"{type(e).__name__}: {e}")
+            return
+        self.done.emit(self.lake)
 
 
 class _SkiFetch(QThread):
@@ -372,6 +394,8 @@ class PlotterApp(QMainWindow):
         self.recalc_pending = False
         self.pending_fresh = False
         self.interval_auto_done = False   # an auto interval has been picked for the current selection
+        self.interval_manual = False      # the user typed / dragged an interval: Draw Map keeps it
+        self.hidden_tiles = set()         # page labels ('r1c2') switched off: veiled in the preview, not exported
         self.layer_visible = {}           # layer key -> bool (missing = visible)
         self.selected_sites = {}          # planet -> set of site names to plot
         self.map_segments = []            # strokes from the worker (contours, fill, sites)
@@ -792,6 +816,27 @@ class PlotterApp(QMainWindow):
         sec_paper.add(self._field("Split into pages (tiles)", tile_box,
                                   "The paper size above is one page; the map spans all of them. Each page "
                                   "exports as its own G-code."))
+        # One button per page, laid out like the pages themselves: click to hide / show that page.
+        self.widget_tile_pages = QWidget()
+        v_pages = QVBoxLayout(self.widget_tile_pages)
+        v_pages.setContentsMargins(0, 0, 0, 0)
+        v_pages.setSpacing(3)
+        self.tile_pages_grid = QGridLayout()
+        self.tile_pages_grid.setSpacing(2)
+        v_pages.addLayout(self.tile_pages_grid)
+        h_pages = QHBoxLayout()
+        h_pages.setContentsMargins(0, 0, 0, 0)
+        b_all = QPushButton("Show all")
+        b_all.setToolTip("Turn every page back on.")
+        b_all.clicked.connect(lambda: self._set_hidden_tiles(set()))
+        h_pages.addWidget(b_all)
+        h_pages.addStretch(1)
+        v_pages.addLayout(h_pages)
+        self._tile_page_buttons = {}
+        self._tile_pages_shape = None
+        sec_paper.add(self._field("Pages", self.widget_tile_pages,
+                                  "Click a page to hide it: it is greyed out in the preview and left out of the "
+                                  "export. Click again to bring it back."))
         vbox.addWidget(sec_paper)
 
         # ---------- CONTOURS LAYER ----------
@@ -816,6 +861,13 @@ class PlotterApp(QMainWindow):
         h_int.addWidget(self.slider_int, 1)
         h_int.addWidget(self.txt_int)
         h_int.addWidget(QLabel("ft"))
+        self.btn_int_auto = QPushButton("Auto")
+        self.btn_int_auto.setToolTip("Go back to an automatic interval (picked from the relief and the density\n"
+                                     "slider). A typed interval is kept when you click Draw Map until you click this.")
+        self.btn_int_auto.setFixedWidth(56)
+        self.btn_int_auto.setEnabled(False)
+        self.btn_int_auto.clicked.connect(self.use_auto_interval)
+        h_int.addWidget(self.btn_int_auto)
         self.sec_contours.add(self._field("Interval override", self.widget_interval))
 
         self.slider_density = QSlider(Qt.Orientation.Horizontal)
@@ -1405,7 +1457,7 @@ class PlotterApp(QMainWindow):
                   self.combo_scale_units.parentWidget(), self.chk_deco_title, self.widget_subtitle):
             w.setVisible(not solar)
         if hasattr(self, 'btn_draw'):
-            self.btn_draw.setText({'Solar System': "Draw Mission Plot",
+            self.btn_draw.setText({'Solar System': "Draw Solar System" if self.is_system_diagram() else "Draw Mission Plot",
                                    'Image': "Place SVG" if self.svg_layers is not None else "Trace Image"
                                    }.get(planet, "Draw Map"))
 
@@ -1502,13 +1554,13 @@ class PlotterApp(QMainWindow):
             s_col = 'name' if 'name' in state_borders.columns else None
             if s_col: states = sorted(set(state_borders[s_col].dropna().tolist()))
             if w_col: countries = sorted(set(world_borders[w_col].dropna().tolist()))
-        lakes = list(REGION_LAKES)
+        lake_names = list(REGION_LAKES)
         resorts = [ski.region_label(n) for n in ski.RESORTS]
-        known = set(lakes) | set(resorts) | set(states) | set(countries)
+        known = set(lake_names) | set(resorts) | set(states) | set(countries)
         favs = [r for r in self.favorites['regions'] if r in known]
         for r in favs:
             cb.addItem(r)
-        groups = [("Lakes", lakes), ("Ski resorts", resorts), ("States", states), ("Countries", countries)]
+        groups = [("Lakes", lake_names), ("Ski resorts", resorts), ("States", states), ("Countries", countries)]
         model = cb.model()
         for title, names in groups:
             names = [n for n in names if n not in favs]
@@ -1534,10 +1586,12 @@ class PlotterApp(QMainWindow):
         sp = self.scale_preset()
         if sp is None:
             self.interval_auto_done = False
-            self.lbl_usgs_interval.setText("Interval: Auto")
+            self.lbl_usgs_interval.setText(f"Interval: Manual ({self.interval_ft} ft) - kept when you redraw"
+                                           if self.interval_manual else "Interval: Auto")
             self.lbl_status.setText("Map scale: free - drag any area on the source map.")
             return
         miles, ft = sp
+        self._set_interval_manual(False)
         self.slider_int.blockSignals(True)
         self.txt_int.blockSignals(True)
         self.interval_ft = int(ft)
@@ -1697,18 +1751,24 @@ class PlotterApp(QMainWindow):
         self.widget_ski_field.setVisible(resort is not None and self.active_planet == 'Earth')
         if resort and not self._loading:
             self.start_ski_fetch(resort)
-        if "Tahoe" in text:
-            self.slider_int.blockSignals(True);
+        lake = lakes.lake_from_label(text)
+        if lake:
+            ft = int(LAKES[lake]['interval_ft'])
+            self.slider_int.blockSignals(True)
             self.txt_int.blockSignals(True)
-            self.slider_int.setRange(25, 500);
-            self.slider_int.setSingleStep(25)
-            self.slider_int.setValue(75);
-            self.txt_int.setText("75")
-            self.interval_ft = 75
-            self.lbl_usgs_interval.setText("Interval: Tahoe Bathymetry (75 ft)")
-            self.slider_int.blockSignals(False);
+            self.slider_int.setRange(5, 500)
+            self.slider_int.setSingleStep(5)
+            self.slider_int.setValue(ft)
+            self.txt_int.setText(str(ft))
+            self.interval_ft = ft
+            self._set_interval_manual(False)
+            self.lbl_usgs_interval.setText(f"Interval: {lake.split(' (')[0]} bathymetry ({ft} ft)")
+            self.slider_int.blockSignals(False)
             self.txt_int.blockSignals(False)
-            self.select_tahoe_extent()
+            if lakes.is_ready(lake):
+                self.select_lake_extent(lake)
+            elif not self._loading:
+                self.start_lake_build(lake)
         else:
             self.slider_int.blockSignals(True);
             self.txt_int.blockSignals(True)
@@ -1717,26 +1777,68 @@ class PlotterApp(QMainWindow):
             val = max(50, self.interval_ft)
             self.slider_int.setValue(val);
             self.txt_int.setText(str(val))
-            self.lbl_usgs_interval.setText("Interval: Auto (USGS Scale)")
+            self.lbl_usgs_interval.setText(f"Interval: Manual ({self.interval_ft} ft) - kept when you redraw"
+                                           if self.interval_manual else "Interval: Auto (USGS Scale)")
             self.slider_int.blockSignals(False);
             self.txt_int.blockSignals(False)
-        # A different region is a different map: re-render fresh (auto interval unless Tahoe).
+        # A different region is a different map: re-render fresh (auto interval unless a lake).
         self.pending_fresh = True
         self.recalc_timer.start(500)
 
-    def select_tahoe_extent(self):
+    def selected_lake(self):
+        """Lake name (config.LAKES) chosen under Clip to region, or None."""
+        if self.active_planet != 'Earth' or not hasattr(self, 'combo_region'):
+            return None
+        return lakes.lake_from_label(self.combo_region.currentText())
+
+    def start_lake_build(self, lake):
+        """First use of a modelled lake: shoreline download + lake-bed model, then frame it."""
+        job = getattr(self, '_lake_job', None)
+        if job is not None and job.isRunning():
+            return                                       # already on it; it frames the lake when done
+        if self.is_calculating:
+            self.lbl_status.setText("Busy - pick the lake again when the current job finishes.")
+            return
+        if self.chk_circle.isChecked():
+            self.chk_circle.setChecked(False)
+        self.is_calculating = True
+        self.btn_draw.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self._lake_job = _LakeBuild(lake)
+        self._lake_job.progress.connect(self.lbl_status.setText)
+        self._lake_job.done.connect(self._on_lake_ready)
+        self._lake_job.failed.connect(self._on_lake_failed)
+        self._lake_job.start()
+
+    def _on_lake_ready(self, lake):
+        self._ski_job_finished()
+        if self.selected_lake() == lake:
+            self.select_lake_extent(lake)
+
+    def _on_lake_failed(self, lake, msg):
+        self._ski_job_finished()
+        QMessageBox.warning(self, "Lake", f"Could not prepare {lake}:\n\n{msg}\n\nThe first time, the shoreline "
+                                          "is downloaded from OpenStreetMap: check the internet connection and "
+                                          "pick the lake again.")
+
+    def select_lake_extent(self, lake):
         """Frames the selection on the lake (padded to the paper aspect) and zooms the map to it."""
         if self.active_planet != 'Earth' or self.chk_circle.isChecked():
             return
-        left, bottom, right, top = TAHOE['bounds']
+        fb = lakes.frame_bounds(lake)
+        if fb is None:
+            return
+        left, bottom, right, top = fb
         self.last_drag_coords = (left, right, bottom, top)
         self.process_selection(left, right, bottom, top)
         self.selector.extents = (left, right, bottom, top)
-        pad = 0.6
+        pad = max(0.05, 1.5 * max(right - left, top - bottom))
         self.ax_map.set_xlim(left - pad, right + pad)
         self.ax_map.set_ylim(bottom - pad, top + pad)
         self.canvas_map.draw_idle()
-        self.lbl_status.setText("Lake Tahoe framed - click Draw Map.")
+        note = " The lake bed is modelled from the shoreline and published depths (see the docs)." \
+            if lakes.is_modelled(lake) else ""
+        self.lbl_status.setText(f"{lake.split(' (')[0]} framed - click Draw Map.{note}")
 
     # --- PEN PALETTE & STATES ---
     def push_undo_state(self):
@@ -1844,9 +1946,10 @@ class PlotterApp(QMainWindow):
 
     def apply_contour_density(self):
         """Density slider -> nearest standard interval for the last rendered relief."""
-        if "Tahoe" in self.combo_region.currentText():
-            self.lbl_status.setText("Tahoe uses a fixed 75 ft bathymetry interval - use the override box.")
+        if self.selected_lake():
+            self.lbl_status.setText("Lakes use a fixed bathymetry interval - type one in the override box.")
             return
+        self._set_interval_manual(False)             # the density slider means 'pick it for me'
         if not self.last_relief_ft:
             self.interval_auto_done = False          # the next draw picks the interval with this density
             return
@@ -1894,11 +1997,25 @@ class PlotterApp(QMainWindow):
                 self.slider_int.blockSignals(True)
                 self.slider_int.setValue(val)
                 self.slider_int.blockSignals(False)
-                if "Tahoe" not in self.combo_region.currentText():
-                    self.lbl_usgs_interval.setText(f"Interval: Manual ({val} ft)")
+                if not self.selected_lake():
+                    self._set_interval_manual(True)
+                    self.lbl_usgs_interval.setText(f"Interval: Manual ({val} ft) - kept when you redraw")
                 self.recalc_timer.start(250)
         except ValueError:
             pass
+
+    def _set_interval_manual(self, on):
+        self.interval_manual = bool(on)
+        if hasattr(self, 'btn_int_auto'):
+            self.btn_int_auto.setEnabled(self.interval_manual)
+
+    def use_auto_interval(self):
+        """'Auto' button: drop the typed interval; the next render picks one from the relief."""
+        self._set_interval_manual(False)
+        self.interval_auto_done = False
+        self.lbl_usgs_interval.setText("Interval: Auto")
+        if self.has_drawn:
+            self.trigger_recalc()
 
     def get_ui_params(self):
         return {
@@ -1922,7 +2039,7 @@ class PlotterApp(QMainWindow):
             'layer_contours': self.sec_contours.is_enabled(),
             'layer_fill': self.sec_fill.is_enabled(),
             'force_auto_interval': not self.interval_auto_done,
-            'fixed_interval': self.scale_preset() is not None,
+            'fixed_interval': self.scale_preset() is not None or self.interval_manual,
             'ski_resort': self.selected_resort() if self.active_planet == 'Earth' else None,
             'ski_opts': self.ski_options(),
             'tanaka': self.chk_tanaka.isChecked(),
@@ -1944,6 +2061,8 @@ class PlotterApp(QMainWindow):
             'paper_h_mm': self.ph,
             'pens': copy.deepcopy(self.pens),
             'regional_dem': self._regional('dem'),
+            'lake': lakes.render_info(self.selected_lake()) if self.selected_lake() and lakes.is_ready(
+                self.selected_lake()) else None,
             'regional_color': self._regional('color'),
         }
 
@@ -1951,7 +2070,7 @@ class PlotterApp(QMainWindow):
         """Sharper regional raster covering the selection (see Tools > Data sources), else None."""
         if not self.current_view_extent or self.chk_circle.isChecked():
             return None
-        if kind == 'dem' and self.active_planet == 'Earth' and "Tahoe" in self.combo_region.currentText():
+        if kind == 'dem' and self.selected_lake():
             return None
         try:
             meta = regions.best_region(self.active_planet, kind, self.current_view_extent)
@@ -1964,7 +2083,8 @@ class PlotterApp(QMainWindow):
                 'name': meta['name']}
 
     def draw_action(self):
-        """'Draw Map' button: always a fresh render (auto interval, reset view, clear annotations)."""
+        """'Draw Map' button: always a fresh render (auto interval unless one was typed, reset view, clear
+        annotations)."""
         if self.is_calculating:
             return
         if self.calibration_mode:
@@ -1981,8 +2101,12 @@ class PlotterApp(QMainWindow):
         if not self.current_view_extent: return
         params = self.get_ui_params()
         dem_path = DATA_FILES[self.active_planet]['dem']
-        if self.active_planet == 'Earth' and "Tahoe" in params['selected_region']:
-            dem_path = TAHOE['dem']
+        lake = self.selected_lake()
+        if lake:
+            if not lakes.is_ready(lake):
+                self.start_lake_build(lake)
+                return
+            dem_path = lakes.dem_path(lake)
 
         if not (params['layer_contours'] or params['layer_fill']):
             self.lbl_status.setText("Turn on the Contours and/or Fill layer first.")
@@ -2334,7 +2458,7 @@ class PlotterApp(QMainWindow):
             groups['annotations'] = {'pens': list(dict.fromkeys(i['pen_id'] for i in self.custom_items)),
                                      'n': len(self.custom_items)}
         order = ['calibration', 'contours', 'borders', 'ski_runs', 'ski_lifts', 'sites'] + sorted(k for k in groups if k.startswith('fill:')) + \
-                ['orbits', 'belt', 'trajectory', 'markers', 'labels', 'decor', 'annotations']
+                ['frame', 'orbits', 'belt', 'stars', 'trajectory', 'markers', 'labels', 'decor', 'annotations']
         order += sorted(k for k in groups if k not in order)
         rows = []
         for k in order:
@@ -3087,6 +3211,7 @@ class PlotterApp(QMainWindow):
         self.pw = cols * self.tile_w + (cols - 1) * gap
         self.ph = rows * self.tile_h + (rows - 1) * gap
         self.paper_aspect = self.pw / self.ph
+        self._rebuild_tile_pages()
         self.ax_prev.set_box_aspect(self.ph / self.pw)
         self.canvas_prev.draw_idle()
         if getattr(self, 'mission_mode', False):
@@ -3107,6 +3232,60 @@ class PlotterApp(QMainWindow):
     def is_tiled(self):
         c, r, _ = self.tile_layout()
         return c * r > 1
+
+    def _rebuild_tile_pages(self):
+        """Page buttons (Paper section) for the current grid; drops hidden pages that no longer exist."""
+        if not hasattr(self, 'tile_pages_grid'):
+            return
+        cols, rows, _ = self.tile_layout()
+        holder = self.widget_tile_pages.parentWidget()
+        if holder is not None:
+            holder.setVisible(cols * rows > 1)
+        labels = {f"r{r + 1}c{c + 1}" for r in range(rows) for c in range(cols)} if cols * rows > 1 else set()
+        self.hidden_tiles &= labels
+        if self._tile_pages_shape != (cols, rows):
+            self._tile_pages_shape = (cols, rows)
+            for b in self._tile_page_buttons.values():
+                self.tile_pages_grid.removeWidget(b)
+                b.deleteLater()
+            self._tile_page_buttons = {}
+            if cols * rows > 1:
+                for r in range(rows):
+                    for c in range(cols):
+                        lab = f"r{r + 1}c{c + 1}"
+                        b = QToolButton()
+                        b.setText(lab.upper())
+                        b.setCheckable(True)
+                        b.setMinimumWidth(44)
+                        b.toggled.connect(lambda on, k=lab: self._toggle_tile(k, on))
+                        self.tile_pages_grid.addWidget(b, r, c)
+                        self._tile_page_buttons[lab] = b
+        self._sync_tile_buttons()
+
+    def _sync_tile_buttons(self):
+        for lab, b in self._tile_page_buttons.items():
+            shown = lab not in self.hidden_tiles
+            b.blockSignals(True)
+            b.setChecked(shown)
+            b.blockSignals(False)
+            b.setText(lab.upper() if shown else f"{lab.upper()} \u2715")
+            b.setToolTip(f"Page {lab.upper()}: " + ("shown - click to hide it (not exported)" if shown
+                                                    else "hidden - click to show it again"))
+
+    def _toggle_tile(self, label, shown):
+        hidden = set(self.hidden_tiles)
+        (hidden.discard if shown else hidden.add)(label)
+        self._set_hidden_tiles(hidden)
+
+    def _set_hidden_tiles(self, hidden):
+        self.hidden_tiles = set(hidden)
+        self._sync_tile_buttons()
+        if self.has_drawn:
+            self.render_canvas()
+
+    def visible_tile_rects(self):
+        """tile_rects() without the pages the user switched off."""
+        return [t for t in self.tile_rects() if t[0] is None or t[0] not in self.hidden_tiles]
 
     def tile_rects(self):
         """[(label, (x0, y0, w, h))] in paper mm over the whole mosaic (origin bottom-left); row 1 is the top."""
@@ -3146,6 +3325,11 @@ class PlotterApp(QMainWindow):
         cut = self.chk_tile_cut.isChecked()
         for label, (x0, y0, w, h) in self.tile_rects():
             X0, X1, Y0, Y1 = self._paper_rect_to_data(x0, y0, w, h)
+            if label in self.hidden_tiles:
+                self.ax_prev.add_patch(patches.Rectangle((X0, Y0), X1 - X0, Y1 - Y0, facecolor='#D8D2C6',
+                                                         alpha=0.88, edgecolor='none', zorder=16))
+                self.ax_prev.text((X0 + X1) / 2, (Y0 + Y1) / 2, "hidden\n(not exported)", fontsize=7,
+                                  color='#6F675B', ha='center', va='center', zorder=17)
             self.ax_prev.add_patch(patches.Rectangle((X0, Y0), X1 - X0, Y1 - Y0, fill=False, zorder=17,
                                                      edgecolor=ACCENT if cut else '#8A8173',
                                                      linestyle='--', linewidth=1.0 if cut else 0.7))
@@ -3201,7 +3385,7 @@ class PlotterApp(QMainWindow):
                 "(<i>ETOPO_2022_v1_60s_N90W180_surface.tif</i>).</li>"
                 "<li>Put it in the app folder as <b>%s</b>:<br><i>%s</i></li>"
                 "<li>Select Earth again (no restart needed).</li></ol>"
-                "<p>Until then you can still plot <b>Lake Tahoe</b> (Clip to region) and any area you fetch with "
+                "<p>Until then you can still plot the <b>Lakes</b> (Clip to region) and any area you fetch with "
                 "<b>Tools &rsaquo; Data sources</b>.</p>") % (url, name, APP_DIR)
         else:
             url = "https://planetarymaps.usgs.gov/mosaic/"
@@ -3332,6 +3516,8 @@ class PlotterApp(QMainWindow):
             return
         if self.mission_mode:
             self._leave_mission_mode()
+        if self.active_planet != self.selected_planet():
+            self._set_interval_manual(False)         # a typed Earth interval means nothing on the Moon
         self.active_planet = self.selected_planet()
         self.context_ui_update()
         if not self._loading:
@@ -3825,6 +4011,7 @@ class PlotterApp(QMainWindow):
             'circle_center_lon': getattr(self, 'circle_center_lon', 0.0),
             'selection': list(self.last_drag_coords) if self.last_drag_coords else None,
             'interval_ft': self.interval_ft, 'interval_auto_done': self.interval_auto_done,
+            'interval_manual': self.interval_manual, 'hidden_tiles': sorted(self.hidden_tiles),
             'selected_sites': {k: sorted(v) for k, v in self.selected_sites.items()},
             'layer_visible': self.layer_visible, 'custom_items': self.custom_items,
             'has_drawn': self.has_drawn and not self.calibration_mode,
@@ -3836,7 +4023,10 @@ class PlotterApp(QMainWindow):
                          'belt': self.chk_belt.isChecked(), 'title': self.txt_mission_title.text(),
                          'pen_labels': self.combo_mpen_labels.currentData(),
                          'pen_orbits': self.combo_mpen_orbits.currentData(),
-                         'pen_belt': self.combo_mpen_belt.currentData()},
+                         'pen_belt': self.combo_mpen_belt.currentData(),
+                         'style': self.combo_system_style.currentIndex(),
+                         'moons': self.chk_sys_moons.isChecked(), 'stars': self.chk_sys_stars.isChecked(),
+                         'rays': self.chk_sys_rays.isChecked(), 'frame': self.chk_sys_frame.isChecked()},
             'image': self._image_state(),
             'preview_view': [list(self.ax_prev.get_xlim()), list(self.ax_prev.get_ylim())] if self.has_drawn else None,
         })
@@ -3856,6 +4046,11 @@ class PlotterApp(QMainWindow):
                 self.chk_mission_labels.setChecked(bool(ms.get('labels', True)))
                 self.chk_belt.setChecked(bool(ms.get('belt', True)))
                 self.txt_mission_title.setText(ms.get('title', ''))
+                self.combo_system_style.setCurrentIndex(int(ms.get('style', 0)))
+                for c, k in ((self.chk_sys_moons, 'moons'), (self.chk_sys_stars, 'stars'),
+                             (self.chk_sys_rays, 'rays'), (self.chk_sys_frame, 'frame')):
+                    c.setChecked(bool(ms.get(k, True)))
+                self._on_system_style_changed()
                 for cb, k in ((self.combo_mpen_labels, 'pen_labels'), (self.combo_mpen_orbits, 'pen_orbits'),
                               (self.combo_mpen_belt, 'pen_belt')):
                     i = cb.findData(ms.get(k))
@@ -3896,6 +4091,9 @@ class PlotterApp(QMainWindow):
                 self.ax_map.set_xlim(*mv[0])
                 self.ax_map.set_ylim(*mv[1])
             self.interval_ft = int(st.get('interval_ft', self.interval_ft))
+            self._set_interval_manual(st.get('interval_manual', False))
+            self.hidden_tiles = set(st.get('hidden_tiles', []))
+            self._rebuild_tile_pages()
             self.slider_int.blockSignals(True)
             self.txt_int.blockSignals(True)
             self.slider_int.setValue(min(max(self.interval_ft, self.slider_int.minimum()), self.slider_int.maximum()))
@@ -4095,13 +4293,20 @@ class PlotterApp(QMainWindow):
     MISSION_PEN_CYCLE = ['blue_038', 'red_038', 'base', 'green_07', 'orange_07', 'purple_07', 'pink_07', 'blue_07']
 
     def _build_missions_section(self, vbox):
-        sec = self.sec_missions = CollapsibleSection("Missions")
+        sec = self.sec_missions = CollapsibleSection("Solar System")
+        self.combo_system_style = QComboBox()
+        self.combo_system_style.addItems(["Mission trajectories", "Solar System diagram (all planets)"])
+        self.combo_system_style.setToolTip("Mission trajectories: real spacecraft paths from NASA JPL Horizons.\n"
+                                           "Solar System diagram: a poster-style schematic of the Sun and all eight "
+                                           "planets (not to scale), with orbits, rings, moons, asteroid belt and stars.")
+        self.combo_system_style.currentIndexChanged.connect(self._on_system_style_changed)
+        sec.add(self._field("Plot", self.combo_system_style))
         self.combo_mission_filter = QComboBox()
         self.combo_mission_filter.addItems(["All missions", "Johns Hopkins APL missions", "APL-built spacecraft only"])
         self.combo_mission_filter.setToolTip("APL missions: spacecraft built/operated by the Johns Hopkins Applied "
                                              "Physics Laboratory, or carrying an APL-built instrument.")
         self.combo_mission_filter.currentIndexChanged.connect(lambda _: self._fill_mission_table())
-        sec.add(self._field("Show", self.combo_mission_filter))
+        self._mission_only = [sec.add(self._field("Show", self.combo_mission_filter))]
         self.table_missions = QTableWidget(0, 3)
         self.table_missions.setHorizontalHeaderLabels(["", "Mission", "Pen"])
         self.table_missions.setWordWrap(False)
@@ -4114,20 +4319,32 @@ class PlotterApp(QMainWindow):
         self.table_missions.setMinimumHeight(230)
         self._mission_checked = {'voyager2': True}
         self._mission_pens = {}
-        sec.add(self.table_missions)
+        self._mission_only.append(sec.add(self.table_missions))
         self.combo_path_style = QComboBox()
         self.combo_path_style.addItems(PATH_STYLES)
         self.combo_path_style.currentIndexChanged.connect(lambda _: self.update_mission_plot())
-        sec.add(self._field("Trajectory line", self.combo_path_style))
+        self._mission_only.append(sec.add(self._field("Trajectory line", self.combo_path_style)))
         self.chk_year_marks = QCheckBox("Year markers (1 YR, 2 YR...)")
         self.chk_year_marks.setChecked(True)
         self.chk_mission_labels = QCheckBox("Labels with leader arrows")
         self.chk_mission_labels.setChecked(True)
         self.chk_belt = QCheckBox("Asteroid belt (stippled)")
         self.chk_belt.setChecked(True)
-        for c in (self.chk_year_marks, self.chk_mission_labels, self.chk_belt):
+        self.chk_sys_moons = QCheckBox("Moons")
+        self.chk_sys_stars = QCheckBox("Background stars")
+        self.chk_sys_rays = QCheckBox("Sun rays")
+        self.chk_sys_frame = QCheckBox("Frame around the diagram")
+        for c in (self.chk_sys_moons, self.chk_sys_stars, self.chk_sys_rays, self.chk_sys_frame):
+            c.setChecked(True)
+        self._system_only = []
+        for c in (self.chk_year_marks, self.chk_mission_labels, self.chk_belt,
+                  self.chk_sys_moons, self.chk_sys_stars, self.chk_sys_rays, self.chk_sys_frame):
             c.toggled.connect(lambda _: self.update_mission_plot())
-            sec.add(c)
+            w = sec.add(c)
+            if c is self.chk_year_marks:
+                self._mission_only.append(w if w is not None else c)
+            elif c in (self.chk_sys_moons, self.chk_sys_stars, self.chk_sys_rays, self.chk_sys_frame):
+                self._system_only.append(w if w is not None else c)
         # pens for everything that isn't a trajectory (light pens for dark paper)
         pen_box = QWidget()
         g = QGridLayout(pen_box)
@@ -4148,7 +4365,7 @@ class PlotterApp(QMainWindow):
         b_light.clicked.connect(self.use_light_mission_pens)
         sec.add(b_light)
         self.txt_mission_title = QLineEdit()
-        self.txt_mission_title.setPlaceholderText("Title (blank = automatic)")
+        self.txt_mission_title.setPlaceholderText("Title (blank = automatic; 'Title | subtitle' in the diagram)")
         self.txt_mission_title.textChanged.connect(lambda _: self.decor_timer.start(500))
         sec.add(self._field("Title", self.txt_mission_title))
         hint = QLabel("Real trajectories from NASA JPL Horizons. The first use of a mission downloads it (internet "
@@ -4156,7 +4373,13 @@ class PlotterApp(QMainWindow):
                       "compressed so inner and outer planets both fit. On dark paper, click 'Use light pens'.")
         hint.setObjectName("hint")
         hint.setWordWrap(True)
-        sec.add(hint)
+        self._mission_only.append(sec.add(hint) or hint)
+        hint2 = QLabel("A schematic poster of the whole Solar System - sizes and distances are not to scale. It is "
+                       "laid out for landscape paper (click Rotate in the Paper section for portrait sheets). "
+                       "On dark paper, click 'Use light pens'.")
+        hint2.setObjectName("hint")
+        hint2.setWordWrap(True)
+        self._system_only.append(sec.add(hint2) or hint2)
         self.lbl_mission_status = QLabel("")
         self.lbl_mission_status.setObjectName("hint")
         self.lbl_mission_status.setWordWrap(True)
@@ -4165,6 +4388,25 @@ class PlotterApp(QMainWindow):
         vbox.addWidget(sec)
         self._fill_mission_table()
         self._fill_mission_pen_combos()
+        self._on_system_style_changed()
+
+    def is_system_diagram(self):
+        return hasattr(self, 'combo_system_style') and self.combo_system_style.currentIndex() == 1
+
+    def _on_system_style_changed(self, _=None):
+        diagram = self.is_system_diagram()
+        for w in self._mission_only:
+            w.setVisible(not diagram)
+        for w in self._system_only:
+            w.setVisible(diagram)
+        self.chk_mission_labels.setText("Labels" if diagram else "Labels with leader arrows")
+        if hasattr(self, 'btn_draw') and getattr(self, 'mission_mode', False) and not self.image_mode:
+            self.btn_draw.setText("Draw Solar System" if diagram else "Draw Mission Plot")
+        if not self._loading and getattr(self, 'mission_mode', False) and not self.image_mode:
+            if diagram:
+                self.update_mission_plot(fresh=True)
+            else:
+                self.update_mission_plot()
 
     def _fill_mission_pen_combos(self):
         for cb in (self.combo_mpen_labels, self.combo_mpen_orbits, self.combo_mpen_belt):
@@ -4277,7 +4519,8 @@ class PlotterApp(QMainWindow):
         self.canvas_prev.draw_idle()
         self.layer_panel.set_layers([], {})
         self.layer_panel.set_order([], '')
-        self.lbl_status.setText("Solar System: tick missions, then Draw Mission Plot.")
+        self.lbl_status.setText("Solar System: click Draw Solar System." if self.is_system_diagram()
+                                else "Solar System: tick missions, then Draw Mission Plot.")
 
     def _leave_mission_mode(self):
         self.mission_mode = False
@@ -4311,6 +4554,9 @@ class PlotterApp(QMainWindow):
         self.canvas_map.draw_idle()
 
     def start_mission_plot(self):
+        if self.is_system_diagram():
+            self.update_mission_plot(fresh=True)
+            return
         sel = self.mission_selection()
         if not sel:
             self.lbl_status.setText("Tick at least one mission first.")
@@ -4354,14 +4600,17 @@ class PlotterApp(QMainWindow):
             return
         if not fresh and not self.has_drawn:
             return
-        for m, _ in self.mission_selection():
+        diagram = self.is_system_diagram()
+        for m, _ in ([] if diagram else self.mission_selection()):
             if m['key'] not in self.mission_data:
                 d = MS.load_cached(m)                   # already downloaded: no need to press Draw
                 if d is not None:
                     self.mission_data[m['key']] = d
         sel = [(m, p) for m, p in self.mission_selection() if m['key'] in self.mission_data]
         waiting = [m['name'] for m, _ in self.mission_selection() if m['key'] not in self.mission_data]
-        if not sel:
+        if diagram:
+            sel, waiting = [], []
+        elif not sel:
             if self.has_drawn:
                 self.lbl_status.setText("Tick a mission and click Draw Mission Plot (new ones need a download).")
             return
@@ -4372,9 +4621,14 @@ class PlotterApp(QMainWindow):
                 'belt_line_mm': self._pen_line_mm(self.combo_mpen_belt.currentData() or lab_pen),
                 'text_size': self.combo_text_size.currentText(), 'title_text': self.txt_mission_title.text().strip(),
                 'path_style': self.combo_path_style.currentText(), 'year_marks': self.chk_year_marks.isChecked(),
-                'labels': self.chk_mission_labels.isChecked(), 'belt': self.chk_belt.isChecked()}
+                'labels': self.chk_mission_labels.isChecked(), 'belt': self.chk_belt.isChecked(),
+                'moons': self.chk_sys_moons.isChecked(), 'stars': self.chk_sys_stars.isChecked(),
+                'rays': self.chk_sys_rays.isChecked(), 'frame': self.chk_sys_frame.isChecked()}
         try:
-            segs, masks, info = build_mission_plot(sel, self.mission_data, opts, self.pw, self.ph)
+            if diagram:
+                segs, masks, info = build_system_diagram(opts, self.pw, self.ph)
+            else:
+                segs, masks, info = build_mission_plot(sel, self.mission_data, opts, self.pw, self.ph)
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -4398,6 +4652,11 @@ class PlotterApp(QMainWindow):
         self.render_canvas()
         self.refresh_layer_panel()
         self._draw_mission_overview()
+        if diagram:
+            tall = self.ph > self.pw * 1.05
+            self.lbl_status.setText(f"Solar System diagram ({len(segs):,} strokes)."
+                                    + (" It is laid out for landscape paper - click Rotate in Paper." if tall else ""))
+            return
         names = ", ".join(m['name'] for m, _ in sel)
         clipped = [x['name'] for x in info.get('missions', []) if x.get('clipped')]
         self.lbl_status.setText(f"Mission plot: {names} ({len(segs):,} strokes)."
@@ -4971,7 +5230,7 @@ class PlotterApp(QMainWindow):
         dlg = ExportDialog(rows, lambda pid, feed: self.estimate_pen_minutes(pid, feed), note, self,
                            lift_mm=getattr(self, 'pen_lift_mm', None),
                            cutout=self.is_tiled() and self.chk_tile_cut.isChecked(),
-                           tiles=len(self.tile_rects()))
+                           tiles=len(self.visible_tile_rects()))
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         st = dlg.settings()
@@ -5024,7 +5283,7 @@ class PlotterApp(QMainWindow):
         base_name = os.path.splitext(os.path.basename(base_filepath))[0]
         text_boxes = self._text_mask_boxes()
         files, skipped, empty_tiles = [], [], []
-        for label, (x0, y0, w, h) in self.tile_rects():
+        for label, (x0, y0, w, h) in self.visible_tile_rects():
             if label:
                 X0, X1, Y0, Y1 = self._paper_rect_to_data(x0, y0, w, h)
                 self._export_tile = {'w': w, 'h': h, 'xlim': (X0, X1), 'ylim': (Y0, Y1),

@@ -44,23 +44,32 @@ On the **source map**:
 Other source options:
 
 - **Clip to region** (Earth only, needs `geopandas`): type a country or US state. The map is clipped to its
-  outline. **Lake Tahoe (High-Res Bathymetry)** uses the bundled 10 m lake-bed model with a fixed
-  75 ft interval.
+  outline.
+- **Lakes** (in the same list) are drawn as lake-bed contours below the water surface, with the shoreline
+  as an index line: **Lake Tahoe (High-Res Bathymetry)** (bundled 10 m survey, 75 ft interval),
+  **Jenny Lake (modelled depth)** (20 ft) and **Jackson Lake (modelled depth)** (40 ft). No public survey
+  grid exists for Jenny or Jackson Lake, so their beds are modelled from the real OpenStreetMap shoreline
+  and the published maximum (and, for Jenny, average) depth: the outline and depth range are real, the
+  exact shape of the bed is not. The first time you pick one it is built in a few seconds (internet needed
+  once if its shoreline file is missing). See [Data sources](data-sources.md#lakes).
 - **Ski resorts** (in the same **Clip to region** list): Grand Targhee, Deer Valley and Sundance. Choosing
   one frames the resort and overlays its **ski runs** and **lifts** (from OpenStreetMap) on the contours,
   each on its own layer and pen. Lifts are drawn with small tick marks for the towers. **Colour runs by
   difficulty** puts green / blue / black / double-black runs on matching pens when you have them in stock.
   The first time you pick a resort, the app also fetches 30 m elevation for the area around it (needs an
   internet connection once). See [Data sources](data-sources.md#ski-resorts).
-- **Circle mode (whole hemisphere)**: plots a full disc of the globe. Drag on the map to turn it.
+- **Circle mode (whole hemisphere)**: plots a full disc of the globe. Drag on the map to turn it. Fills
+  on a globe always cover the whole disc: bright areas (ice caps, deserts, lunar highlands) and gaps in
+  the colour map get the lightest level of ink instead of being left white, and neighbouring inks overlap
+  slightly at coastlines so no white seam shows.
 - **Show points of interest**: markers for landing sites, mountains, craters and other good subjects.
   Hover a marker for details. Click it to add it to the plot (a filled marker means it is plotted).
   Double-click it to frame the area around it. **Label plotted sites** writes their names on the plot.
 - **Show borders on the source map** is a display aid only. **Plot country / state borders** in the
   Contours section actually draws them.
 
-Then click **Draw Map**. Drawing again always starts fresh: it picks a new automatic interval, resets the
-preview zoom and clears hand edits. Changing a setting afterwards re-renders automatically and keeps your
+Then click **Draw Map**. Drawing again always starts fresh: it picks a new automatic interval (unless you
+typed one, see [Contours](#contours)), resets the preview zoom and clears hand edits. Changing a setting afterwards re-renders automatically and keeps your
 edits.
 
 ### Sharper data for small areas
@@ -84,6 +93,9 @@ window is downloaded, and it is used automatically whenever a selection falls in
   it. The preview shades the gaps and labels each page (R1C1 is the top-left). **Cut lines** outlines the
   pages in the preview and ticks **Cut out each page** in the export dialog. G-code export then writes a
   full set of files for every page, named with its page label, e.g. `01_Thin_G2_Black_mymap_r1c2.gcode`.
+- **Pages**: one button per page, laid out like the pages. Click a page to hide it: it is greyed out in
+  the preview ("hidden - not exported") and left out of the G-code export. Click it again, or **Show
+  all**, to bring it back. Handy for re-plotting a single page.
 
 ## Contours
 
@@ -91,7 +103,8 @@ Turn the whole layer on or off with the checkbox in the section header.
 
 - **Interval**: the badge shows the automatic interval, in feet, picked for the relief of your selection.
   **Contour density** steps to the next sparser or denser standard interval. **Interval override** sets an
-  exact value.
+  exact value; a typed interval is kept when you click **Draw Map** again (the badge says "Manual") until
+  you click **Auto** next to it or move the density slider.
 - **Index line every _n_ lines**: every _n_-th contour is drawn with the **Index lines** pen. This is
   usually a thicker pen.
 - **Pens**: separate pens for **contour lines**, **index lines**, **below sea level** (when **Separate pen

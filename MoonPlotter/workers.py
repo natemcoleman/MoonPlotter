@@ -10,7 +10,7 @@ from rasterio.windows import Window
 from PyQt6.QtCore import QThread, pyqtSignal
 
 # Local imports
-from config import DATA_FILES, PLANET_RADII, MAX_DEM_PX, TAHOE
+from config import DATA_FILES, PLANET_RADII, MAX_DEM_PX
 from contour_engine import generate_contours, auto_contour_interval
 from hatch_engine import generate_hatches, srgb_to_linear, linear_to_srgb
 from sites import site_segments
@@ -205,15 +205,16 @@ class RenderWorker(QThread):
         self.fresh = fresh
 
     # ------------------------------------------------------------------
-    def _read_dem(self, lon_min, lon_max, lat_min, lat_max, is_tahoe, max_px=MAX_DEM_PX):
-        """Elevation window (cached in memory: slider tweaks and pen changes don't re-read the file)."""
+    def _read_dem(self, lon_min, lon_max, lat_min, lat_max, lake, max_px=MAX_DEM_PX):
+        """Elevation window (cached in memory: slider tweaks and pen changes don't re-read the file).
+        lake: the lake's render info (lakes.render_info) for a lake-bathymetry region, else None."""
         regional = self.params.get('regional_dem')
-        src = TAHOE['dem'] if is_tahoe else (regional['path'] if regional else self.dem_path)
+        src = lake['dem'] if lake else (regional['path'] if regional else self.dem_path)
         try:
             stamp = (os.path.getmtime(src), os.path.getsize(src))
         except OSError:
             stamp = None
-        key = (src, stamp, is_tahoe, bool(regional), self.planet,
+        key = (src, stamp, bool(lake), bool(regional), self.planet,
                round(lon_min, 9), round(lon_max, 9), round(lat_min, 9), round(lat_max, 9), int(max_px))
         with _DEM_CACHE_LOCK:
             hit = _DEM_CACHE.get(key)
@@ -223,7 +224,7 @@ class RenderWorker(QThread):
             dem, ext, k, mult = hit
             self.progress.emit("Elevation window reused from memory...")
             return dem.copy(), list(ext), k, mult
-        out = self._read_dem_file(lon_min, lon_max, lat_min, lat_max, is_tahoe, max_px)
+        out = self._read_dem_file(lon_min, lon_max, lat_min, lat_max, lake, max_px)
         dem, ext, k, mult = out
         with _DEM_CACHE_LOCK:
             _DEM_CACHE[key] = (dem.copy(), list(ext), k, mult)
@@ -231,11 +232,11 @@ class RenderWorker(QThread):
                 _DEM_CACHE.popitem(last=False)
         return out
 
-    def _read_dem_file(self, lon_min, lon_max, lat_min, lat_max, is_tahoe, max_px=MAX_DEM_PX):
+    def _read_dem_file(self, lon_min, lon_max, lat_min, lat_max, lake, max_px=MAX_DEM_PX):
         regional = self.params.get('regional_dem')
-        if is_tahoe:
-            mult = TAHOE['multiplier']
-            dem, ext, k = read_dem_window(self.dem_path, TAHOE['bounds'], lon_min, lon_max, lat_min, lat_max,
+        if lake:
+            mult = float(lake['multiplier'])
+            dem, ext, k = read_dem_window(lake['dem'], tuple(lake['bounds']), lon_min, lon_max, lat_min, lat_max,
                                           wrap=False, max_px=max_px)
         elif regional:
             self.progress.emit(f"Using regional elevation: {regional['name']}")
@@ -261,14 +262,14 @@ class RenderWorker(QThread):
             do_fill = self.params.get('layer_fill', False)
             result = {'segments': [], 'dem_data': None, 'extent': extent, 'min_e': 0.0, 'max_e': 0.0,
                       'auto_interval': None, 'fresh': self.fresh}
-            is_tahoe = self.planet == 'Earth' and "Tahoe" in self.params.get('selected_region', '')
+            lake = self.params.get('lake') if self.planet == 'Earth' else None    # lake bathymetry region
             segments = []
             dem_cache = None
 
             # ---------------- Contour layer ----------------
             if do_contours:
                 self.progress.emit("Reading DEM topography data from disk...")
-                dem_data, dem_extent, k, mult = self._read_dem(lon_min, lon_max, lat_min, lat_max, is_tahoe)
+                dem_data, dem_extent, k, mult = self._read_dem(lon_min, lon_max, lat_min, lat_max, lake)
                 dem_cache = (dem_data, dem_extent, mult)
                 if k > 1:
                     self.progress.emit(f"DEM read at 1/{k} resolution ({dem_data.shape[1]}x{dem_data.shape[0]} px)...")
@@ -282,7 +283,7 @@ class RenderWorker(QThread):
                 max_e = 0.0 if all_nan else float(np.nanmax(crop_ft))
 
                 # Auto interval for fresh draws, computed BEFORE contouring (single pass).
-                if (self.fresh or self.params.get('force_auto_interval')) and not is_tahoe and not all_nan \
+                if (self.fresh or self.params.get('force_auto_interval')) and not lake and not all_nan \
                         and not self.params.get('fixed_interval'):          # a map-scale preset fixes it
                     lo = max(min_e, 0.0) if (self.planet == 'Earth' and not self.params.get('show_ocean', True)) else min_e
                     step = auto_contour_interval(max_e - lo, self.params.get('contour_target_lines', 20))
@@ -296,7 +297,7 @@ class RenderWorker(QThread):
 
             # ---------------- Fill / hatch layer ----------------
             if do_fill:
-                segments += self._fill_layer(extent, is_tahoe, dem_cache)
+                segments += self._fill_layer(extent, lake, dem_cache)
 
             # ---------------- Points of interest ----------------
             if self.params.get('sites'):
@@ -317,7 +318,7 @@ class RenderWorker(QThread):
             traceback.print_exc()
             self.error.emit(f"{type(e).__name__}: {e}")
 
-    def _fill_layer(self, extent, is_tahoe, dem_cache):
+    def _fill_layer(self, extent, lake, dem_cache):
         lon_min, lon_max, lat_min, lat_max = extent
         strategy = self.params.get('hatch_strategy', '')
         source = self.params.get('fill_source', 'Color map')
@@ -329,7 +330,7 @@ class RenderWorker(QThread):
             and self.params.get('fill_inks') == 'color'
             and os.path.exists(self.dem_path)
         )
-        need_dem = "Hachure" in strategy or "Hillshade" in source or is_tahoe or is_earth_circle_color
+        need_dem = "Hachure" in strategy or "Hillshade" in source or bool(lake) or is_earth_circle_color
 
         pw = float(self.params.get('paper_w_mm', 100.0))
         ph = float(self.params.get('paper_h_mm', 100.0))
@@ -348,7 +349,7 @@ class RenderWorker(QThread):
             else:
                 self.progress.emit("Reading DEM for the fill layer...")
                 want = int(np.ceil(max((lon_max - lon_min) / dpp_lon, (min(lat_max, 90) - max(lat_min, -90)) / dpp_lat)))
-                dem, dext, _, mult = self._read_dem(lon_min, lon_max, lat_min, lat_max, is_tahoe,
+                dem, dext, _, mult = self._read_dem(lon_min, lon_max, lat_min, lat_max, lake,
                                                     max_px=int(np.clip(want, 64, MAX_COLOR_PX)))
             dem_m = (dem * mult * 0.3048).astype(np.float32)
             dem_bounds = {'lon0': dext[0], 'lon_span': dext[1] - dext[0], 'lat_top': dext[3], 'lat_bot': dext[2]}
@@ -373,7 +374,7 @@ class RenderWorker(QThread):
             if rgb is None:
                 return []
 
-        if "Hillshade" in source or is_tahoe:
+        if "Hillshade" in source or lake:
             self.progress.emit("Computing hillshade...")
             dark = hillshade_darkness(dem_m, dem_bounds, R)              # NaN outside data
             if rgb is None:
@@ -384,7 +385,7 @@ class RenderWorker(QThread):
                 rgb[~np.isfinite(dark)] = np.nan
                 bounds = dem_bounds
             else:
-                # Resample darkness onto the colour grid; multiply (shaded relief) and/or mask (Tahoe).
+                # Resample darkness onto the colour grid; multiply (shaded relief) and/or mask (lakes).
                 h, w = rgb.shape[:2]
                 lon_c = bounds['lon0'] + (np.arange(w) + 0.5) / w * bounds['lon_span']
                 lat_c = bounds['lat_top'] - (np.arange(h) + 0.5) / h * (bounds['lat_top'] - bounds['lat_bot'])
@@ -393,7 +394,7 @@ class RenderWorker(QThread):
                 if "Hillshade" in source:
                     lin = srgb_to_linear(rgb) * (1.0 - 0.75 * np.nan_to_num(dk, nan=0.0))[..., None]
                     rgb = linear_to_srgb(lin).astype(np.float32)
-                if is_tahoe:
+                if lake:
                     rgb[~np.isfinite(dk)] = np.nan              # nothing outside the lake
 
         elev_arg = (dem_m, dem_bounds) if dem_m is not None else None

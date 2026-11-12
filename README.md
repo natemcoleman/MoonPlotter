@@ -31,7 +31,10 @@ using real pen colours, white pen on black paper, and Voyager 2's path from NASA
   59 m lunar or 200 m Martian elevation for just the area you selected. You can also import any GeoTIFF.
 - **Solar System mode.** Plot real trajectories of 17 deep-space missions (Voyager, Pioneer, Cassini,
   New Horizons, Juno, Parker Solar Probe and more), downloaded from NASA JPL Horizons, on a compressed
-  scale with orbits, year markers, labels and a stippled asteroid belt.
+  scale with orbits, year markers, labels and a stippled asteroid belt. Or draw a poster-style diagram of
+  the whole Solar System (all planets, rings, moons, asteroid belt and stars).
+- **Lake bathymetry.** Lake Tahoe from a 10 m survey; Jenny and Jackson Lake modelled from their real
+  shorelines and published depths.
 - **Ski resorts.** Grand Targhee, Deer Valley and Sundance runs and lifts from OpenStreetMap, overlaid on
   30 m contours, with runs optionally coloured by difficulty.
 - **Large plots on several pages.** Split a map across a grid of sheets, with an optional gap between the
@@ -120,6 +123,7 @@ MoonPlotter/              repository root
     ├── missions/         cached JPL Horizons trajectories
     ├── regions/          downloaded or imported regional rasters (created on demand)
     ├── ski_resorts/      OpenStreetMap ski runs and lifts for the Ski resorts regions
+    ├── lakes/            lake shorelines (OpenStreetMap) and modelled lake beds
     ├── projects/         saved projects (*.topo.json): the default save and open folder
     └── tests/            unit tests (python tests/test_engines.py)
 ```
@@ -141,6 +145,7 @@ The app downloads or uses public datasets. Please credit them when you share plo
 - Moon: NASA Goddard SVS CGI Moon Kit (LRO LOLA elevation, LROC colour); USGS LOLA/Kaguya merge.
 - Mars: USGS Astrogeology (MGS MOLA, Viking colour, HRSC/MOLA blend).
 - Borders: Natural Earth (public domain).
-- Ski runs and lifts: © OpenStreetMap contributors (ODbL).
+- Ski runs and lifts, lake shorelines: © OpenStreetMap contributors (ODbL).
+- Lake depths: Larsen et al. 2016 (Jenny Lake); Rhea et al. 2005, USGS (Jackson Lake).
 - Spacecraft trajectories: NASA JPL Horizons System.
 - Lettering: Hershey single-stroke fonts, via vpype.
