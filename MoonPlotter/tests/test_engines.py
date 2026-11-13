@@ -192,11 +192,11 @@ def test_safe_start_sequence():
     from config import SAFE_Z_MM, PEN_LIFT_MM, PEN_DOWN_ABOVE_HOME_MM
     h = exporter.header("t")
     i_g92 = next(i for i, l in enumerate(h) if l.startswith("G92"))
-    assert f"Z-{PEN_DOWN_ABOVE_HOME_MM:.1f}" in h[i_g92]
+    assert f"Z{exporter._z(-PEN_DOWN_ABOVE_HOME_MM)}" in h[i_g92]
     moves = [l for l in h[i_g92 + 1:] if l.startswith("G0")]
     assert moves[0] == f"G0 Z{SAFE_Z_MM:.1f} F1500"
     assert moves[1].startswith("G0 X0 Y0")
-    assert moves[2] == f"G0 Z{PEN_LIFT_MM:.1f} F1500"
+    assert moves[2] == f"G0 Z{exporter._z(PEN_LIFT_MM)} F1500"
     for block in (exporter.footer("x"), exporter.pen_change("Pen")):
         first_xy = next(i for i, l in enumerate(block) if " X" in l)
         assert any(l.startswith(f"G0 Z{SAFE_Z_MM:.1f}") for l in block[:first_xy])
@@ -441,6 +441,42 @@ def test_image_trace_edges():
     layers, _ = it.trace_image(_logo_rgb(), {'mode': it.MODES[1]}, 200, 150)
     assert len(layers) == 1 and len(layers[0]['polys']) >= 3
     assert sum(len(p) for p in layers[0]['polys']) > 50
+
+
+# ---------------------------------------------------------------- Z calibration
+def test_z_calibration_math():
+    import calibrate_z as cz
+    assert cz.ladder_heights(3.0, 0.3, 4) == [3.0, 2.7, 2.4, 2.1]
+    assert cz.pen_result(5.5, 1.2, press=0.4) == (6.3, 1.2)       # Z0 0.4 mm below the first inked line
+    assert cz.knife_result(-0.6, margin=0.15) == -0.75
+
+
+def test_z_calibration_gcode():
+    import calibrate_z as cz
+    g, zs = cz.pen_ladder(6.0, start=1.5, step=0.5, count=4)
+    assert any(l.startswith("G92") and "Z-6.0" in l for l in g)
+    assert [l for l in g if l.startswith("G1 Z")] == ["G1 Z1.5 F300", "G1 Z1.0 F300", "G1 Z0.5 F300", "G1 Z0.0 F300"]
+    assert any(l.startswith("M0") for l in g)
+    k, ds = cz.knife_ladder(6.0, start=0.0, step=0.5, count=3)
+    assert [l for l in k if l.startswith("G1 Z")] == ["G1 Z0.0 F300", "G1 Z-0.5 F300", "G1 Z-1.0 F300"]
+    assert exporter.bed_violation(exporter.xy_bounds(k)) is None
+
+
+# ---------------------------------------------------------------- layered cut-outs
+def test_layer_cut_cone():
+    import layer_cut as lc
+    yy, xx = np.mgrid[0:120, 0:120]
+    dem = 1000.0 - np.hypot(xx - 60, yy - 60) * 10.0                # a cone, peak in the middle
+    ls = lc.build_layers(dem, 60.0, 60.0, 4, min_feature_mm=2.0)
+    assert len(ls['layers']) == 4
+    for lo, hi in zip(ls['layers'][:-1], ls['layers'][1:]):
+        assert hi.difference(lo.buffer(0.05)).area < 1e-6          # every layer rests on the one below
+        assert hi.area < lo.area
+    plan = lc.plan_sheets(ls, 150.0, 150.0)
+    assert not plan['too_big'] and plan['n_pieces'] == 4
+    for sh in plan['sheets']:
+        for path in sh['cuts']:
+            assert path[:, 0].min() > 0 and path[:, 1].min() > 0 and path[:, 0].max() < 150 and path[:, 1].max() < 150
 
 
 if __name__ == '__main__':

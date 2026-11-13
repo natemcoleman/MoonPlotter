@@ -29,6 +29,7 @@ __pycache__/
 MoonPlotter/recent_projects.json
 MoonPlotter/plotter_pens.json
 MoonPlotter/favorites.json
+MoonPlotter/machine_settings.json
 
 # Downloaded / generated data (see docs/data-sources.md)
 MoonPlotter/natural_earth/

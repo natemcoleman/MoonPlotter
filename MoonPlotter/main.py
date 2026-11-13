@@ -60,6 +60,7 @@ from data_dialog import DataDialog
 import project_io
 from contour_engine import auto_contour_interval
 from config import AUTO_CONTOUR_TARGET_LINES
+import config as cfg              # calibrated per-machine values (cfg.PEN_LIFT_MM ...) are read at run time
 
 SEL_FILL = SEPIA        # selection rectangle on the source map
 SEL_EDGE = SEPIA
@@ -75,7 +76,6 @@ LAYER_LABELS = {'contours': 'Contours', 'borders': 'Borders & outlines', 'sites'
 # Rough plotter model for the live time estimate (matches the G-code writer / estimator):
 DRAW_FEED = 1500.0      # mm/min (G1)
 TRAVEL_FEED = 3000.0    # mm/min (G0)
-PEN_UP_DOWN_MIN = 1.0 / 1500.0 + 1.0 / 1000.0   # 1 mm Z up at F1500 + 1 mm down at F1000, per stroke
 ACCEL_FACTOR = 1.15
 
 
@@ -517,6 +517,7 @@ class PlotterApp(QMainWindow):
         act(m_tools, "Pen calibration sheet\u2026", self.open_pen_manager)
         act(m_tools, "Data sources (sharper regional data)\u2026", self.open_data_dialog)
         act(m_tools, "Speed up global elevation (one time)\u2026", self.prepare_dem_files)
+        act(m_tools, "Calibrate pen && knife heights\u2026", self.open_z_calibration)
 
     # ------------------------------------------------------------------
     # UI CONSTRUCTION
@@ -1842,6 +1843,20 @@ class PlotterApp(QMainWindow):
         self.set_panel_visible('map', not on)
         self.set_panel_visible('layers', not on)
 
+    def open_z_calibration(self):
+        """Tools > Calibrate pen & knife heights: test plots and this machine's Z values."""
+        from calib_dialog import CalibrationDialog
+        pen_id = self.combo_contour_pen.currentData() or 'base'
+        dlg = CalibrationDialog(self, pen_feed=self.pens.get(pen_id, {}).get('feed', exporter.DEFAULT_DRAW_FEED),
+                                knife_feed=self.pens.get('cutter', {}).get('feed', exporter.DEFAULT_DRAW_FEED),
+                                save_dir=desktop_dir())
+        if dlg.exec():
+            self.pen_lift_mm = None               # the export dialog starts from the calibrated lift again
+            v = cfg.machine_settings()
+            self.lbl_status.setText(f"Saved: pen-down {v['PEN_DOWN_ABOVE_HOME_MM']:.2f} mm above home, lift "
+                                    f"{v['PEN_LIFT_MM']:.1f} mm, knife {v['CUTTER_Z_OFFSET_MM']:+.2f} mm.")
+            self.update_time_estimate()
+
     # --- LAYERED CUT-OUT ---
     def cut_mode(self):
         return hasattr(self, 'sec_cut') and self.sec_cut.is_enabled() and not self.mission_mode \
@@ -2041,7 +2056,7 @@ class PlotterApp(QMainWindow):
             return
         base = os.path.splitext(path.replace("\\", "/"))[0]
         pen_id = self.combo_cut_pen.currentData() or 'base'
-        lift = getattr(self, 'pen_lift_mm', None) or exporter.PEN_LIFT_MM
+        lift = getattr(self, 'pen_lift_mm', None) or cfg.PEN_LIFT_MM
         n = len(self.cut_plan['sheets'])
         report, total, problems = [], 0.0, []
         for k, sh in enumerate(self.cut_plan['sheets']):
@@ -2865,8 +2880,9 @@ class PlotterApp(QMainWindow):
             item['_p1'] = (seg[-1, 0] * sx, seg[-1, 1] * sy)
 
     def estimate_pen_minutes(self, p_id, feed_override=None):
-        """Same model as the G-code estimator: draw at F1500, travel at F3000, a 1 mm pen lift per stroke,
-        +15 % for acceleration. Travel is approximated (vpype re-sorts strokes at export)."""
+        """Same model as the G-code estimator: draw at the pen's feed, travel at F3000, a pen lift and drop
+        per stroke at the firmware's Z speed, +15 % for acceleration. Travel is approximated (vpype re-sorts
+        strokes at export)."""
         p0s, p1s, draw = [], [], 0.0
         for item in self.dem_segments:
             if item['pen_id'] != p_id or not self.is_visible(item) or '_len_mm' not in item:
@@ -2898,7 +2914,9 @@ class PlotterApp(QMainWindow):
         bound = 0.6 * np.sqrt(self.pw * self.ph * n)
         travel = min(seq, bound) + np.hypot(self.pw, self.ph)           # + trips to/from home
         feed = float(feed_override or self.pens.get(p_id, {}).get('feed', DRAW_FEED))
-        return (draw / feed + travel / TRAVEL_FEED + n * PEN_UP_DOWN_MIN) * ACCEL_FACTOR
+        lift = getattr(self, 'pen_lift_mm', None) or cfg.PEN_LIFT_MM
+        updown = 2.0 * lift / max(1.0, min(1000.0, float(cfg.Z_MAX_FEED)))      # minutes per stroke
+        return (draw / feed + travel / TRAVEL_FEED + n * updown) * ACCEL_FACTOR
 
     def update_time_estimate(self):
         if self.cut_mode() and self.cut_set is not None:

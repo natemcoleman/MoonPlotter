@@ -66,7 +66,7 @@ class ExportDialog(QDialog):
                                     else f"Cut out each of the {tiles} pages at the end (drag knife, page edges)")
         self.chk_cutout.setChecked(bool(cutout))
         self.chk_cutout.setToolTip("Adds a last tool: pause (M0) to load the cutter blade, then cut round the sheet\n"
-                                   "with a small loop outside each corner. Blade depth: CUTTER_Z_OFFSET_MM in config.py.")
+                                   "with a small loop outside each corner. Blade depth: Tools > Calibrate pen & knife heights.")
         self.chk_cutout.toggled.connect(self._update_total)
         v.addWidget(self.chk_cutout)
         h = QHBoxLayout()

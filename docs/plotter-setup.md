@@ -7,7 +7,8 @@ with homing switches can use it after you set the values below. Other firmware n
 
 > **Read this page before your first plot.** The app has no way of knowing how far your pen tip sits from
 > the bed. If `PEN_DOWN_ABOVE_HOME_MM` is wrong, the pen will either drag across the sheet or be driven
-> into the bed.
+> into the bed. Run **Tools › Calibrate pen & knife heights** first (see [Calibrating the pen and knife
+> heights](#calibrating-the-pen-and-knife-heights)).
 
 ## How the coordinates work
 
@@ -39,22 +40,40 @@ This means:
 | Setting | Default | What it means |
 |---|---|---|
 | `BED_MM` | `(235, 235)` | Travel of your X and Y axes |
-| `GCODE_OFFSET_MM` | `(50, 50)` | Distance from the home position to the plot origin |
-| `PEN_DOWN_ABOVE_HOME_MM` | `5.5` | Height of the paper surface above the homed Z position. **Raise it if the pen drags or hits the bed. Lower it if lines are faint or skip.** |
-| `PEN_LIFT_MM` | `3.0` | Pen-up height for travel between strokes. You can also change it in the export dialog. |
-| `SAFE_Z_MM` | `5.0` | Clearance for long moves, homing exits and pen changes |
-| `DEFAULT_DRAW_FEED` / `TRAVEL_FEED` | `1500` / `3000` mm/min | Pen-down and pen-up speeds. Each pen can override the draw speed. |
+| `GCODE_OFFSET_MM` | `(38, 18)` | Distance from the home position to the plot origin |
+| `PEN_DOWN_ABOVE_HOME_MM` | `5.5` | Height of pen-down (Z0) above the homed Z position. **Raise it if the pen drags or hits the bed. Lower it if lines are faint or skip.** Calibrated per machine (below). |
+| `PEN_LIFT_MM` | `2.5` | Pen-up height above Z0 for travel between strokes. Calibrated per machine; the export dialog can override it. |
+| `CUTTER_Z_OFFSET_MM` | `-2.0` | Drag-knife down height relative to Z0 (negative = deeper). Calibrated per machine. |
+| `Z_MAX_FEED` | `300` mm/min | Your firmware's top Z speed (stock Ender 3: 5 mm/s). Used for time estimates only. |
+| `SAFE_Z_MM` | `5.5` | Clearance for long moves, homing exits and pen changes |
+| `DEFAULT_DRAW_FEED` / `TRAVEL_FEED` | `1200` / `3000` mm/min | Pen-down and pen-up speeds. Each pen can override the draw speed. |
 | `MIN_SEGMENT_MM` | `2.0` | Strokes shorter than this are dropped from map lines (not from lettering) |
 
-### Finding your pen height
+### Calibrating the pen and knife heights
 
-1. Home the printer (`G28`) with no paper on the bed.
-2. Lower Z in 0.1 mm steps until the pen tip just touches a sheet of the paper you'll use.
-3. Read the Z position. That number is `PEN_DOWN_ABOVE_HOME_MM`.
-4. Spring-loaded or rubber-band pen holders tolerate being a few tenths of a millimetre low, which keeps
-   gentle pressure on the paper. Rigid holders do not.
+The pens and the knife sit at a fixed height in their holders, so the pen-down height, the pen lift and
+the knife depth are set in software. **Tools › Calibrate pen & knife heights** finds them with two test
+plots and saves them for this computer in `MoonPlotter/machine_settings.json` (ignored by git, so every
+machine keeps its own values; the numbers in `config.py` are only the defaults). Redo it after re-levelling
+the bed or moving the plotter.
 
-Restart the app after editing `config.py`.
+1. **Pen height.** Click **Save pen test G-code…** and plot it on plain paper. It draws a column of short
+   lines, top to bottom, each 0.3 mm lower than the last (every 5th line is longer to make counting easy;
+   the printer screen shows each line's number and height). Enter the **first line with ink** and click
+   **Use**. Pen-down moves to just below that line (by **press**, 0.4 mm by default, so a spring or
+   rubber-band holder keeps steady contact) and the pen lift becomes press + 0.8 mm. No ink at all? Lower
+   **Top line**. Ink on line 1? Raise it. Running the test again afterwards is a good check.
+2. **Knife depth.** Do this after step 1: the depth is measured from pen-down. Click **Save knife test
+   G-code…**, fit the knife and lay scrap card of the kind you will cut on a mat. It cuts 10 mm squares,
+   left to right and top row first, each deeper than the last. Enter the **first square that drops out**
+   and click **Use** (a 0.15 mm margin is added).
+3. Click **Save**. New exports use the values straight away.
+
+To set them by hand instead: home the printer (`G28`), lower Z in 0.1 mm steps until the pen tip just
+touches the paper and enter that Z as the pen-down height in the dialog.
+
+Each pen lift costs time: an Ender 3 moves Z at only about 5 mm/s, so a 2.5 mm lift adds about a second
+per stroke, against about 0.4 s for a 1 mm lift. Calibrating usually lets you use the smaller lift.
 
 ## Exporting
 
@@ -91,7 +110,8 @@ colours. Use it to check a plot in a vector editor, or to drive another plotter 
 
 ## Other machines
 
-- **Other Marlin printers**: set `BED_MM`, `GCODE_OFFSET_MM` and `PEN_DOWN_ABOVE_HOME_MM`.
+- **Other Marlin printers**: set `BED_MM` and `GCODE_OFFSET_MM`, then run **Tools › Calibrate pen & knife
+  heights**.
 - **Servo pen-lift plotters (GRBL, AxiDraw-style)**: these don't move Z. Export **SVG** and use your
   plotter's own software or vpype. Alternatively, change `exporter.wrap_vpype_body()` so pen up and down
   send your servo commands (for example `M3`/`M5`) instead of Z moves.

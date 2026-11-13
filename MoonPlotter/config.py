@@ -188,6 +188,9 @@ CUTOUT_OVERLAP_MM = 5.0
 CUTOUT_PASSES = 1
 # Clearance used for long moves: leaving home for the start point, parking and pen changes.
 SAFE_Z_MM = 5.5
+# Fastest Z move the printer's firmware allows, mm/min. Stock Ender 3 Marlin caps Z at 5 mm/s (300);
+# send M503 and look at the M203 line to check yours. Only used for plot-time estimates.
+Z_MAX_FEED = 300.0
 # SAFE_Z_MM = 0.5
 # SAFE_Z_MM = 0.0
 
@@ -249,3 +252,54 @@ def save_pens(pens):
             json.dump(pens, f, indent=4)
     except Exception as e:
         print(f"Error saving pens: {e}")
+
+
+# ---------------------------------------------------------------------------------------------
+# Per-machine calibration (Tools > Calibrate pen & knife heights). The values above are defaults; the
+# calibration dialog saves this machine's measured values in MACHINE_SETTINGS_FILE (not in the
+# repository), which overrides them when the app starts. Delete the file to go back to the defaults.
+# ---------------------------------------------------------------------------------------------
+MACHINE_SETTINGS_FILE = "machine_settings.json"
+MACHINE_SETTING_KEYS = ('PEN_DOWN_ABOVE_HOME_MM', 'PEN_LIFT_MM', 'CUTTER_Z_OFFSET_MM', 'Z_MAX_FEED')
+MACHINE_DEFAULTS = {k: globals()[k] for k in MACHINE_SETTING_KEYS}
+
+
+def apply_machine_settings(values):
+    """Sets the calibrated values on this module (code reads them as config.NAME at run time)."""
+    g = globals()
+    for k in MACHINE_SETTING_KEYS:
+        v = (values or {}).get(k)
+        if isinstance(v, (int, float)) and v == v:          # number, not NaN
+            g[k] = float(v)
+
+
+def load_machine_settings():
+    """Applies MACHINE_SETTINGS_FILE if it exists. Returns the values read ({} if none)."""
+    if not os.path.exists(MACHINE_SETTINGS_FILE):
+        return {}
+    try:
+        with open(MACHINE_SETTINGS_FILE, 'r') as f:
+            values = json.load(f)
+    except Exception as e:
+        print(f"Warning: could not read {MACHINE_SETTINGS_FILE} ({e}) - using the defaults in config.py.")
+        return {}
+    if isinstance(values, dict):
+        apply_machine_settings(values)
+        return values
+    return {}
+
+
+def save_machine_settings(values):
+    """Saves the calibrated values and applies them straight away."""
+    out = {k: float(values[k]) for k in MACHINE_SETTING_KEYS if k in values}
+    with open(MACHINE_SETTINGS_FILE, 'w') as f:
+        json.dump(out, f, indent=2)
+    apply_machine_settings(out)
+
+
+def machine_settings():
+    """Current values (defaults overridden by this machine's calibration)."""
+    return {k: globals()[k] for k in MACHINE_SETTING_KEYS}
+
+
+load_machine_settings()

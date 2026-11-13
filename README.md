@@ -107,9 +107,10 @@ time)** makes large areas and circle mode load several times faster. The
 ## Safety first
 
 A pen plotter is a CNC machine. The G-code homes the printer (`G28`), so the pen must clear the bed
-while homing. Then it treats the paper surface as Z = 0. **If `PEN_DOWN_ABOVE_HOME_MM` in `config.py` is
-wrong for your pen holder, the pen will either drag on the paper or crash into the bed.** Start with a
-small test plot and keep a hand near the power switch. See [Plotter setup](docs/plotter-setup.md).
+while homing. Then it treats the paper surface as Z = 0. **If the pen-down height is wrong for your pen
+holder, the pen will either drag on the paper or crash into the bed.** Before your first plot, run
+**Tools › Calibrate pen & knife heights**: two short test plots find the pen height and the knife depth for
+your machine. Start with a small test plot and keep a hand near the power switch. See [Plotter setup](docs/plotter-setup.md).
 
 ## Repository layout
 
