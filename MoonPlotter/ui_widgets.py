@@ -173,11 +173,12 @@ class LayerPanel(QWidget):
         self._updating = False
 
     def set_layers(self, layers, visibility):
-        """layers: list of (key, label, [colours], stroke_count)."""
+        """layers: list of (key, label, [colours], stroke_count or a text such as '3 pieces')."""
         self._updating = True
         self.list.clear()
         for key, label, colors, count in layers:
-            it = QListWidgetItem(swatch_icon(colors), f"{label}\n{count:,} strokes")
+            it = QListWidgetItem(swatch_icon(colors), f"{label}\n{count:,} strokes" if isinstance(count, int)
+                                 else f"{label}\n{count}")
             it.setData(Qt.ItemDataRole.UserRole, key)
             it.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsSelectable)
             it.setCheckState(Qt.CheckState.Checked if visibility.get(key, True) else Qt.CheckState.Unchecked)

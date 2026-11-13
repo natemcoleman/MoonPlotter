@@ -135,6 +135,7 @@ import dem_prep
 import ski
 import svg_import
 import lakes
+import layer_cut
 from workers import clear_dem_cache
 
 # Cache for UI map previews
@@ -396,6 +397,9 @@ class PlotterApp(QMainWindow):
         self.interval_auto_done = False   # an auto interval has been picked for the current selection
         self.interval_manual = False      # the user typed / dragged an interval: Draw Map keeps it
         self.hidden_tiles = set()         # page labels ('r1c2') switched off: veiled in the preview, not exported
+        self.cut_set = None               # layered cut-out: layer polygons (layer_cut.build_layers)
+        self.cut_plan = None              # ... and the pieces packed onto sheets (layer_cut.plan_sheets)
+        self.current_dem_mult = 1.0
         self.layer_visible = {}           # layer key -> bool (missing = visible)
         self.selected_sites = {}          # planet -> set of site names to plot
         self.map_segments = []            # strokes from the worker (contours, fill, sites)
@@ -1083,6 +1087,75 @@ class PlotterApp(QMainWindow):
         self.chk_join.toggled.connect(self.trigger_recalc)
         vbox.addWidget(self.sec_fill)
 
+        # ---------- LAYERED CUT-OUT (stacked cardstock) ----------
+        self.sec_cut = CollapsibleSection("Layered cut-out", expanded=False, checkable=True, checked=False)
+        self.sec_cut.enable_box.setToolTip("Instead of drawing the map, cut each height band out of card to stack "
+                                           "and glue into a 3-D map")
+        self.sec_cut.enabled_changed.connect(self._on_cut_toggled)
+        self.spin_cut_layers = QSpinBox()
+        self.spin_cut_layers.setRange(2, 15)
+        self.spin_cut_layers.setValue(6)
+        self.spin_cut_layers.setToolTip("Number of card layers, bottom (the whole map) included. "
+                                        "Heights are split into equal steps.")
+        self.sec_cut.add(self._field("Layers", self.spin_cut_layers))
+        self.spin_sheet_w, self.spin_sheet_h = QDoubleSpinBox(), QDoubleSpinBox()
+        for sp in (self.spin_sheet_w, self.spin_sheet_h):
+            sp.setRange(50.0, 400.0)
+            sp.setDecimals(0)
+            sp.setValue(150.0)
+            sp.setSuffix(" mm")
+        sheet_box = QWidget()
+        h_sheet = QHBoxLayout(sheet_box)
+        h_sheet.setContentsMargins(0, 0, 0, 0)
+        h_sheet.addWidget(self.spin_sheet_w)
+        h_sheet.addWidget(QLabel("\u00d7"))
+        h_sheet.addWidget(self.spin_sheet_h)
+        self.sec_cut.add(self._field("Card sheet to cut from", sheet_box,
+                                     "Pieces are rotated and packed onto as few sheets as possible. Each sheet: "
+                                     "the pen marks it, then the knife cuts it out."))
+        self.spin_cut_min = QDoubleSpinBox()
+        self.spin_cut_min.setRange(1.0, 10.0)
+        self.spin_cut_min.setSingleStep(0.5)
+        self.spin_cut_min.setValue(2.5)
+        self.spin_cut_min.setSuffix(" mm")
+        self.spin_cut_min.setToolTip("Islands, necks and gaps narrower than this are dropped or filled - the "
+                                     "knife can't cut them and they are too small to glue.")
+        self.sec_cut.add(self._field("Smallest detail", self.spin_cut_min))
+        self.combo_cut_pen = QComboBox()
+        self.combo_cut_pen.setToolTip("Draws the outline of the next layer (where to glue it) and the layer "
+                                      "number on each piece. Nothing is drawn on the top layer.")
+        self._fill_pen_combo(self.combo_cut_pen, 'base')
+        self.sec_cut.add(self._field("Marking pen", self.combo_cut_pen))
+        self.chk_cut_colours = QCheckBox("Different card colour by height")
+        self.chk_cut_colours.setToolTip("Pieces for different colours go on different sheets.")
+        self.spin_cut_colour_every = QSpinBox()
+        self.spin_cut_colour_every.setRange(1, 5)
+        self.spin_cut_colour_every.setValue(2)
+        self.spin_cut_colour_every.setPrefix("new colour every ")
+        self.spin_cut_colour_every.setSuffix(" layers")
+        self.spin_cut_colour_every.setEnabled(False)
+        self.chk_cut_colours.toggled.connect(self.spin_cut_colour_every.setEnabled)
+        self.sec_cut.add(self.chk_cut_colours)
+        self.sec_cut.add(self.spin_cut_colour_every)
+        self.combo_cut_view = QComboBox()
+        self.combo_cut_view.addItem("Finished stack")
+        self.combo_cut_view.currentIndexChanged.connect(lambda _: self.render_canvas())
+        self.sec_cut.add(self._field("Preview", self.combo_cut_view))
+        hint = QLabel("Layer 1 is the whole map (with the map furniture); lakes and hollows become holes. "
+                      "Export G-code writes one file per sheet: pen marks, a pause to fit the knife, then the cuts.")
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        self.sec_cut.add(hint)
+        self._cut_timer = QTimer(self)
+        self._cut_timer.setSingleShot(True)
+        self._cut_timer.timeout.connect(self._rebuild_cut_layers)
+        for w in (self.spin_cut_layers, self.spin_sheet_w, self.spin_sheet_h, self.spin_cut_min,
+                  self.spin_cut_colour_every):
+            w.valueChanged.connect(lambda _: self._cut_timer.start(400))
+        self.chk_cut_colours.toggled.connect(lambda _: self._cut_timer.start(100))
+        self.combo_cut_pen.currentIndexChanged.connect(lambda _: self._cut_timer.start(100))
+        vbox.addWidget(self.sec_cut)
+
         # ---------- ADVANCED (less-used switches, grouped) ----------
         sec_adv = self.sec_advanced = CollapsibleSection("Advanced", expanded=False)
 
@@ -1769,6 +1842,259 @@ class PlotterApp(QMainWindow):
         self.set_panel_visible('map', not on)
         self.set_panel_visible('layers', not on)
 
+    # --- LAYERED CUT-OUT ---
+    def cut_mode(self):
+        return hasattr(self, 'sec_cut') and self.sec_cut.is_enabled() and not self.mission_mode \
+            and not self.image_mode and not self.calibration_mode
+
+    def _on_cut_toggled(self, on):
+        if self._loading:
+            return
+        if on and self.chk_circle.isChecked():
+            self.lbl_status.setText("Layered cut-outs need a flat map - turn off Circle mode.")
+        if on and self.has_drawn and self.current_dem_crop is None:
+            self.trigger_recalc()                 # the elevation wasn't read (contours were off)
+            return
+        if on:
+            self._rebuild_cut_layers()
+        else:
+            self.cut_set = self.cut_plan = None
+            if self.has_drawn:
+                self.render_canvas()
+                self.refresh_layer_panel()
+
+    def _cut_layer_colour(self, i):
+        n = max(1, len(self.cut_set['layers']) if self.cut_set else 1)
+        t = i / max(1, n - 1)
+        a, b = np.array([0.93, 0.89, 0.80]), np.array([0.45, 0.33, 0.22])     # light card -> dark card
+        from matplotlib.colors import to_hex
+        return to_hex(a + (b - a) * t)
+
+    def _cut_base_marks(self):
+        """Map furniture (title, scale bar...) in paper mm, drawn on the bottom layer."""
+        if not self.current_view_extent:
+            return []
+        sx, sy = self._paper_mm_per_data_unit()
+        x0, y0 = self.current_view_extent[0], self.current_view_extent[2]
+        out = []
+        for it in self.decor_segments:
+            if not self.is_visible(it):
+                continue
+            seg = np.asarray(it['seg'], float)
+            if len(seg) >= 2:
+                out.append(np.column_stack([(seg[:, 0] - x0) * sx, (seg[:, 1] - y0) * sy]))
+        return out
+
+    def _rebuild_cut_layers(self, redraw=True):
+        """Height bands -> layer polygons -> pieces packed on sheets (no new render needed)."""
+        self.cut_set = self.cut_plan = None
+        if not self.cut_mode() or not self.has_drawn:
+            return
+        if self.chk_circle.isChecked():
+            self.lbl_status.setText("Layered cut-outs need a flat map - turn off Circle mode.")
+            return
+        if self.current_dem_crop is None:
+            self.lbl_status.setText("Click Draw Map to build the layers.")
+            return
+        try:
+            self.lbl_status.setText("Building the card layers...")
+            QApplication.processEvents()
+            self.cut_set = layer_cut.build_layers(np.asarray(self.current_dem_crop, float) * self.current_dem_mult,
+                                                  self.pw, self.ph, self.spin_cut_layers.value(),
+                                                  self.spin_cut_min.value())
+
+            def prog(m):
+                self.lbl_status.setText(m)
+                QApplication.processEvents()
+            groups = self.spin_cut_colour_every.value() if self.chk_cut_colours.isChecked() else 0
+            self.cut_plan = layer_cut.plan_sheets(self.cut_set, self.spin_sheet_w.value(), self.spin_sheet_h.value(),
+                                                  base_marks=self._cut_base_marks(), colour_groups=groups,
+                                                  progress=prog)
+        except Exception as e:
+            self.cut_set = self.cut_plan = None
+            self.lbl_status.setText(f"Could not build the layers: {e}")
+            if redraw:
+                self.render_canvas()
+            return
+        cur = self.combo_cut_view.currentIndex()
+        self.combo_cut_view.blockSignals(True)
+        self.combo_cut_view.clear()
+        self.combo_cut_view.addItem("Finished stack")
+        n = len(self.cut_plan['sheets'])
+        for k, sh in enumerate(self.cut_plan['sheets']):
+            layers = sorted({li + 1 for li, _ in sh['pieces']})
+            colour = f" \u00b7 colour {sh['group'] + 1}" if self.chk_cut_colours.isChecked() else ""
+            self.combo_cut_view.addItem(f"Sheet {k + 1} of {n} (layers {', '.join(map(str, layers))}){colour}")
+        self.combo_cut_view.setCurrentIndex(cur if 0 <= cur < self.combo_cut_view.count() else 0)
+        self.combo_cut_view.blockSignals(False)
+        msg = (f"{len(self.cut_set['layers'])} layers, {self.cut_plan['n_pieces']} pieces on {n} sheet(s) of "
+               f"{self.spin_sheet_w.value():g} \u00d7 {self.spin_sheet_h.value():g} mm.")
+        if self.cut_plan['too_big']:
+            msg += (f" \u26a0 Too big for a sheet: layer(s) {', '.join(map(str, self.cut_plan['too_big']))} - "
+                    f"make the paper size smaller than the sheet (minus about 10 mm).")
+        if self.is_tiled():
+            msg += " (Page tiling is ignored for cut-outs.)"
+        self.lbl_status.setText(msg)
+        if redraw:
+            self.render_canvas()
+            self.refresh_layer_panel()
+
+    def _cut_summary(self):
+        if not self.cut_plan:
+            self.layer_panel.set_order([], '')
+            return
+        rows = []
+        for k, sh in enumerate(self.cut_plan['sheets']):
+            layers = sorted({li + 1 for li, _ in sh['pieces']})
+            rows.append((f"Sheet {k + 1}", "layers " + ",".join(map(str, layers))))
+        self.layer_panel.set_order(rows, f"{len(rows)} sheet(s), {self.cut_plan['n_pieces']} pieces")
+
+    def _draw_cut_preview(self):
+        """Finished stack (layers shaded light to dark, map coordinates) or one sheet's layout (mm)."""
+        from matplotlib.patches import PathPatch
+        from matplotlib.path import Path as MPath
+        ax = self.ax_prev
+        view = self.combo_cut_view.currentIndex() if self.cut_plan else 0
+
+        def poly_patch(geom, to_xy, **kw):
+            for p in getattr(geom, 'geoms', [geom]):
+                if p.is_empty or p.geom_type != 'Polygon':
+                    continue
+                verts, codes = [], []
+                for ring in [p.exterior] + list(p.interiors):
+                    xy = to_xy(np.asarray(ring.coords))
+                    verts += list(xy)
+                    codes += [MPath.MOVETO] + [MPath.LINETO] * (len(xy) - 2) + [MPath.CLOSEPOLY]
+                ax.add_patch(PathPatch(MPath(verts, codes), **kw))
+
+        if view <= 0:
+            fr = self._paper_frame()
+            mid_lat = np.radians((self.current_view_extent[2] + self.current_view_extent[3]) / 2)
+            ax.set_aspect(1 / np.cos(mid_lat))
+            to_xy = fr.to_data
+            for i, g in enumerate(self.cut_set['layers']):
+                if not self.layer_visible.get(f"cut{i}", True):
+                    continue
+                poly_patch(g, to_xy, facecolor=self._cut_layer_colour(i), edgecolor='#2b2118', linewidth=0.5,
+                           zorder=2 + i)
+            if self.layer_visible.get("cut0", True):
+                for m in self._cut_base_marks():
+                    xy = to_xy(m)
+                    ax.plot(xy[:, 0], xy[:, 1], color='#1b1b1b', linewidth=0.6, zorder=2)
+            e = self.current_view_extent
+            if ax.get_xlim() == (0.0, 1.0):
+                ax.set_xlim(e[0], e[1])
+                ax.set_ylim(e[2], e[3])
+            return
+        sh = self.cut_plan['sheets'][view - 1]
+        W, H = self.spin_sheet_w.value(), self.spin_sheet_h.value()
+        ax.set_aspect(1.0)
+        ax.set_xlim(-3, W + 3)
+        ax.set_ylim(-3, H + 3)
+        ax.add_patch(patches.Rectangle((0, 0), W, H, facecolor='#F3EEE4', edgecolor='#8a8170', linewidth=0.8))
+        ident = lambda xy: xy
+        for li, g in sh['pieces']:
+            poly_patch(g, ident, facecolor=self._cut_layer_colour(li), edgecolor='none', alpha=0.55, zorder=2)
+        pen = self.pens.get(self.combo_cut_pen.currentData() or 'base', self.pens['base'])
+        for m in sh['marks']:
+            ax.plot(m[:, 0], m[:, 1], color=pen['color'], linewidth=0.6, zorder=4)
+        for path in sh['cuts']:
+            ax.plot(path[:, 0], path[:, 1], color='#d0342c', linewidth=0.7, linestyle='--', zorder=5)
+
+    def _cut_gcode(self, sh, k, n, pen_id, lift_mm):
+        mark_feed = self.pens.get(pen_id, {}).get('feed', exporter.DEFAULT_DRAW_FEED)
+        cut_feed = self.pens.get('cutter', {}).get('feed', exporter.DEFAULT_DRAW_FEED)
+        pen_name = self.pens.get(pen_id, {'name': pen_id})['name']
+        g = exporter.header(f"LAYERED CUT-OUT: sheet {k + 1} of {n}", lift_mm=lift_mm)
+        if sh['marks']:
+            g += [f"M117 Load {pen_name}"[:40], f"M0 Sheet {k + 1}: load {pen_name}, then click"[:60]]
+            g += exporter.wrap_vpype_body(layer_cut.as_moves(sh['marks']), mark_feed, exporter.TRAVEL_FEED, 0,
+                                          lift_mm=lift_mm, down_z=exporter.tool_down_z(pen_id))
+            g += exporter.pen_change(self.pens.get('cutter', {'name': 'Cutter Blade'})['name'], lift_mm=lift_mm)
+        else:
+            g += ["M117 Load the knife"[:40], f"M0 Sheet {k + 1}: fit the knife, then click"[:60]]
+        cuts = list(sh['cuts'])
+        passes = max(1, int(getattr(exporter, 'CUTOUT_PASSES', 1)))
+        moves = []
+        for path in cuts:
+            for _ in range(passes):
+                moves += layer_cut.as_moves([path])
+        g += ["; --- CUTS: small pieces first; each piece's holes before its outline ---"]
+        g += exporter.wrap_vpype_body(moves, cut_feed, exporter.TRAVEL_FEED, 0, lift_mm=lift_mm,
+                                      down_z=exporter.tool_down_z('cutter'))
+        g += exporter.footer(f"Sheet {k + 1} of {n} done")
+        return g
+
+    def export_cut_sheets(self):
+        if not self.has_drawn or not self.cut_plan:
+            QMessageBox.warning(self, "Not Ready", "Draw the map first - the card layers are built from it.")
+            return
+        if self.cut_plan['too_big']:
+            QMessageBox.warning(self, "Layered cut-out",
+                                f"Layer(s) {', '.join(map(str, self.cut_plan['too_big']))} don't fit on a "
+                                f"{self.spin_sheet_w.value():g} \u00d7 {self.spin_sheet_h.value():g} mm sheet and are "
+                                "left out. Make the paper size smaller than the sheet.")
+        default = os.path.join(desktop_dir(), f"{self.active_planet.lower()}_layers_{int(self.pw)}x{int(self.ph)}.gcode")
+        path, _ = QFileDialog.getSaveFileName(self, "Base name for the sheet G-code files", default,
+                                              "G-Code Files (*.gcode)")
+        if not path:
+            return
+        base = os.path.splitext(path.replace("\\", "/"))[0]
+        pen_id = self.combo_cut_pen.currentData() or 'base'
+        lift = getattr(self, 'pen_lift_mm', None) or exporter.PEN_LIFT_MM
+        n = len(self.cut_plan['sheets'])
+        report, total, problems = [], 0.0, []
+        for k, sh in enumerate(self.cut_plan['sheets']):
+            g = self._cut_gcode(sh, k, n, pen_id, lift)
+            fn = f"{base}_sheet{k + 1:02d}.gcode"
+            try:
+                with open(fn, "w") as f:
+                    f.write("\n".join(g))
+            except Exception as e:
+                QMessageBox.critical(self, "Export", f"Could not write {fn}:\n{e}")
+                return
+            mins = exporter.estimate_minutes(g)
+            total += mins
+            layers = sorted({li + 1 for li, _ in sh['pieces']})
+            report.append(f"\u2022 {os.path.basename(fn)}  (layers {', '.join(map(str, layers))})  ->  "
+                          f"{exporter.fmt_duration(mins)}")
+            bad = exporter.bed_violation(exporter.xy_bounds(g))
+            if bad:
+                problems.append(f"Sheet {k + 1}: {bad}")
+        self.lbl_status.setText(f"Exported {n} sheet file(s). (Est: {exporter.fmt_duration(total)})")
+        msg = (f"{n} sheet file(s), total \u2248 {exporter.fmt_duration(total)}.\n"
+               f"Lay a {self.spin_sheet_w.value():g} \u00d7 {self.spin_sheet_h.value():g} mm card at the plot origin "
+               "for each one. The plotter draws the marks, pauses for the knife, then cuts.\n\n"
+               + "\n".join(report)
+               + "\n\nStack: layer 1 (the whole map) at the bottom; glue each layer onto the outline drawn "
+                 "on the one below. The numbers say which layer a piece belongs to.")
+        if problems:
+            QMessageBox.warning(self, "Exported - check bed limits", msg + "\n\n\u26a0 " + "\n".join(problems))
+        else:
+            QMessageBox.information(self, "Layered cut-out", msg)
+
+    def export_cut_svgs(self):
+        """One SVG per sheet (cut lines red, pen marks black) - for checking, or for a cutting machine."""
+        if not self.cut_plan:
+            QMessageBox.warning(self, "Not Ready", "Draw the map first - the card layers are built from it.")
+            return
+        default = os.path.join(desktop_dir(), f"{self.active_planet.lower()}_layers_{int(self.pw)}x{int(self.ph)}.svg")
+        path, _ = QFileDialog.getSaveFileName(self, "Base name for the sheet SVGs", default, "SVG Files (*.svg)")
+        if not path:
+            return
+        base = os.path.splitext(path.replace("\\", "/"))[0]
+        W, H = self.spin_sheet_w.value(), self.spin_sheet_h.value()
+        for k, sh in enumerate(self.cut_plan['sheets']):
+            fig, ax = self._export_figure(W, H)
+            ax.set_xlim(0, W)
+            ax.set_ylim(0, H)
+            for m in sh['marks']:
+                ax.plot(m[:, 0], m[:, 1], color='black', linewidth=0.3)
+            for c in sh['cuts']:
+                ax.plot(c[:, 0], c[:, 1], color='red', linewidth=0.3)
+            fig.savefig(f"{base}_sheet{k + 1:02d}.svg", format='svg')
+        self.lbl_status.setText(f"Saved {len(self.cut_plan['sheets'])} sheet SVG(s).")
+
     def selected_resort(self):
         return ski.resort_from_label(self.combo_region.currentText()) if hasattr(self, 'combo_region') else None
 
@@ -2063,7 +2389,7 @@ class PlotterApp(QMainWindow):
             'simp_tol': self.slider_simp.value() / 10.0,
             'smooth_val': self.slider_smooth.value() / 10.0,
             'blur_sigma': self.slider_blur.value() / 10.0,
-            'layer_contours': self.sec_contours.is_enabled(),
+            'layer_contours': self.sec_contours.is_enabled() or self.cut_mode(),
             'layer_fill': self.sec_fill.is_enabled(),
             'force_auto_interval': not self.interval_auto_done,
             'fixed_interval': self.scale_preset() is not None or self.interval_manual,
@@ -2184,6 +2510,7 @@ class PlotterApp(QMainWindow):
             self._finish_render("Selection changed - click Draw Map.")
             return
         self.current_dem_crop = result['dem_data']
+        self.current_dem_mult = float(result.get('dem_mult', 1.0))
         if result['dem_data'] is not None and result['max_e'] > result['min_e']:
             self.last_relief_ft = result['max_e'] - result['min_e']
         self.current_data_extent = result['extent']
@@ -2206,6 +2533,8 @@ class PlotterApp(QMainWindow):
         self.has_drawn = True
         self._build_decorations()
         self._cache_stroke_metrics()
+        if self.cut_mode():
+            self._rebuild_cut_layers(redraw=False)
         if fresh:
             self.custom_items = []
             self.undo_stack.clear()
@@ -2311,6 +2640,8 @@ class PlotterApp(QMainWindow):
         for cb, default in ((self.combo_contour_pen, 'base'), (self.combo_index_pen, 'pen_1'),
                             (self.combo_water_pen, 'blue_038'), (self.combo_border_pen, 'pen_1')):
             self._fill_pen_combo(cb, default)
+        if hasattr(self, 'combo_cut_pen'):
+            self._fill_pen_combo(self.combo_cut_pen, 'base')
         if hasattr(self, 'combo_ski_run_pen'):
             self._fill_pen_combo(self.combo_ski_run_pen, 'base')
             self._fill_pen_combo(self.combo_ski_lift_pen, 'red_038')
@@ -2474,6 +2805,16 @@ class PlotterApp(QMainWindow):
                                 "(Redrawing the map resets layer pens.)")
 
     def refresh_layer_panel(self):
+        if self.cut_mode() and self.cut_set is not None:
+            rows = []
+            for i, g in enumerate(self.cut_set['layers']):
+                n = len(getattr(g, 'geoms', [g]))
+                rows.append((f"cut{i}", f"Layer {i + 1}" + (" (base)" if i == 0 else "")
+                             + (" (top)" if i == len(self.cut_set['layers']) - 1 else ""),
+                             [self._cut_layer_colour(i)], f"{n} piece{'s' if n != 1 else ''}"))
+            self.layer_panel.set_layers(rows, self.layer_visible)
+            self._cut_summary()
+            return
         groups = {}
         for item in self.dem_segments:
             k = self.layer_key(item)
@@ -2560,6 +2901,9 @@ class PlotterApp(QMainWindow):
         return (draw / feed + travel / TRAVEL_FEED + n * PEN_UP_DOWN_MIN) * ACCEL_FACTOR
 
     def update_time_estimate(self):
+        if self.cut_mode() and self.cut_set is not None:
+            self._cut_summary()
+            return
         if not self.has_drawn:
             self.layer_panel.set_order([], '')
             return
@@ -2606,6 +2950,11 @@ class PlotterApp(QMainWindow):
         self.ax_prev.set_facecolor(self.current_paper_color())
 
         if not self.has_drawn or not self.current_view_extent:
+            self.canvas_prev.draw_idle()
+            return
+
+        if self.cut_mode() and self.cut_set is not None:
+            self._draw_cut_preview()
             self.canvas_prev.draw_idle()
             return
 
@@ -2735,7 +3084,7 @@ class PlotterApp(QMainWindow):
     def is_ink_sim_mode(self):
         """True-to-paper ink preview is used whenever a fill layer is showing (contour-only plots keep
         the classic, easier-to-read line view)."""
-        return self.has_drawn and any(item.get('layer') == 'fill' and self.is_visible(item)
+        return self.has_drawn and not self.cut_mode() and any(item.get('layer') == 'fill' and self.is_visible(item)
                                       for item in self.dem_segments)
 
     def schedule_ink_sim(self, delay_ms=80):
@@ -3928,6 +4277,10 @@ class PlotterApp(QMainWindow):
             'tile_cols': (self.spin_tile_cols, 'value'), 'tile_rows': (self.spin_tile_rows, 'value'),
             'tile_gap': (self.spin_tile_gap, 'value'), 'tile_cut': (self.chk_tile_cut, 'check'),
             'ski_by_difficulty': (self.chk_ski_diff, 'check'),
+            'cut_on': (self.sec_cut.enable_box, 'check'), 'cut_layers': (self.spin_cut_layers, 'value'),
+            'cut_sheet_w': (self.spin_sheet_w, 'value'), 'cut_sheet_h': (self.spin_sheet_h, 'value'),
+            'cut_min': (self.spin_cut_min, 'value'), 'cut_pen': (self.combo_cut_pen, 'data'),
+            'cut_colours': (self.chk_cut_colours, 'check'), 'cut_colour_every': (self.spin_cut_colour_every, 'value'),
             'ski_run_pen': (self.combo_ski_run_pen, 'data'), 'ski_lift_pen': (self.combo_ski_lift_pen, 'data'),
         }
 
@@ -5203,6 +5556,9 @@ class PlotterApp(QMainWindow):
         if not self.has_drawn:
             QMessageBox.warning(self, "Not Ready", "Draw a map first!")
             return
+        if self.cut_mode():
+            self.export_cut_svgs()
+            return
         orient = "landscape" if self.is_landscape else "portrait"
         default_name = f"{self.active_planet.lower()}_{orient}_{int(self.pw)}x{int(self.ph)}.svg"
         out_svg, _ = QFileDialog.getSaveFileName(self, "Save Editable SVG", os.path.join(desktop_dir(), default_name),
@@ -5226,6 +5582,9 @@ class PlotterApp(QMainWindow):
         QMessageBox.information(self, "Success", f"Master SVG saved to:\n{out_svg}")
 
     def export_action(self):
+        if self.cut_mode():
+            self.export_cut_sheets()
+            return
         if not HAS_VPYPE:
             QMessageBox.critical(self, "Missing Library", "Please run: pip install vpype vpype-gcode")
             return

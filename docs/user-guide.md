@@ -148,6 +148,33 @@ Turn it on with the section checkbox. A fill turns the map's tone into lines or 
 - **Auto contrast** stretches the tones of the selection to the full range.
 - **Join neighbouring lines (zigzag)** links each stroke to the next, which saves many pen lifts.
 
+## Layered cut-out (stacked cardstock)
+
+Instead of drawing the map, the knife cuts each height band out of card. Stack and glue the pieces and
+you get a 3-D relief map. Tick **On** in the **Layered cut-out** header, then click **Draw Map**.
+
+- **Layers**: how many card layers, the bottom one included. Heights are split into equal steps. Layer 1
+  is the whole map rectangle; each layer above is everything higher than its level. Lakes and hollows
+  become holes, so a lake bed (Lake Tahoe, Jenny Lake...) comes out as a stepped bowl.
+- **Card sheet to cut from**: the size of the card you load (150 x 150 mm by default). This is separate
+  from the map size in **Paper**: the map is cut from as many sheets as needed. Pieces are rotated
+  (in 45° steps) and packed to waste little card; small pieces can go inside the holes of bigger ones.
+  The map size must be smaller than the sheet (by about 10 mm) or its bottom layer won't fit.
+- **Smallest detail**: islands, thin necks and gaps narrower than this are dropped or filled - the knife
+  can't cut them and they are too small to glue.
+- **Marking pen**: on every piece it draws the outline of the layer that goes on top (0.6 mm inside it,
+  so the glued piece hides the line) and the layer number where the next layer will cover it. The top
+  layer gets nothing drawn on it; its number goes on the waste beside it. Map furniture (title, scale
+  bar...) is drawn on layer 1.
+- **Different card colour by height** (for later): pieces for different colours never share a sheet, and
+  the colour changes every _n_ layers.
+- **Preview**: the finished stack, or any sheet with its cuts (red, dashed) and pen marks.
+
+**Export G-code** writes one file per sheet (`..._sheet01.gcode`, ...). For each sheet: load the card at
+the plot origin, the pen draws the marks, the plotter pauses for you to fit the knife, then it cuts -
+small pieces first, each piece's holes before its outline, with corner loops at sharp corners. **Save
+SVG** saves one SVG per sheet (cuts red, marks black). Circle mode and page tiling don't apply here.
+
 ## Map furniture
 
 All lettering uses single-stroke (Hershey) fonts, so it plots cleanly with a pen.

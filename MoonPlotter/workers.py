@@ -293,7 +293,7 @@ class RenderWorker(QThread):
 
                 segments += generate_contours(dem_data, extent, extent, self.params,
                                               progress_callback=self.progress.emit)
-                result.update({'dem_data': dem_data, 'min_e': min_e, 'max_e': max_e})
+                result.update({'dem_data': dem_data, 'min_e': min_e, 'max_e': max_e, 'dem_mult': mult})
 
             # ---------------- Fill / hatch layer ----------------
             if do_fill:

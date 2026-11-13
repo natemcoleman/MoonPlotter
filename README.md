@@ -37,6 +37,8 @@ using real pen colours, white pen on black paper, and Voyager 2's path from NASA
   shorelines and published depths.
 - **Ski resorts.** Grand Targhee, Deer Valley and Sundance runs and lifts from OpenStreetMap, overlaid on
   30 m contours, with runs optionally coloured by difficulty.
+- **Layered cut-outs.** Turn a map into stacked cardstock: each height band is cut out with the drag
+  knife, marked with where the next layer goes, and packed onto as few card sheets as possible.
 - **Large plots on several pages.** Split a map across a grid of sheets, with an optional gap between the
   mounted pages and a cut-out of each page; every page gets its own set of G-code files.
 - **SVG import.** Open multi-layer SVG artwork: each layer gets its own pen, scaled and centred on the
