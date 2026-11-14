@@ -50,6 +50,10 @@ Repo: `github.com/natemcoleman/MoonPlotter`. Licence: MIT. Python 3.12 on Window
 - **Be accurate.** "Make no mistakes" was an explicit instruction. Check numbers and sources, and say
   clearly when something is modelled or untested.
 - End each status report with the owner's **pending physical test list** (section 7).
+- **Living state files:** keep `project_context.md` (overview, architecture, files, decisions, current
+  state) and `project_roadmap.md` (next steps, bugs, backlog, recently completed) in the repo root up to
+  date. Update both at each milestone or change of major task, and output both in full when the owner
+  types **"Update state"**. Read them first when picking up the project.
 
 ### The owner's hardware and materials
 
