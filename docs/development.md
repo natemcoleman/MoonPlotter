@@ -1,5 +1,7 @@
 # Development
 
+AI assistants: start with [`AGENTS.md`](../AGENTS.md) in the repository root.
+
 The app is plain Python. The GUI uses PyQt6, the plotting and preview use matplotlib, rasters are read
 with rasterio, geometry uses shapely and scipy, and G-code is written by vpype. All application code is
 in the `MoonPlotter/` folder. Data paths in `config.py` are relative to that folder: `main.py` switches
@@ -27,6 +29,13 @@ to it on start-up, so the app can be launched from anywhere.
 | `project_io.py` | Project files (`.topo.json`) and style presets (`presets.json`) |
 | `pen_dialog.py`, `export_dialog.py`, `data_dialog.py` | Dialogs |
 | `ui_widgets.py`, `theme.py` | Reusable widgets (collapsible sections, layer panel, swatch combo box, wheel guard) and the Qt style sheet |
+| `lakes.py` | Lake bathymetry regions (`config.LAKES`): the Tahoe survey raster, and modelled lake beds for Jenny and Jackson Lake built from OpenStreetMap shorelines |
+| `ski.py` | Ski resort runs and lifts from OpenStreetMap (Overpass), cached in `ski_resorts/` |
+| `svg_import.py` | Multi-layer SVG import, scaled and centred on the paper |
+| `system_diagram.py` | The poster-style all-planets Solar System diagram |
+| `layer_cut.py` | Layered cardstock cut-outs: height bands, pen marks, packing pieces on sheets, knife paths |
+| `calibrate_z.py`, `calib_dialog.py` | Pen-height and knife-depth test plots, and the **Tools › Calibrate pen & knife heights** dialog (`machine_settings.json`) |
+| `dem_prep.py` | One-time `.ovr` overviews for the large global elevation files |
 | `tools/` | One-off scripts, such as building the Lake Tahoe bathymetry file |
 
 ## How a plot is represented
