@@ -449,6 +449,25 @@ def test_z_calibration_math():
     assert cz.ladder_heights(3.0, 0.3, 4) == [3.0, 2.7, 2.4, 2.1]
     assert cz.pen_result(5.5, 1.2, press=0.4) == (6.3, 1.2)       # Z0 0.4 mm below the first inked line
     assert cz.knife_result(-0.6, margin=0.15) == -0.75
+    # knife test made at pen-down 5.5, pen-down since raised to 6.3: same blade height -> 0.8 mm deeper
+    assert cz.knife_result(-0.6, margin=0.15, test_pen_down=5.5, pen_down=6.3) == -1.55
+    assert cz.config_lines({'PEN_DOWN_ABOVE_HOME_MM': 4.2, 'PEN_LIFT_MM': 1.2, 'CUTTER_Z_OFFSET_MM': -0.95}) == \
+        ["PEN_DOWN_ABOVE_HOME_MM = 4.20", "PEN_LIFT_MM = 1.2", "CUTTER_Z_OFFSET_MM = -0.95"]
+
+
+def test_z_calibration_read_test_file():
+    import calibrate_z as cz
+    with tempfile.TemporaryDirectory() as d:
+        for name, (g, zs) in (("pen", cz.pen_ladder(5.5, start=3.0, step=0.3, count=13)),
+                              ("knife", cz.knife_ladder(6.3, start=1.5, step=0.3, count=16))):
+            p = os.path.join(d, name + ".gcode")
+            with open(p, "w") as f:
+                f.write("\n".join(g))
+            kind, h, back = cz.read_test(p)
+            assert kind == name and h == (5.5 if name == "pen" else 6.3) and back == zs
+    # line 14 of a 3.0 / 0.3 ladder is Z-0.90: with 0.4 mm press the pen-down height drops by 1.3 mm
+    zs = cz.ladder_heights(3.0, 0.3, 15)
+    assert zs[13] == -0.9 and cz.pen_result(5.5, zs[13], press=0.4) == (4.2, 1.2)
 
 
 def test_z_calibration_gcode():

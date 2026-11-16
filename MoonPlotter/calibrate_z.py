@@ -82,6 +82,38 @@ def pen_result(pen_down_above_home, first_inked_z, press=0.4, air=0.8):
     return round(new_h, 2), round(float(press) + float(air), 2)
 
 
-def knife_result(first_through_z, margin=0.15):
-    """Knife depth (relative to Z0): the first square that dropped out, plus a little margin."""
-    return round(float(first_through_z) - float(margin), 2)
+def knife_result(first_through_z, margin=0.15, test_pen_down=None, pen_down=None):
+    """Knife depth (CUTTER_Z_OFFSET_MM, relative to Z0): the first square that dropped out, plus a little
+    margin. The test's depths were relative to the pen-down height it was made with (test_pen_down); if
+    the pen-down height has changed since (pen_down), the depth is moved so the blade still reaches the
+    same physical height."""
+    shift = 0.0
+    if test_pen_down is not None and pen_down is not None:
+        shift = float(test_pen_down) - float(pen_down)
+    return round(float(first_through_z) + shift - float(margin), 2)
+
+
+def read_test(path):
+    """Reads a pen or knife test G-code file written by pen_ladder / knife_ladder.
+    Returns ('pen' | 'knife', pen-down height it was made with, [Z of line / square 1, 2, ...])."""
+    import re
+    kind, h, zs = None, None, []
+    with open(path, 'r', errors='replace') as f:
+        for line in f:
+            m = re.search(r"(PEN HEIGHT|KNIFE DEPTH) TEST: pen-down height (-?[\d.]+) mm", line)
+            if m and kind is None:
+                kind, h = ('pen' if m.group(1) == 'PEN HEIGHT' else 'knife'), float(m.group(2))
+                continue
+            m = re.match(r";\s*(?:line|square) (\d+): Z([+-]?[\d.]+)", line)
+            if m:
+                zs.append((int(m.group(1)), float(m.group(2))))
+    if kind is None or not zs:
+        raise ValueError("This isn't a pen or knife test file made by MoonPlotter.")
+    return kind, h, [z for _, z in sorted(zs)]
+
+
+def config_lines(values):
+    """The config.py lines for these values (as in config.py: PEN_LIFT_MM with one decimal)."""
+    fmt = {'PEN_DOWN_ABOVE_HOME_MM': "{:.2f}", 'PEN_LIFT_MM': "{:.1f}", 'CUTTER_Z_OFFSET_MM': "{:.2f}",
+           'Z_MAX_FEED': "{:.1f}"}
+    return [f"{k} = {fmt[k].format(float(v))}" for k, v in values.items() if k in fmt]

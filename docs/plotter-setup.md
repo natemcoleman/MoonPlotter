@@ -59,15 +59,30 @@ the bed or moving the plotter.
 
 1. **Pen height.** Click **Save pen test G-code…** and plot it on plain paper. It draws a column of short
    lines, top to bottom, each 0.3 mm lower than the last (every 5th line is longer to make counting easy;
-   the printer screen shows each line's number and height). Enter the **first line with ink** and click
-   **Use**. Pen-down moves to just below that line (by **press**, 0.4 mm by default, so a spring or
-   rubber-band holder keeps steady contact) and the pen lift becomes press + 0.8 mm. No ink at all? Lower
-   **Top line**. Ink on line 1? Raise it. Running the test again afterwards is a good check.
-2. **Knife depth.** Do this after step 1: the depth is measured from pen-down. Click **Save knife test
-   G-code…**, fit the knife and lay scrap card of the kind you will cut on a mat. It cuts 10 mm squares,
-   left to right and top row first, each deeper than the last. Enter the **first square that drops out**
-   and click **Use** (a 0.15 mm margin is added).
-3. Click **Save**. New exports use the values straight away.
+   the printer screen shows each line's number and height). Enter the **first solid line**. The box under
+   it shows the exact lines to put in `config.py`, for example:
+
+   ```
+   PEN_DOWN_ABOVE_HOME_MM = 4.20
+   PEN_LIFT_MM = 1.2
+   ```
+
+   They update as you change the line number. Pen-down goes just below that line (by **press**, 0.4 mm by
+   default, so a spring or rubber-band holder keeps steady contact) and the pen lift becomes press + 0.8 mm.
+   No ink at all? Lower **Top line**. Ink on line 1? Raise it.
+   - Plotted a test earlier, or with other settings? Click **Read a test file…** and open its G-code: the
+     line heights and the pen-down height it was made with are read from the file, so the numbers are right.
+   - **Copy** puts the lines on the clipboard; **Use** puts the values in **This machine** at the top.
+2. **Knife depth.** Do this after step 1 (click **Use** there first): the depth is measured from pen-down.
+   Click **Save knife test G-code…**, fit the knife and lay scrap card of the kind you will cut on a mat. It
+   cuts 10 mm squares, left to right and top row first, each deeper than the last. Enter the **first square
+   that drops out**; the box shows the `CUTTER_Z_OFFSET_MM = …` line (a 0.15 mm margin is added). If the
+   pen-down height changed after the knife test was made, the depth is corrected so the blade still reaches
+   the same height.
+3. Either copy the lines into `config.py` and restart the app, or click **Use** and then **Save**. Save writes
+   `machine_settings.json`, which **overrides `config.py`** on this computer from then on. If that file exists,
+   edit the values in the dialog (or delete the file) rather than in `config.py`. New exports use the values
+   straight away.
 
 To set them by hand instead: home the printer (`G28`), lower Z in 0.1 mm steps until the pen tip just
 touches the paper and enter that Z as the pen-down height in the dialog.

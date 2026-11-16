@@ -5,9 +5,10 @@ _Last updated: 16 Nov 2026 · `main` after the City road maps commit_
 ## Immediate Next Steps
 1. **Calibrate the machine (owner, at the plotter).**
    - Open **Tools › Calibrate pen & knife heights**.
-   - Pen test: save it, plot it on plain paper, enter the first line with ink, click **Use**.
-   - Knife test: save it, cut it on scrap 65 lb card on a mat, enter the first square that drops out, click **Use**.
-   - Click **Save**.
+   - Pen test: save it (or **Read a test file…** for one already plotted), enter the first solid line; the
+     `config.py` lines are shown. Click **Use**.
+   - Knife test: save it, cut it on scrap 65 lb card on a mat, enter the first square that drops out.
+   - Copy the lines into `config.py`, or click **Save** (writes `machine_settings.json`, which overrides it).
    - Expect pen-down to rise by about 2 mm from 5.5, the lift to drop to about 1.2 mm, and the knife depth
      to be well under the current -2.0 mm.
    - Report the numbers so they can be sanity-checked.
@@ -66,6 +67,10 @@ _Last updated: 16 Nov 2026 · `main` after the City road maps commit_
 - Screenshots of the new features in `docs/`.
 
 ## Recently Completed
+- **Calibration dialog shows the `config.py` lines live.** Enter the first solid line or the first square that
+  drops out, and the exact `PEN_DOWN_ABOVE_HOME_MM` / `PEN_LIFT_MM` / `CUTTER_Z_OFFSET_MM` lines appear, with
+  Copy and Use buttons. **Read a test file…** takes the heights from an earlier test's G-code. The knife depth
+  is corrected if the pen-down height changed after the knife test. 44/44 tests pass.
 - **City road maps** (Subject › City). Covers boundary or rectangle clip, smallest road type, thick/thin pens
   or a single pen, and water, coastline, rivers, rail, parks and outline extras. Also a crowding check with
   a red overlay, a title, project save/load, resumable tiled downloads and `net.fetch_bytes` POST support.
