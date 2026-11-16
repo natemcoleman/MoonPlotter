@@ -152,6 +152,20 @@ The first time you choose a resort, the app also fetches **30 m Copernicus eleva
 three times the size of the resort, so you can pan, zoom out or split the map into pages and stay on
 sharp data. It is stored in `regions/` like any other fetched area.
 
+## City road maps
+
+**Subject › City** downloads a city's roads from [OpenStreetMap](https://www.openstreetmap.org/) the first
+time you load it. There is nothing to set up beforehand:
+
+- [Nominatim](https://nominatim.openstreetmap.org/) finds the city and its boundary;
+- the [Overpass API](https://overpass-api.de/) returns the roads (`highway=*`), water, coastline, rivers and
+  canals, railways and parks inside the boundary's bounding box. The box is fetched in parts of about
+  60 km², with retries, because the public servers are often busy. Finished parts are kept in
+  `cities/_parts/` until the whole city is in, so a failed download picks up where it stopped.
+
+Each city is saved as `MoonPlotter/cities/<name>.npz` (not in git; Washington, D.C. is about 2 MB). Delete the
+file to download fresh data. See [City road maps](city-maps.md).
+
 ## Licences and credits
 
 | Data | Licence / terms |
@@ -161,6 +175,6 @@ sharp data. It is stored in `regions/` like any other fetched area.
 | Sentinel-2 cloudless (EOX) | **CC BY-NC-SA 4.0: non-commercial use only.** Credit: "Sentinel-2 cloudless by EOX IT Services GmbH (Contains modified Copernicus Sentinel data 2024)". Don't sell plots made with it. |
 | GEBCO | Public domain, with attribution to the GEBCO Compilation Group |
 | Natural Earth | Public domain |
-| OpenStreetMap (ski runs and lifts, lake shorelines) | [ODbL 1.0](https://www.openstreetmap.org/copyright). Credit "© OpenStreetMap contributors" on plots you share. |
+| OpenStreetMap (ski runs and lifts, lake shorelines, city roads, water, railways and parks) | [ODbL 1.0](https://www.openstreetmap.org/copyright). Credit "© OpenStreetMap contributors" on plots you share. |
 
 Check each provider's current terms before using plots commercially.

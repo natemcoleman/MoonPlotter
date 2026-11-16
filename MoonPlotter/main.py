@@ -136,6 +136,8 @@ import ski
 import svg_import
 import lakes
 import layer_cut
+import city_roads as CR
+LAYER_LABELS.update(CR.LAYER_LABELS)
 from workers import clear_dem_cache
 
 # Cache for UI map previews
@@ -232,6 +234,26 @@ class _SkiFetch(QThread):
         except Exception as e:
             note = f"(30 m elevation not fetched: {e} - contours use the coarse global data.)"
         self.done.emit(self.resort, data, note)
+
+
+class _CityFetch(QThread):
+    """Finds a city on OpenStreetMap and downloads its roads (and the optional extras) in the background."""
+    done = pyqtSignal(str, object)
+    failed = pyqtSignal(str, str)
+    progress = pyqtSignal(str)
+
+    def __init__(self, name, max_class):
+        super().__init__()
+        self.name = name
+        self.max_class = max_class
+
+    def run(self):
+        try:
+            data = CR.download(self.name, self.max_class, progress=self.progress.emit)
+        except Exception as e:
+            self.failed.emit(self.name, f"{type(e).__name__}: {e}")
+            return
+        self.done.emit(self.name, data)
 
 
 class _DemPrep(QThread):
@@ -406,8 +428,15 @@ class PlotterApp(QMainWindow):
         self.decor_segments = []          # title / scale bar / north arrow / graticule / frame
         self.decor_masks = []             # data-coord boxes blanked behind the decorations
         self.calibration_mode = False
-        self.mission_mode = False         # True for every paper-space mode (Solar System and Image)
+        self.mission_mode = False         # True for every paper-space mode (Solar System, Image and City)
         self.image_mode = False
+        self.city_mode = False
+        self.city_data = None             # loaded city (city_roads.load / download)
+        self.city_rect = None             # [lon0, lat0, lon1, lat1] of the clip rectangle, or None
+        self.city_info = None             # stats of the last city map (scale, strokes, crowding)
+        self.city_selector = None
+        self._city_job = None
+        self._city_token = 0             # newest city map (the crowding check runs after it)
         self.mission_data = {}
         self.image_path = None
         self.image_rgb = None
@@ -639,6 +668,7 @@ class PlotterApp(QMainWindow):
         sec_src = CollapsibleSection("Source")
         self.combo_subject = QComboBox()
         for name, tip in (("Earth", ""), ("Moon", ""), ("Mars", ""),
+                          ("City", "Every road of a city from OpenStreetMap (after anvaka/city-roads)"),
                           ("Solar System", "Spacecraft trajectories through the solar system (Voyager, Cassini, "
                                            "New Horizons...)"),
                           ("Image", "Trace a logo, drawing or photo into pen outlines (and sticker cut lines)")):
@@ -730,6 +760,7 @@ class PlotterApp(QMainWindow):
         vbox.addWidget(sec_src)
         self._build_missions_section(vbox)
         self._build_image_section(vbox)
+        self._build_city_section(vbox)
 
         # ---------- PAPER ----------
         sec_paper = CollapsibleSection("Paper")
@@ -1539,8 +1570,9 @@ class PlotterApp(QMainWindow):
         self.chk_join.setVisible(not ("Stipp" in strategy or is_hachure or "Squiggle" in strategy))
         self._update_contrast_warning()
         # Solar System mode: mission controls instead of the map / terrain controls
-        solar = planet in ('Solar System', 'Image')
+        solar = planet in ('Solar System', 'Image', 'City')
         self.sec_missions.setVisible(planet == 'Solar System')
+        self.sec_city.setVisible(planet == 'City')
         self.sec_image.setVisible(planet == 'Image')
         if planet == 'Image':
             self._update_image_controls()
@@ -1558,8 +1590,8 @@ class PlotterApp(QMainWindow):
             w.setVisible(not solar)
         if hasattr(self, 'btn_draw'):
             self.btn_draw.setText({'Solar System': "Draw Solar System" if self.is_system_diagram() else "Draw Mission Plot",
-                                   'Image': "Place SVG" if self.svg_layers is not None else "Trace Image"
-                                   }.get(planet, "Draw Map"))
+                                   'Image': "Place SVG" if self.svg_layers is not None else "Trace Image",
+                                   'City': "Draw City Map"}.get(planet, "Draw Map"))
 
     REGION_NONE = "None (Plot Full Selection)"
 
@@ -2460,6 +2492,13 @@ class PlotterApp(QMainWindow):
         if self.image_mode:
             self.start_image_plot(fresh=True)
             return
+        if self.city_mode:
+            name = self.combo_city.currentText().strip()
+            if self.city_data is None or (name and name != self.city_data['meta']['query']):
+                self.load_city()
+            else:
+                self.update_city_plot(fresh=True)
+            return
         if self.mission_mode:
             self.start_mission_plot()
             return
@@ -3048,6 +3087,7 @@ class PlotterApp(QMainWindow):
             self.ax_prev.set_xlim(xlim)
             self.ax_prev.set_ylim(ylim)
 
+        self._draw_city_overlay()
         self._draw_tile_overlay()
         self._apply_screen_linewidths(redraw=False)
         self.ink_image = None                 # ax.clear() above removed the old one
@@ -3908,6 +3948,9 @@ class PlotterApp(QMainWindow):
         if self.selected_planet() == 'Image':
             self._enter_image_mode()
             return
+        if self.selected_planet() == 'City':
+            self._enter_city_mode()
+            return
         if self.mission_mode:
             self._leave_mission_mode()
         if self.active_planet != self.selected_planet():
@@ -4426,6 +4469,7 @@ class PlotterApp(QMainWindow):
                          'moons': self.chk_sys_moons.isChecked(), 'stars': self.chk_sys_stars.isChecked(),
                          'rays': self.chk_sys_rays.isChecked(), 'frame': self.chk_sys_frame.isChecked()},
             'image': self._image_state(),
+            'city': self._city_state(),
             'preview_view': [list(self.ax_prev.get_xlim()), list(self.ax_prev.get_ylim())] if self.has_drawn else None,
         })
         return st
@@ -4457,6 +4501,8 @@ class PlotterApp(QMainWindow):
                 self._fill_mission_table()
             if st.get('image'):
                 self._apply_image_state(st['image'])
+            if st.get('city'):
+                self._apply_city_state(st['city'])
             self.combo_subject.setCurrentText(planet)
             if self.active_planet != planet:
                 self.switch_planet()
@@ -4516,6 +4562,10 @@ class PlotterApp(QMainWindow):
             self.start_mission_plot()
         if planet == 'Image' and (self.image_rgb is not None or self.svg_layers is not None):
             self.start_image_plot(fresh=True)
+        if planet == 'City' and self.city_data is not None:
+            self._draw_city_overview()
+            if st.get('has_drawn'):
+                self.update_city_plot(fresh=True)
         self.lbl_status.setText("Project loaded.")
 
     def new_project(self):
@@ -4668,6 +4718,7 @@ class PlotterApp(QMainWindow):
         self.rebuild_palette_ui()
         self.rebuild_ink_widgets()
         self._fill_mission_pen_combos()
+        self._fill_city_pen_combos()
         self._fill_mission_table()
         if self.has_drawn and self.sec_fill.is_enabled():
             self.recalc_timer.start(150)
@@ -4893,12 +4944,16 @@ class PlotterApp(QMainWindow):
     def update_paper_plot(self):
         if self.image_mode:
             self.update_image_plot()
+        elif self.city_mode:
+            self.update_city_plot()
         else:
             self.update_mission_plot()
 
     def _enter_mission_mode(self):
         self.mission_mode = True
         self.image_mode = False
+        self.city_mode = False
+        self.selector.set_active(True)
         self.active_planet = 'Solar System'
         if self.calibration_mode:
             self.calibration_mode = False
@@ -4923,6 +4978,11 @@ class PlotterApp(QMainWindow):
     def _leave_mission_mode(self):
         self.mission_mode = False
         self.image_mode = False
+        self.city_mode = False
+        if self.city_selector is not None:
+            self.city_selector.set_active(False)
+            self.city_selector = None
+        self.selector.set_active(True)
         self.map_segments, self.dem_segments, self.decor_segments, self.decor_masks = [], [], [], []
         self.has_drawn = False
         self.current_view_extent = None
@@ -4994,7 +5054,7 @@ class PlotterApp(QMainWindow):
                                               "Check the internet connection and try again.")
 
     def update_mission_plot(self, fresh=False):
-        if not self.mission_mode or self.image_mode or self._loading or self.calibration_mode:
+        if not self.mission_mode or self.image_mode or self.city_mode or self._loading or self.calibration_mode:
             return
         if not fresh and not self.has_drawn:
             return
@@ -5060,6 +5120,426 @@ class PlotterApp(QMainWindow):
         self.lbl_status.setText(f"Mission plot: {names} ({len(segs):,} strokes)."
                                 + (f" {', '.join(clipped)} continue beyond the edge." if clipped else "")
                                 + (f" Click Draw Mission Plot to download {', '.join(waiting)}." if waiting else ""))
+
+    # --- CITY ROAD MAPS (OpenStreetMap roads, after anvaka/city-roads) ---
+    def _build_city_section(self, vbox):
+        sec = self.sec_city = CollapsibleSection("City")
+        row = QHBoxLayout()
+        self.combo_city = QComboBox()
+        self.combo_city.setEditable(True)
+        self.combo_city.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.combo_city.lineEdit().setPlaceholderText("e.g. Washington, D.C.")
+        self.combo_city.setToolTip("Type a city (or a district, e.g. 'Manhattan') and click Load. It is downloaded "
+                                   "from OpenStreetMap once and kept in the 'cities' folder;\nthe list shows the "
+                                   "cities already downloaded.")
+        self.btn_city_load = QPushButton("Load")
+        self.btn_city_load.setToolTip("Find the city on OpenStreetMap and download its roads (only the first time).")
+        self.btn_city_load.clicked.connect(self.load_city)
+        self.combo_city.lineEdit().returnPressed.connect(self.load_city)
+        self.combo_city.activated.connect(lambda _: self.load_city())
+        row.addWidget(self.combo_city, 1)
+        row.addWidget(self.btn_city_load)
+        sec.add(self._field("City", row))
+        self._fill_city_combo()
+
+        self.combo_city_clip = QComboBox()
+        self.combo_city_clip.addItems(["City boundary", "Rectangle (drag on the source map)"])
+        self.combo_city_clip.setToolTip("City boundary: the city's official outline, like city-roads.\n"
+                                        "Rectangle: drag a box on the source map (it keeps the page's shape).")
+        sec.add(self._field("Clip to", self.combo_city_clip))
+
+        self.combo_city_min = QComboBox()
+        for _, label, _ in CR.ROAD_CLASSES:
+            self.combo_city_min.addItem(label)
+        self.combo_city_min.setCurrentIndex(CR.DEFAULT_MIN_CLASS)
+        self.combo_city_min.setToolTip("Every road of this type and bigger is drawn, everywhere on the map.\n"
+                                       "Too much black in the preview? Pick a bigger type, larger paper, or split the "
+                                       "plot into pages.\nPaths & footways need a second, larger download.")
+        sec.add(self._field("Smallest roads drawn", self.combo_city_min))
+
+        self.chk_city_single = QCheckBox("One pen for every road (classic look)")
+        sec.add(self.chk_city_single)
+        self.combo_city_major = QComboBox()
+        self.combo_city_major.addItems(CR.MAJOR_LABELS)
+        self.combo_city_major.setCurrentIndex(CR.DEFAULT_MAJOR_UPTO)
+        self.combo_city_major.setToolTip("Road types drawn with the thick pen; all smaller roads use the thin pen.")
+        self.lbl_city_major = sec.add(self._field("Thick pen draws", self.combo_city_major))
+        self.combo_city_pen_major = QComboBox()
+        self.lbl_city_pen_major = sec.add(self._field("Thick pen", self.combo_city_pen_major))
+        self.combo_city_pen_minor = QComboBox()
+        self.lbl_city_pen_minor = sec.add(self._field("Thin pen", self.combo_city_pen_minor))
+
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        self.chk_city_extra = {}
+        for i, (key, (label, _)) in enumerate(CR.EXTRAS.items()):
+            c = QCheckBox(label.replace('&', '&&'))     # '&' alone would be a keyboard mnemonic
+            self.chk_city_extra[key] = c
+            grid.addWidget(c, i // 2, i % 2)
+        self.chk_city_extra['water'].setToolTip("Outlines of lakes, ponds, reservoirs and the wide parts of rivers.")
+        self.chk_city_extra['rivers'].setToolTip("River and canal centre lines (not where a water outline already "
+                                                 "shows the river).")
+        self.chk_city_extra['rail'].setToolTip("Railways, light rail and metro lines above ground (no yards or "
+                                               "sidings).")
+        self.chk_city_extra['outline'].setToolTip("The city boundary.")
+        sec.add(self._field("Also draw", grid))
+        self.combo_city_pen_extras = QComboBox()
+        self.lbl_city_pen_extras = sec.add(self._field("Pen for water, rail, parks & outline",
+                                                       self.combo_city_pen_extras))
+
+        self.chk_city_title = QCheckBox("Title under the map (name and coordinates)")
+        self.chk_city_title.setChecked(True)
+        sec.add(self.chk_city_title)
+        self.txt_city_title = QLineEdit()
+        self.txt_city_title.setPlaceholderText("Name | second line  (blank = automatic)")
+        self.widget_city_title = sec.add(self._field("Title text", self.txt_city_title))
+        self.chk_city_crowd = QCheckBox("Highlight crowded areas")
+        self.chk_city_crowd.setToolTip("Shades the places where lines are so close that, with these pens and this "
+                                       "paper size, the ink would merge into solid black.")
+        sec.add(self.chk_city_crowd)
+        self.lbl_city_info = QLabel("")
+        self.lbl_city_info.setObjectName("hint")
+        self.lbl_city_info.setWordWrap(True)
+        sec.add(self.lbl_city_info)
+        hint = QLabel("Roads, water, railways and parks come from OpenStreetMap (© OpenStreetMap "
+                      "contributors). A city downloads once and is kept in the 'cities' folder. Right-click a layer "
+                      "in the Layers tab to change its pen.")
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        sec.add(hint)
+
+        self.city_timer = QTimer()
+        self.city_timer.setSingleShot(True)
+        self.city_timer.timeout.connect(lambda: self.update_city_plot())
+        self.combo_city_clip.currentIndexChanged.connect(lambda _: self._on_city_clip_changed())
+        self.combo_city_min.currentIndexChanged.connect(lambda _: self._on_city_min_changed())
+        self.chk_city_single.toggled.connect(lambda _: (self._update_city_controls(), self.schedule_city_plot()))
+        self.chk_city_title.toggled.connect(lambda _: (self._update_city_controls(), self.schedule_city_plot()))
+        for c in list(self.chk_city_extra.values()) + [self.chk_city_crowd]:
+            c.toggled.connect(lambda _: (self._update_city_controls(), self.schedule_city_plot()))
+        for cb in (self.combo_city_major, self.combo_city_pen_major, self.combo_city_pen_minor,
+                   self.combo_city_pen_extras):
+            cb.currentIndexChanged.connect(lambda _: self.schedule_city_plot())
+        self.txt_city_title.editingFinished.connect(self.schedule_city_plot)
+        sec.setVisible(False)
+        vbox.addWidget(sec)
+        self._fill_city_pen_combos()
+        self._update_city_controls()
+
+    def _fill_city_combo(self):
+        cur = self.combo_city.currentText()
+        self.combo_city.blockSignals(True)
+        self.combo_city.clear()
+        self.combo_city.addItems(CR.cached_cities())
+        self.combo_city.setCurrentText(cur)
+        self.combo_city.blockSignals(False)
+
+    def _fill_city_pen_combos(self):
+        self._fill_pen_combo(self.combo_city_pen_major, 'pen_1')
+        self._fill_pen_combo(self.combo_city_pen_minor, 'base')
+        self._fill_pen_combo(self.combo_city_pen_extras, 'base')
+
+    def _update_city_controls(self):
+        single = self.chk_city_single.isChecked()
+        self.lbl_city_major.setVisible(not single)
+        self.lbl_city_pen_major.setVisible(not single)
+        self.lbl_city_pen_minor.findChild(QLabel, "fieldLabel").setText("Pen" if single else "Thin pen")
+        self.lbl_city_pen_extras.setVisible(any(c.isChecked() for c in self.chk_city_extra.values()))
+        self.widget_city_title.setVisible(self.chk_city_title.isChecked())
+
+    def schedule_city_plot(self):
+        if self.city_mode and self.has_drawn and not self._loading:
+            self.city_timer.start(250)
+
+    def city_options(self):
+        mj = self.combo_city_pen_major.currentData() or 'pen_1'
+        mn = self.combo_city_pen_minor.currentData() or 'base'
+        ex = self.combo_city_pen_extras.currentData() or mn
+        return {'min_class': self.combo_city_min.currentIndex(), 'major_upto': self.combo_city_major.currentIndex(),
+                'single_pen': self.chk_city_single.isChecked(), 'pen_major': mj, 'pen_minor': mn, 'pen_extras': ex,
+                'width_major': self._pen_line_mm(mj), 'width_minor': self._pen_line_mm(mn),
+                'width_extras': self._pen_line_mm(ex),
+                'extras': {k for k, c in self.chk_city_extra.items() if c.isChecked()},
+                'clip': 'rectangle' if self.combo_city_clip.currentIndex() == 1 else 'boundary',
+                'rect': self.city_rect, 'title': self.chk_city_title.isChecked(),
+                'title_text': self.txt_city_title.text(), 'frame': self.chk_deco_frame.isChecked()}
+
+    def _enter_city_mode(self):
+        self._enter_mission_mode()                     # shared paper-space setup
+        self.city_mode = True
+        self.active_planet = 'City'
+        self.selector.set_active(False)                # the source map gets its own rectangle tool
+        self.context_ui_update()
+        self._draw_city_overview()
+        if self.city_data is None:
+            self.lbl_status.setText("City: type a city in the City section and click Load.")
+        elif not self._loading:
+            self.update_city_plot(fresh=True)
+
+    def load_city(self):
+        name = self.combo_city.currentText().strip()
+        if not name:
+            self.lbl_status.setText("Type a city name first (e.g. 'Washington, D.C.').")
+            return
+        if self._city_job is not None and self._city_job.isRunning():
+            return
+        need = self.combo_city_min.currentIndex()
+        try:
+            data = CR.load(name)
+        except Exception as e:
+            print(f"City cache unreadable ({e}) - downloading again.")
+            data = None
+        if data is not None and int(data['meta'].get('max_class', CR.FETCH_CLASS)) >= need:
+            self._on_city_ready(name, data)
+            return
+        self.is_calculating = True
+        self.btn_draw.setEnabled(False)
+        self.btn_city_load.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self._city_job = _CityFetch(name, max(CR.FETCH_CLASS, need))
+        self._city_job.progress.connect(self.lbl_status.setText)
+        self._city_job.done.connect(self._on_city_ready)
+        self._city_job.failed.connect(self._on_city_failed)
+        self._city_job.finished.connect(self._city_job_finished)
+        self._city_job.start()
+
+    def _city_job_finished(self):
+        self.is_calculating = False
+        self.btn_draw.setEnabled(True)
+        self.btn_city_load.setEnabled(True)
+        self.progress_bar.setVisible(False)
+
+    def _on_city_ready(self, name, data):
+        same = self.city_data is not None and self.city_data['meta'].get('osm_relation') == \
+            data['meta'].get('osm_relation')
+        self.city_data = data
+        if not same:
+            self.city_rect = None
+            self.txt_city_title.clear()
+        self._fill_city_combo()
+        self.combo_city.setCurrentText(name)
+        if not self.city_mode:
+            return
+        self._draw_city_overview()
+        self.update_city_plot(fresh=True)
+        m = data['meta']
+        self.lbl_status.setText(f"{m.get('display_name', name)} - {len(data['roads']):,} road pieces "
+                                f"(OpenStreetMap, {m.get('downloaded', '')}).")
+
+    def _on_city_failed(self, name, msg):
+        self.lbl_status.setText("City download failed.")
+        QMessageBox.warning(self, "City", f"Could not load '{name}':\n\n{msg}")
+
+    def _on_city_min_changed(self):
+        d = self.city_data
+        if d is not None and self.combo_city_min.currentIndex() > int(d['meta'].get('max_class', CR.FETCH_CLASS)):
+            self.combo_city.setCurrentText(d['meta']['query'])
+            self.load_city()                         # paths need the larger download
+            return
+        if self.city_mode:
+            self._draw_city_overview()
+        self.schedule_city_plot()
+
+    def _on_city_clip_changed(self):
+        if self.combo_city_clip.currentIndex() == 1 and self.city_rect is None and self.city_data is not None:
+            x0, y0, x1, y1 = CR.boundary_metres(self.city_data['meta']).bounds
+            cx, cy, w, h = 0.5 * (x0 + x1), 0.5 * (y0 + y1), 0.5 * (x1 - x0), 0.5 * (y1 - y0)
+            self._set_city_rect(CR.fit_rect((cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2), self.pw, self.ph,
+                                            self.chk_city_title.isChecked()))
+        if self.city_mode:
+            self._draw_city_overview()
+        self.schedule_city_plot()
+
+    def _set_city_rect(self, rect_m):
+        lon0, lat0 = self.city_data['meta']['center']
+        a, b = CR.to_lonlat(rect_m[0], rect_m[1], lon0, lat0)
+        c, d = CR.to_lonlat(rect_m[2], rect_m[3], lon0, lat0)
+        self.city_rect = [float(a), float(b), float(c), float(d)]
+
+    def _city_rect_m(self):
+        if self.city_rect is None or self.city_data is None:
+            return None
+        lon0, lat0 = self.city_data['meta']['center']
+        x0, y0 = CR.to_metres(self.city_rect[0], self.city_rect[1], lon0, lat0)
+        x1, y1 = CR.to_metres(self.city_rect[2], self.city_rect[3], lon0, lat0)
+        return float(x0), float(y0), float(x1), float(y1)
+
+    def _on_city_rect(self, eclick, erelease):
+        if not self.city_mode or self.city_data is None or eclick.xdata is None or erelease.xdata is None:
+            return
+        x0, x1 = sorted([eclick.xdata, erelease.xdata])
+        y0, y1 = sorted([eclick.ydata, erelease.ydata])
+        self._set_city_rect(CR.fit_rect((x0, y0, x1, y1), self.pw, self.ph, self.chk_city_title.isChecked()))
+        QTimer.singleShot(0, self._draw_city_overview)   # after the selector has finished with the event
+        if self.has_drawn:
+            self.update_city_plot()
+
+    def _draw_city_overview(self):
+        """Source-map panel in City mode: the roads (local metres), the city boundary and the clip rectangle."""
+        ax = self.ax_map
+        ax.clear()
+        style_axes(self.fig_map, ax)
+        ax.set_facecolor('#F4F1EA')
+        if getattr(self, 'city_selector', None) is not None:
+            self.city_selector.set_active(False)
+            self.city_selector = None
+        d = self.city_data
+        if d is None:
+            ax.text(0.5, 0.5, "Load a city in the City section", ha='center', va='center', color='#8A93A8',
+                    transform=ax.transAxes)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            self.canvas_map.draw_idle()
+            return
+        cls = np.asarray(d['road_cls'])
+        lim = self.combo_city_min.currentIndex()
+        major = self.combo_city_major.currentIndex()
+        big = [r for r, c in zip(d['roads'], cls) if c <= major]
+        small = [r for r, c in zip(d['roads'], cls) if major < c <= lim]
+        ax.add_collection(LineCollection(small, colors='#6B6B6B', linewidths=0.25))
+        ax.add_collection(LineCollection(big, colors='#1A1A1A', linewidths=0.7))
+        try:
+            from shapely import get_parts
+            for p in get_parts(CR.boundary_metres(d['meta'])):
+                if p.geom_type == 'Polygon':
+                    xy = np.asarray(p.exterior.coords)
+                    ax.plot(xy[:, 0], xy[:, 1], color=ACCENT, lw=1.2)
+        except Exception as e:
+            print(f"City boundary not drawn: {e}")
+        x0, y0, x1, y1 = d['meta']['bbox_m']
+        ax.set_xlim(x0, x1)
+        ax.set_ylim(y0, y1)
+        ax.set_aspect('equal')
+        ax.set_xticks([])
+        ax.set_yticks([])
+        rect_mode = self.combo_city_clip.currentIndex() == 1
+        ax.set_title(f"{d['meta'].get('name', '')} - " + ("drag a rectangle to choose the area" if rect_mode
+                                                           else "scroll to zoom, middle-drag to pan"),
+                     fontsize=8, color='#8A93A8')
+        if rect_mode:
+            self.city_selector = RectangleSelector(ax, self._on_city_rect, useblit=True, button=[1],
+                                                   minspanx=5, minspany=5, spancoords='pixels', interactive=False,
+                                                   props=dict(facecolor=ACCENT, edgecolor=ACCENT, alpha=0.18,
+                                                              fill=True))
+            r = self._city_rect_m()
+            if r is not None:
+                ax.add_patch(patches.Rectangle((r[0], r[1]), r[2] - r[0], r[3] - r[1], fill=False,
+                                               edgecolor=ACCENT, lw=1.5, zorder=6))
+        self.canvas_map.draw_idle()
+
+    def update_city_plot(self, fresh=False):
+        if not self.city_mode or self._loading or self.calibration_mode or self.city_data is None:
+            return
+        if not fresh and not self.has_drawn:
+            return
+        if self.combo_city_clip.currentIndex() == 1 and self.city_rect is None:
+            self._on_city_clip_changed()                 # makes the default rectangle
+        try:
+            segs, masks, info = CR.build_city_map(self.city_data, dict(self.city_options(), crowding=False),
+                                                  self.pw, self.ph)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.lbl_status.setText(f"City map failed: {e}")
+            return
+        self.city_info = info
+        self.current_view_extent = [0.0, self.pw, -self.ph / 2.0, self.ph / 2.0]
+        self.map_segments = segs
+        self.decor_segments, self.decor_masks = [], masks
+        self.dem_segments = list(segs)
+        self.has_drawn = True
+        if fresh:
+            self.custom_items = []
+            self.ax_prev.set_xlim(0.0, 1.0)
+            self.ax_prev.set_ylim(0.0, 1.0)
+        self._cache_stroke_metrics()
+        self.render_canvas()
+        self.refresh_layer_panel()
+        self._city_token += 1
+        self._set_city_info_label()
+        QTimer.singleShot(40, lambda t=self._city_token: self._update_city_crowding(t))
+        self.lbl_status.setText(f"City map: {self.city_data['meta'].get('name', '')} "
+                                f"({info['n_strokes']:,} strokes).")
+
+    def _update_city_crowding(self, token):
+        """The crowding check (about a second on a big map) runs just after the preview is shown."""
+        info = self.city_info
+        if token != self._city_token or info is None or not self.city_mode:
+            return
+        try:
+            frac, grid, ext = CR.crowding(info['ink'], info['map_extent'])
+        except Exception as e:
+            print(f"Crowding check failed: {e}")
+            return
+        info.update(crowded_frac=frac, crowd_grid=grid, crowd_extent=ext)
+        self._set_city_info_label()
+        if self.chk_city_crowd.isChecked():
+            self._draw_city_overlay()
+            self.canvas_prev.draw_idle()
+
+    def _set_city_info_label(self):
+        info = self.city_info
+        crowd = info.get('crowded_frac')
+        self.lbl_city_info.setText(
+            f"{info['width_km']:.1f} × {info['height_km']:.1f} km · 1 mm = {info['scale_m_per_mm']:.0f} m "
+            f"· {info['n_strokes']:,} strokes · {info['ink_m']:.1f} m of ink.\n"
+            + ("Checking for crowded areas..." if crowd is None else
+               f"Crowded: {crowd:.0%} of the ink falls where lines merge into solid black - pick a bigger 'Smallest "
+               "roads drawn', larger paper, or split the plot into pages." if crowd >= 0.10 else
+               f"Crowding: {crowd:.0%} of the ink (fine)."))
+
+    def _draw_city_overlay(self):
+        """Red shading on the preview where the ink would merge (City mode, 'Highlight crowded areas')."""
+        info = self.city_info
+        if not (self.city_mode and info is not None and self.chk_city_crowd.isChecked()):
+            return
+        g = info.get('crowd_grid')
+        if g is None or not g.any():
+            return
+        rgba = np.zeros(g.shape + (4,), np.float32)
+        rgba[g] = (0.86, 0.1, 0.1, 0.45)
+        x0, x1, y0, y1 = info['crowd_extent']
+        self.ax_prev.imshow(rgba, extent=(x0, x1, y0, y1), origin='lower', interpolation='nearest', zorder=20)
+
+    def _city_state(self):
+        return {'name': self.combo_city.currentText(),
+                'loaded': self.city_data['meta']['query'] if self.city_data is not None else None,
+                'clip': self.combo_city_clip.currentIndex(), 'rect': self.city_rect,
+                'min_class': self.combo_city_min.currentIndex(), 'major_upto': self.combo_city_major.currentIndex(),
+                'single': self.chk_city_single.isChecked(),
+                'extras': sorted(k for k, c in self.chk_city_extra.items() if c.isChecked()),
+                'title': self.chk_city_title.isChecked(), 'title_text': self.txt_city_title.text(),
+                'crowd': self.chk_city_crowd.isChecked(),
+                'pens': {'major': self.combo_city_pen_major.currentData(),
+                         'minor': self.combo_city_pen_minor.currentData(),
+                         'extras': self.combo_city_pen_extras.currentData()}}
+
+    def _apply_city_state(self, st):
+        self.combo_city.setCurrentText(st.get('name') or '')
+        self.combo_city_clip.setCurrentIndex(int(st.get('clip', 0)))
+        self.combo_city_min.setCurrentIndex(int(st.get('min_class', CR.DEFAULT_MIN_CLASS)))
+        self.combo_city_major.setCurrentIndex(int(st.get('major_upto', CR.DEFAULT_MAJOR_UPTO)))
+        self.chk_city_single.setChecked(bool(st.get('single')))
+        for k, c in self.chk_city_extra.items():
+            c.setChecked(k in (st.get('extras') or []))
+        self.chk_city_title.setChecked(bool(st.get('title', True)))
+        self.txt_city_title.setText(st.get('title_text', ''))
+        self.chk_city_crowd.setChecked(bool(st.get('crowd')))
+        for cb, k in ((self.combo_city_pen_major, 'major'), (self.combo_city_pen_minor, 'minor'),
+                      (self.combo_city_pen_extras, 'extras')):
+            i = cb.findData((st.get('pens') or {}).get(k))
+            if i >= 0:
+                cb.setCurrentIndex(i)
+        self._update_city_controls()
+        self.city_data = None
+        if st.get('loaded'):
+            try:
+                self.city_data = CR.load(st['loaded'])
+            except Exception as e:
+                print(f"City cache unreadable: {e}")
+            if self.city_data is None:
+                self.lbl_status.setText(f"{st['loaded']} isn't downloaded on this computer - click Load.")
+        self.city_rect = st.get('rect')
 
     # --- IMAGE TRACING (logos, drawings, photos -> outlines / sticker cut lines) ---
     def _build_image_section(self, vbox):
@@ -5514,7 +5994,10 @@ class PlotterApp(QMainWindow):
 
     # Layers made of lettering / fine marks: exported without vpype's simplify, merge and 2 mm length filter
     # (those would delete the short strokes that make up small letters, dots and degree signs).
-    FINE_LAYERS = ('decor', 'sites', 'calibration', 'labels', 'markers', 'trajectory', 'belt', 'ski_lifts')
+    # Strokes that vpype only re-orders (no simplify / merge / 2 mm length filter). City roads are joined into
+    # long strokes beforehand, and the filter would drop short street pieces between junctions.
+    FINE_LAYERS = ('decor', 'sites', 'calibration', 'labels', 'markers', 'trajectory', 'belt', 'ski_lifts') \
+        + CR.CITY_LAYERS
 
     def _lines_for_pen(self, p_id, text_boxes, split=False):
         """All plot lines (in data coords) for one pen, with text blanking applied.

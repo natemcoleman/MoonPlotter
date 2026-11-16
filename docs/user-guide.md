@@ -24,15 +24,15 @@ line above them tells you what the app is doing.
 - [Projects and style presets](#projects-and-style-presets)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 
-Solar System mode and image tracing have their own pages: [Solar System mode](solar-system.md) and
-[Image tracing](image-tracing.md).
+Solar System mode, city maps and image tracing have their own pages: [Solar System mode](solar-system.md),
+[City road maps](city-maps.md) and [Image tracing](image-tracing.md).
 
 ---
 
 ## Choosing an area
 
-**Source › Subject** picks the **Earth**, **Moon** or **Mars**. The **Solar System** and **Image** modes are
-covered on their own pages. Mars stays greyed out until its data files are present. See
+**Source › Subject** picks the **Earth**, **Moon** or **Mars**. The **City**, **Solar System** and **Image**
+modes are covered on their own pages. Mars stays greyed out until its data files are present. See
 [Data sources](data-sources.md).
 
 On the **source map**:

@@ -37,6 +37,10 @@ using real pen colours, white pen on black paper, and Voyager 2's path from NASA
   shorelines and published depths.
 - **Ski resorts.** Grand Targhee, Deer Valley and Sundance runs and lifts from OpenStreetMap, overlaid on
   30 m contours, with runs optionally coloured by difficulty.
+- **City road maps.** Every road of a city from OpenStreetMap, after
+  [city-roads](https://github.com/anvaka/city-roads): clip to the city boundary or a rectangle, choose the
+  smallest road type, use a thick pen for major roads and a thin one for the rest (or one pen), and add
+  water, rivers, railways and parks. A crowding check shows where lines would merge at your pen width.
 - **Layered cut-outs.** Turn a map into stacked cardstock: each height band is cut out with the drag
   knife, marked with where the next layer goes, and packed onto as few card sheets as possible.
 - **Large plots on several pages.** Split a map across a grid of sheets, with an optional gap between the
@@ -101,8 +105,10 @@ time)** makes large areas and circle mode load several times faster. The
 | [Pens and paper](docs/pens-and-paper.md) | The pen manager, stock tracking, calibration sheets, colour separation, dark and coloured paper |
 | [Data sources](docs/data-sources.md) | Files the app expects, where to download them, regional fetch and GeoTIFF import, licences |
 | [Solar System mode](docs/solar-system.md) | Mission plots from JPL Horizons: choosing missions, pens and styles, offline caching |
+| [City road maps](docs/city-maps.md) | City mode: loading a city, road types, pens, extras, crowding |
 | [Image tracing](docs/image-tracing.md) | Logos, clip-art and photos to outlines; hatch fill; sticker cut lines |
 | [Development](docs/development.md) | Code layout, how a render and an export flow, tests, conventions |
+| [Architecture](docs/architecture.md) | Which file holds which feature: a map of the code for people and AI assistants |
 
 ## Safety first
 
@@ -127,6 +133,7 @@ MoonPlotter/              repository root
     ├── regions/          downloaded or imported regional rasters (created on demand)
     ├── ski_resorts/      OpenStreetMap ski runs and lifts for the Ski resorts regions
     ├── lakes/            lake shorelines (OpenStreetMap) and modelled lake beds
+    ├── cities/           downloaded city roads (OpenStreetMap, created on demand)
     ├── projects/         saved projects (*.topo.json): the default save and open folder
     └── tests/            unit tests (python tests/test_engines.py)
 ```
@@ -148,7 +155,7 @@ The app downloads or uses public datasets. Please credit them when you share plo
 - Moon: NASA Goddard SVS CGI Moon Kit (LRO LOLA elevation, LROC colour); USGS LOLA/Kaguya merge.
 - Mars: USGS Astrogeology (MGS MOLA, Viking colour, HRSC/MOLA blend).
 - Borders: Natural Earth (public domain).
-- Ski runs and lifts, lake shorelines: © OpenStreetMap contributors (ODbL).
+- Ski runs and lifts, lake shorelines, city roads: © OpenStreetMap contributors (ODbL).
 - Lake depths: Larsen et al. 2016 (Jenny Lake); Rhea et al. 2005, USGS (Jackson Lake).
 - Spacecraft trajectories: NASA JPL Horizons System.
 - Lettering: Hershey single-stroke fonts, via vpype.

@@ -1,6 +1,6 @@
 # project_context.md
 
-_Last updated: 14 Nov 2026 · repo state: `main` @ `5a6fb6c` (1 commit ahead of `origin/main`)_
+_Last updated: 16 Nov 2026 · repo state: `main` after the City road maps commit (not pushed)_
 
 ## Project Overview
 **MoonPlotter** ("Topo Plotter Studio — Cartographer Edition", github.com/natemcoleman/MoonPlotter, MIT) is a
@@ -12,6 +12,7 @@ Goals:
   - contour and hatch maps of Earth, Moon and Mars (global DEMs or fetched 30 m regional data);
   - lake bathymetry and ski-resort maps;
   - Solar System mission charts and an all-planets poster diagram;
+  - **city road maps** (every road of a city from OpenStreetMap, after anvaka/city-roads);
   - traced images and multi-layer SVGs.
 - Produce physical outputs:
   - multi-pen plots with `M0` pen swaps;
@@ -32,7 +33,8 @@ Goals:
 - **External data and services:**
   - NOAA ETOPO 2022, NASA SVS Moon kit, USGS Mars;
   - Copernicus GLO-30 (regional fetch), Sentinel-2 cloudless / USGS NAIP;
-  - Natural Earth, OpenStreetMap via the Overpass API (ski runs, lake shorelines);
+  - Natural Earth;
+  - OpenStreetMap via Nominatim and the Overpass API (ski runs, lake shorelines, city roads, water, rail, parks);
   - NASA JPL Horizons (missions).
 - **Hardware:**
   - Ender 3 running Marlin. Z moves at about 5 mm/s on stock firmware.
@@ -46,7 +48,7 @@ All application code is in `MoonPlotter/`. Data paths are relative to that folde
 
 | Module | Role |
 |---|---|
-| `main.py` (~5,800 lines) | `PlotterApp` window: sidebar sections, source map, preview, layers panel, editing tools, projects, export orchestration, background threads (`_SkiFetch`, `_LakeBuild`, missions, tracing) |
+| `main.py` (~6,300 lines) | `PlotterApp` window: sidebar sections, source map, preview, layers panel, editing tools, projects, export orchestration, background threads (`_SkiFetch`, `_LakeBuild`, `_CityFetch`, missions, tracing) |
 | `config.py` | Paper sizes and colours, built-in pens, `DATA_FILES`, `LAKES`, plotter and G-code constants; **per-machine overrides** loaded from `machine_settings.json` |
 | `workers.py` | `RenderWorker` (QThread): reads the DEM / colour window (regional or lake raster if one covers the selection), runs the contour and fill engines, returns segments plus `dem_data` and `dem_mult` |
 | `contour_engine.py` | Contours, index lines, Tanaka shading, below-sea-level split, borders, auto interval, lake bathymetry levels |
@@ -58,16 +60,17 @@ All application code is in `MoonPlotter/`. Data paths are relative to that folde
 | `lakes.py` | Lake regions: Tahoe survey raster; Jenny and Jackson **modelled beds** (OSM shoreline in `lakes/*.json` + published depths → `lakes/*.tif`) |
 | `ski.py` | Ski resorts (Overpass, mirror fallbacks, boundary filter) → run and lift segments; cached in `ski_resorts/*.json` |
 | `svg_import.py`, `image_trace.py` | Multi-layer SVG import; image tracing |
+| `city_roads.py` | **City road maps:** Nominatim boundary, Overpass download in ~60 km² parts (POST, retries, resumable, split on failure), `cities/*.npz` cache, road classes, clip to boundary or rectangle, two-pen split, joining OSM pieces into long strokes, crowding check, title |
 | `missions.py`, `mission_plot.py`, `system_diagram.py` | JPL Horizons missions and charts; poster-style all-planets diagram |
 | `layer_cut.py` | **Layered cut-outs:** height bands → shapely polygons → clean-up → pen marks (next-layer outline and layer number) → packing on sheets (FFT raster, 45° rotations, nesting in holes) → knife paths |
 | `calibrate_z.py` | Pen-height and knife-depth test-ladder G-code and the result maths |
 | `project_io.py`, `ui_widgets.py`, `theme.py` | Projects and presets, colourways; widgets; Qt style |
-| `tests/test_engines.py` | 38 engine tests: G-code safety, contours, hatch, missions, tracing, cut-outs, calibration |
-| `AGENTS.md`, `CLAUDE.md`, `docs/` | Agent handover notes; user and developer docs |
+| `tests/test_engines.py` | 43 engine tests: G-code safety, contours, hatch, missions, tracing, cut-outs, calibration, city maps |
+| `AGENTS.md`, `CLAUDE.md`, `docs/` | Agent handover notes; user and developer docs; **`docs/architecture.md`** maps every feature to its file |
 
 **Data model:** everything drawable is a list of segment dicts `{'type','layer','seg' (n×2),'level','pen_id'}`.
 - Map modes use lon/lat coordinates.
-- Paper modes (Solar System, Image, calibration sheet) use mm, with the frame `[0, pw, -ph/2, ph/2]`.
+- Paper modes (Solar System, Image, City, calibration sheet) use mm, with the frame `[0, pw, -ph/2, ph/2]`.
 
 **Render flow:** `_start_render()` → `RenderWorker` → `on_render_success()` → decorations → `render_canvas()`
 (or the ink simulation; or `_draw_cut_preview()` in layered cut-out mode).
@@ -109,6 +112,16 @@ In layered cut-out mode, `export_cut_sheets()` writes one file per sheet instead
   - cut order: small pieces first, then holes before outlines;
   - no circle mode or region clipping;
   - the plot must be about 10 mm smaller than the cut sheet.
+- **City maps:**
+  - City mode is a paper mode (`mission_mode and city_mode`), so the elevation pipeline (`RenderWorker`)
+    is untouched.
+  - Everything down to the chosen road type is drawn everywhere (owner's choice, for a consistent look);
+    there is no adaptive thinning.
+  - A thick pen for major roads and a thin pen for the rest, or one pen for every road.
+  - Roads are clipped to the city boundary or to a rectangle dragged on the source map (fitted to the page shape).
+  - City layers skip vpype's merge and 2 mm filter (`FINE_LAYERS`). The app joins the pieces itself, and
+    the filter would leave gaps between junctions.
+  - Overpass needs POST for long queries (GET → HTTP 502); the backup servers were down in Nov 2026.
 - **Jenny and Jackson Lake beds are modelled, not surveyed.** The outline and depth range are real; the
   bed shape is idealised. Depths come from Larsen et al. 2016 and USGS 2005.
 - **Code conventions:**
@@ -129,9 +142,13 @@ In layered cut-out mode, `export_cut_sheets()` writes one file per sheet instead
   - the Solar System diagram;
   - pane hide/show buttons;
   - **layered cut-outs**;
-  - **pen and knife height calibration**.
-- All 38 tests pass. Everything is pushed except `5a6fb6c` (handover notes) and the commit that adds these files.
+  - **pen and knife height calibration**;
+  - **city road maps** (tested on screen with Washington, D.C. and Paris, including G-code export and
+    project save/load);
+  - `docs/architecture.md`, a feature → file map.
+- All 43 tests pass. Not pushed: `5a6fb6c`, `a2e67cd` and the City commit.
 - **Not yet verified on the machine:**
+  - a city road map plot;
   - calibration (no `machine_settings.json` saved yet);
   - the right-edge line fix;
   - card and layered cut-outs;

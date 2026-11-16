@@ -1,6 +1,7 @@
 # Development
 
-AI assistants: start with [`AGENTS.md`](../AGENTS.md) in the repository root.
+AI assistants: start with [`AGENTS.md`](../AGENTS.md) in the repository root. For "which file holds which
+feature", see [Architecture](architecture.md).
 
 The app is plain Python. The GUI uses PyQt6, the plotting and preview use matplotlib, rasters are read
 with rasterio, geometry uses shapely and scipy, and G-code is written by vpype. All application code is
@@ -32,6 +33,7 @@ to it on start-up, so the app can be launched from anywhere.
 | `lakes.py` | Lake bathymetry regions (`config.LAKES`): the Tahoe survey raster, and modelled lake beds for Jenny and Jackson Lake built from OpenStreetMap shorelines |
 | `ski.py` | Ski resort runs and lifts from OpenStreetMap (Overpass), cached in `ski_resorts/` |
 | `svg_import.py` | Multi-layer SVG import, scaled and centred on the paper |
+| `city_roads.py` | City road maps from OpenStreetMap: city lookup, tiled download and cache, road classes, clipping, joining pieces into long strokes, crowding check. No Qt. |
 | `system_diagram.py` | The poster-style all-planets Solar System diagram |
 | `layer_cut.py` | Layered cardstock cut-outs: height bands, pen marks, packing pieces on sheets, knife paths |
 | `calibrate_z.py`, `calib_dialog.py` | Pen-height and knife-depth test plots, and the **Tools › Calibrate pen & knife heights** dialog (`machine_settings.json`) |

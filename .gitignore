@@ -34,3 +34,4 @@ MoonPlotter/machine_settings.json
 # Downloaded / generated data (see docs/data-sources.md)
 MoonPlotter/natural_earth/
 *.ovr
+MoonPlotter/cities/

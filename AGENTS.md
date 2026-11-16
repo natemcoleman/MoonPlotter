@@ -3,9 +3,11 @@
 This file is for an AI agent picking up work on this repository. It covers what the project is, how the
 owner likes to work, how the code fits together, what has been done, and what is still open. Read it
 before changing anything. The user-facing docs are in `README.md` and `docs/`. The code map and data flow
-are in [`docs/development.md`](docs/development.md).
+are in [`docs/development.md`](docs/development.md). **Which file holds which feature** is mapped in
+[`docs/architecture.md`](docs/architecture.md). The current state and next steps are in `project_context.md`
+and `project_roadmap.md` in the repository root.
 
-Last updated: 13 November 2026, at commit `021070e` on `main`.
+Last updated: 16 November 2026 (City road maps).
 
 ---
 
@@ -24,6 +26,7 @@ It can make:
 - **Lake bathymetry** (Tahoe from a survey; Jenny and Jackson modelled) and **ski resorts** (OpenStreetMap
   runs and lifts over contours).
 - **Solar System** mission trajectory charts (JPL Horizons) and a poster-style **all-planets diagram**.
+- **City road maps**: every road of a city from OpenStreetMap, after anvaka/city-roads.
 - **Image tracing** and **multi-layer SVG import**.
 - **Multi-page (tiled) plots**, **card cut-outs** and **layered cardstock relief maps**. Layered relief
   maps are stacked height bands, cut with the knife and marked with the pen.
@@ -73,8 +76,8 @@ Repo: `github.com/natemcoleman/MoonPlotter`. Licence: MIT. Python 3.12 on Window
 - **Running:** open `MoonPlotter/main.py` in PyCharm and use **Run › Current File**. The window takes
   **30 to 45 s** to appear: importing `workers` → `contour_engine` loads geopandas and the Natural Earth
   borders.
-- **Tests:** run `python tests/test_engines.py` from `MoonPlotter/` (38 tests, all passing at
-  `021070e`). They need the full stack (PyQt6, vpype, rasterio, shapely). Running from `tests/` creates
+- **Tests:** run `python tests/test_engines.py` from `MoonPlotter/` (43 tests, all passing after the City
+  maps work). They need the full stack (PyQt6, vpype, rasterio, shapely). Running from `tests/` creates
   a stray `tests/natural_earth/` folder (see the known issues in section 8); delete it, don't commit it.
 - **Line endings:** `.py` files use **CRLF**. Keep them CRLF when editing. Markdown docs are LF.
 - **PyCharm auto-adds new files to git.** Temporary scripts and test outputs you create (for example
@@ -84,9 +87,15 @@ Repo: `github.com/natemcoleman/MoonPlotter`. Licence: MIT. Python 3.12 on Window
   `natural_earth/` (data).
 - **Agent tooling seen so far:** the owner's files are reachable through a device bridge. Its Linux shell
   has **no network and no PyQt6/vpype/rasterio**, so app code can only be exercised on Windows, through
-  PyCharm. The Linux shell is fine for git, grep and small numpy-free checks. PyCharm can only be
-  clicked, not typed into. To run a scratch script, create it, use **File › Reload All from Disk**,
-  double-click it in the project tree, then **Run Current File**. The app window itself accepts typing.
+  PyCharm. The Linux shell has numpy and matplotlib but no shapely or scipy; it is fine for git, grep and
+  small checks. PyCharm can only be clicked, not typed into. To run a scratch script, put it in
+  `MoonPlotter/` (the PyCharm project root; the repository root isn't in its tree), double-click it in the
+  project tree, then use the main menu (☰) **Run › Run…** and pick it. PyCharm popups ignore a click until
+  the pointer has hovered over the item, so move the mouse there first. The run-configuration drop-down
+  in the title bar is covered by the "Claude is using your computer" banner. A script can write its
+  output to a file you then read from the Linux shell. The app window itself accepts typing.
+- **device_commit_files sometimes writes an older copy.** Check the md5 after every commit and commit
+  again (with `force`) if it differs. Convert `.py` files back to CRLF after committing them.
 - **Network fetches** (Overpass, Copernicus, JPL Horizons, Natural Earth) work from the owner's machine
   only.
 
@@ -100,7 +109,7 @@ Key points:
 - **Everything drawable is a list of segment dicts**: `{'type', 'layer', 'seg' (n×2 array), 'level',
   'pen_id'}`.
   - **Map modes** (Earth, Moon, Mars) use lon/lat data coordinates.
-  - **Paper modes** (Solar System, Image, calibration sheet) use millimetres, with frame
+  - **Paper modes** (Solar System, Image, City, calibration sheet) use millimetres, with frame
     `[0, pw, -ph/2, ph/2]`.
   - `decorations.PaperFrame` and `PlotterApp._paper_frame()` convert between paper mm and data
     coordinates.
@@ -132,6 +141,7 @@ Key points:
 | `calibrate_z.py` | Pen-height and knife-depth test ladders and the result maths. No Qt. |
 | `calib_dialog.py` | **Tools › Calibrate pen & knife heights** dialog. |
 | `dem_prep.py` | One-time `.ovr` overviews for the large global DEMs (**Tools › Speed up global elevation**). |
+| `city_roads.py` | **City road maps.** Nominatim boundary lookup, Overpass download in ~60 km² parts (resumable, split on failure), `cities/*.npz` cache (git-ignored), road classes, clip to boundary or rectangle, joining OSM pieces into long strokes, crowding check (pen-width raster + 3 mm window), title. No Qt. City mode in `main.py` is a paper mode (`mission_mode and city_mode`), like Image mode, so it doesn't use `RenderWorker`. City layers are in `FINE_LAYERS`, so vpype doesn't apply its 2 mm length filter, which would leave gaps between junctions. |
 
 ---
 
@@ -156,7 +166,10 @@ Key points:
   `_paper_mm_per_data_unit()` and the view extent's lower-left corner (see `_cut_base_marks()`).
 - **Qt menus.** In Qt menu text, `&` is a mnemonic; write `&&` for a literal ampersand.
 - **Overpass** sometimes returns 502 or times out. `ski.py` and `lakes.py` try `overpass-api.de` twice,
-  then two mirrors.
+  then two mirrors. Long queries sent as GET (in the URL) get **HTTP 502** from overpass-api.de's front
+  end, so `city_roads` sends POST (`net.fetch_bytes(url, data=...)`). In November 2026 the kumi.systems and
+  private.coffee mirrors weren't answering at all. maps.mail.ru may need the curl.exe fallback because of
+  certificate inspection on the owner's PC.
 
 ---
 
@@ -172,6 +185,8 @@ Key points:
 | `4490743` | Hide/show buttons for the source map and layers panes |
 | `f46e4d7` | **Layered cut-outs** (stacked cardstock relief) |
 | `021070e` | **Pen and knife height calibration** dialog, `machine_settings.json`, real Z speed in time estimates, new tests |
+| `5a6fb6c`, `a2e67cd` | `AGENTS.md` / `CLAUDE.md` handover notes; `project_context.md` and `project_roadmap.md` |
+| City road maps commit | **City road maps** (`city_roads.py`, City mode), POST support in `net.fetch_bytes`, `docs/city-maps.md`, `docs/architecture.md` |
 
 The original 4-phase roadmap (UI polish → pathing and G-code → workflow presets → new features) is
 complete.
@@ -186,9 +201,10 @@ complete.
 3. On the next plot, check that the **line along the right edge** is gone. It was most likely the
    page-edge stroke fixed in Phase 4. This was never confirmed on paper.
 4. Do a **card cut-out on scrap paper**. This also tests the layered cut-outs.
-5. **Push the commits.** Six were not pushed as of `021070e`.
+5. **Push the commits.** Three are on `main` but not pushed: `5a6fb6c`, `a2e67cd` and the City road maps commit.
 
-Also untested on the machine: tiled multi-page plots (alignment across the gap), lake and Solar System
+Also untested on the machine: a City road map plot (Washington, D.C. and Paris were checked on screen and
+in exported G-code only), tiled multi-page plots (alignment across the gap), lake and Solar System
 diagram exports, ski overlay combined with tiling, and SVG import of real Inkscape or Illustrator files.
 
 ---
@@ -236,3 +252,4 @@ Ideas the owner has seen (ask before starting any):
 | Change G-code structure or safety | `exporter.py` (ask the owner first), plus `tests/test_engines.py` |
 | Change machine heights | **Tools › Calibrate…** (writes `machine_settings.json`); defaults in `config.py` |
 | Change the layered cut-out packing or cutting | `layer_cut.py` (constants at the top) |
+| Change city road types, extras or the crowding check | `ROAD_CLASSES`, `EXTRAS`, `CROWD_*` at the top of `city_roads.py` |

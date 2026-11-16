@@ -479,6 +479,112 @@ def test_layer_cut_cone():
             assert path[:, 0].min() > 0 and path[:, 1].min() > 0 and path[:, 0].max() < 150 and path[:, 1].max() < 150
 
 
+# ---------------------------------------------------------------------------------------------
+# City road maps (city_roads.py)
+# ---------------------------------------------------------------------------------------------
+def _fake_city():
+    import city_roads as CR
+    lon0, lat0 = -77.0, 38.9
+    half = 0.01                                            # ~0.87 x 1.1 km square city
+    ring = [[lon0 - half, lat0 - half], [lon0 + half, lat0 - half], [lon0 + half, lat0 + half],
+            [lon0 - half, lat0 + half], [lon0 - half, lat0 - half]]
+    x1, y1 = CR.to_metres(lon0 + half, lat0 + half, lon0, lat0)
+    roads, cls = [], []
+    for i, v in enumerate(np.linspace(-float(x1) * 1.2, float(x1) * 1.2, 25)):   # grid, sticking out of the city
+        c = 0 if i == 12 else (2 if i % 6 == 0 else 4)
+        ys = np.linspace(-float(y1) * 1.2, float(y1) * 1.2, 25)
+        for a, b in zip(ys[:-1], ys[1:]):                  # each street in pieces, like OSM ways
+            roads.append(np.array([[v, a], [v, b]]))
+            cls.append(c)
+            roads.append(np.array([[a * x1 / y1, v * y1 / x1], [b * x1 / y1, v * y1 / x1]]))
+            cls.append(c)
+    meta = {'query': 'Testville', 'name': 'Testville', 'display_name': 'Testville', 'osm_relation': 1,
+            'center': [lon0, lat0], 'bbox_m': [-float(x1) * 1.3, -float(y1) * 1.3, float(x1) * 1.3, float(y1) * 1.3],
+            'boundary': {'type': 'Polygon', 'coordinates': [ring]}, 'max_class': 5}
+    river = np.array([[-float(x1) * 1.3, 0.0], [float(x1) * 1.3, 0.0]])
+    return {'meta': meta, 'roads': roads, 'road_cls': np.array(cls), 'extras': [river],
+            'extra_kind': np.array([2])}
+
+
+def test_city_chain_joins_pieces():
+    import city_roads as CR
+    lines = [np.array([[i, 0.0], [i + 1.0, 0.0]]) for i in range(10)]          # one street in 10 pieces
+    lines += [np.array([[5.0, -3.0], [5.0, 0.0]]), np.array([[5.0, 0.0], [5.0, 3.0]])]   # a crossing street
+    out = CR.chain_lines(lines)
+    assert len(out) == 2
+    total = sum(float(np.sum(np.hypot(*np.diff(l, axis=0).T))) for l in out)
+    assert abs(total - 16.0) < 1e-9                       # every piece exactly once
+    assert max(len(l) for l in out) == 11                 # straight through the junction
+
+
+def test_city_crowding():
+    import city_roads as CR
+    lines = lambda gap: [np.array([[0.0, y], [30.0, y]]) for y in np.arange(0, 20, gap)]
+    assert CR.crowding([(lines(0.3), 0.38)], (0, 30, 0, 20))[0] > 0.8         # 0.38 mm pen, lines 0.3 mm apart
+    assert CR.crowding([(lines(0.7), 0.38)], (0, 30, 0, 20))[0] == 0.0        # gaps of 0.3 mm still show
+    cross = [np.array([[0.0, 10.0], [30.0, 10.0]]), np.array([[15.0, 0.0], [15.0, 20.0]])]
+    assert CR.crowding([(cross, 0.7)], (0, 30, 0, 20))[0] == 0.0              # a crossing is not crowding
+
+
+def test_city_map_layers_pens_and_clip():
+    import city_roads as CR
+    data = _fake_city()
+    pw, ph = 150.0, 200.0
+    opts = {'min_class': 4, 'major_upto': 2, 'pen_major': 'pen_1', 'pen_minor': 'base', 'title': True,
+            'extras': {'rivers', 'outline'}, 'pen_extras': 'blue'}
+    segs, masks, info = CR.build_city_map(data, opts, pw, ph)
+    layers = {s['layer'] for s in segs}
+    assert {'city_major', 'city_minor', 'city_rivers', 'city_outline', 'labels'} <= layers
+    assert all(s['pen_id'] == 'pen_1' for s in segs if s['layer'] == 'city_major')
+    assert all(s['pen_id'] == 'base' for s in segs if s['layer'] == 'city_minor')
+    pts = np.concatenate([s['seg'] for s in segs])
+    assert pts[:, 0].min() >= 0 and pts[:, 0].max() <= pw and pts[:, 1].min() >= -ph / 2 and pts[:, 1].max() <= ph / 2
+    # clipped to the city: no road reaches the margin band beyond the boundary's box
+    bx0, by0, bx1, by1 = CR.map_box(pw, ph, True)
+    road = np.concatenate([s['seg'] for s in segs if s['layer'].startswith('city_m')])
+    assert road[:, 0].min() >= bx0 - 1e-6 and road[:, 0].max() <= bx1 + 1e-6
+    # pieces were joined: far fewer strokes than OSM pieces
+    assert info['n_strokes'] < (info['n_major'] + info['n_minor']) / 5
+    # single pen: one layer, one pen
+    segs1, _, _ = CR.build_city_map(data, dict(opts, single_pen=True, extras=set(), title=False), pw, ph)
+    assert {s['layer'] for s in segs1} == {'city_roads'} and {s['pen_id'] for s in segs1} == {'base'}
+    # smaller road classes off: fewer strokes
+    segs2, _, _ = CR.build_city_map(data, dict(opts, min_class=2, extras=set(), title=False), pw, ph)
+    assert len(segs2) < len([s for s in segs if s['layer'].startswith('city_m')])
+    # rectangle clip: fitted rectangle keeps the map box's shape
+    lon0, lat0 = data['meta']['center']
+    r = CR.fit_rect((-200, -100, 200, 100), pw, ph, False)
+    bx0, by0, bx1, by1 = CR.map_box(pw, ph, False)
+    assert abs((r[2] - r[0]) / (r[3] - r[1]) - (bx1 - bx0) / (by1 - by0)) < 1e-9
+    a, b = CR.to_lonlat(r[0], r[1], lon0, lat0)
+    c, d = CR.to_lonlat(r[2], r[3], lon0, lat0)
+    segs3, _, info3 = CR.build_city_map(data, dict(opts, clip='rectangle', rect=[a, b, c, d], extras=set(),
+                                                   title=False), pw, ph)
+    assert abs(info3['width_km'] - (r[2] - r[0]) / 1000.0) < 1e-6
+
+
+def test_city_cache_roundtrip():
+    import city_roads as CR
+    data = _fake_city()
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "x.npz")
+        CR.save(data, p)
+        back = CR.load_file(p)
+    assert back['meta']['name'] == 'Testville' and len(back['roads']) == len(data['roads'])
+    assert np.allclose(back['roads'][7], data['roads'][7], atol=1e-3)
+    assert list(back['road_cls']) == list(data['road_cls'])
+
+
+def test_city_water_area_from_cropped_outline():
+    """A river's banks cropped by the bounding box (open rings) still give the water between them."""
+    import city_roads as CR
+    from shapely.geometry import box, LineString
+    banks = [np.array([[-50.0, 40.0], [150.0, 40.0]]), np.array([[-50.0, 60.0], [150.0, 60.0]])]
+    centre = LineString([(-50, 50), (150, 50)])
+    w = CR._water_area(banks, centre, box(0, 0, 100, 100))
+    assert w is not None and abs(w.area - 2000.0) < 1.0
+
+
 if __name__ == '__main__':
     failed = 0
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith('test_') and callable(f)]
