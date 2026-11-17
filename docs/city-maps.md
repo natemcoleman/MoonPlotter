@@ -75,13 +75,19 @@ together.
 
 They all use the **Pen for water, rail, parks & outline**.
 
+**Skip dead-end roads shorter than** (1 mm by default) is the road version. Every road is split at its
+junctions, and any stretch shorter than this that ends in nothing is left out: cul-de-sacs, driveways,
+car-park spurs and stray bits, plus the dashes left where a road runs along the clip edge. A dead-end street
+stored in OpenStreetMap as several pieces is judged by its whole length. Streets that connect at both ends
+are always kept, so the grid has no gaps. On Washington DC down to residential streets, 1 mm drops about 660
+to 830 stubs, and 2 mm about 830 to 890. That means fewer pen lifts, but it barely changes how dense the map
+looks: if the preview is mostly black, a bigger **Smallest roads drawn** type is what helps.
+
 **Skip water / park shapes smaller than** (2 mm by default) leaves out every extra shape smaller than that on
 paper: ponds, fountains, pocket parks and stray bits of river. At city scale they would only be specks of
 ink, and Washington DC has about a thousand of them. Long shorelines made of many short pieces are joined
-first, so they stay. Stray bits of road under 1 mm that touch no other road are dropped too, such as the
-dashes left where a road runs along the clip edge. A short block between two junctions touches its
-neighbours, so it stays. The info line under the City section says how many shapes were skipped; set the
-value to 0 to keep everything.
+first, so they stay. The info line under the City section says how many dead-end roads and shapes were skipped; set
+either value to 0 to keep everything.
 
 **Title, bottom left** writes the city's name in the bottom-left corner, with its coordinates underneath.
 The title takes no strip of its own, so the map stays as large as the page allows. The map moves up only if

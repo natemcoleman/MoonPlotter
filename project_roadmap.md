@@ -66,6 +66,10 @@ _Last updated: 16 Nov 2026 · `main` after the City road maps commit_
 - Screenshots of the other new features in `docs/` (layered cut-outs, Solar System diagram, calibration dialog).
 
 ## Recently Completed
+- City maps: **Skip dead-end roads shorter than** (default 1 mm). Roads are split at junctions and short
+  stretches that end in nothing are dropped: cul-de-sacs, driveways, spurs, stray bits, clip-edge dashes.
+  Through-streets are always kept. Washington DC residential: about 660–830 stubs dropped, about 13% fewer
+  strokes. 49/49 tests pass.
 - City maps: tiny shapes are skipped. Water / park / extra shapes under **2 mm** on paper (setting in the City
   section) and loose road bits under 1 mm that touch no other road are left out; extras are simplified at
   0.1 mm. Washington DC: about 1,050–1,160 specks skipped (about 1,240 extra strokes → 94–191). 48/48 tests pass.

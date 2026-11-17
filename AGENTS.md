@@ -76,7 +76,7 @@ Repo: `github.com/natemcoleman/MoonPlotter`. Licence: MIT. Python 3.12 on Window
 - **Running:** open `MoonPlotter/main.py` in PyCharm and use **Run › Current File**. The window takes
   **30 to 45 s** to appear: importing `workers` → `contour_engine` loads geopandas and the Natural Earth
   borders.
-- **Tests:** run `python tests/test_engines.py` from `MoonPlotter/` (48 tests, all passing). They need the
+- **Tests:** run `python tests/test_engines.py` from `MoonPlotter/` (49 tests, all passing). They need the
   full stack (PyQt6, vpype, rasterio, shapely). Running from `tests/` creates
   a stray `tests/natural_earth/` folder (see the known issues in section 8); delete it, don't commit it.
 - **Line endings:** `.py` files use **CRLF**. Keep them CRLF when editing. Markdown docs are LF.

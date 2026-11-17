@@ -5156,6 +5156,17 @@ class PlotterApp(QMainWindow):
                                        "Too much black in the preview? Pick a bigger type, larger paper, or split the "
                                        "plot into pages.\nPaths & footways need a second, larger download.")
         sec.add(self._field("Smallest roads drawn", self.combo_city_min))
+        self.spin_city_road_min = QDoubleSpinBox()
+        self.spin_city_road_min.setRange(0.0, 20.0)
+        self.spin_city_road_min.setSingleStep(0.5)
+        self.spin_city_road_min.setDecimals(1)
+        self.spin_city_road_min.setSuffix(" mm")
+        self.spin_city_road_min.setValue(CR.MIN_ROAD_MM)
+        self.spin_city_road_min.setToolTip("Dead-end roads shorter than this on paper are left out (cul-de-sacs, "
+                                           "driveways, car-park spurs), and so are stray bits of road and the "
+                                           "dashes left along the clip edge.\nStreets that connect at both ends "
+                                           "are always kept, so the grid has no gaps. 0 = keep everything.")
+        sec.add(self._field("Skip dead-end roads shorter than", self.spin_city_road_min))
 
         self.chk_city_single = QCheckBox("One pen for every road (classic look)")
         sec.add(self.chk_city_single)
@@ -5233,6 +5244,7 @@ class PlotterApp(QMainWindow):
             cb.currentIndexChanged.connect(lambda _: self.schedule_city_plot())
         self.txt_city_title.editingFinished.connect(self.schedule_city_plot)
         self.spin_city_min_shape.valueChanged.connect(lambda _: self.schedule_city_plot())
+        self.spin_city_road_min.valueChanged.connect(lambda _: self.schedule_city_plot())
         sec.setVisible(False)
         vbox.addWidget(sec)
         self._fill_city_pen_combos()
@@ -5276,7 +5288,7 @@ class PlotterApp(QMainWindow):
                 'clip': 'rectangle' if self.combo_city_clip.currentIndex() == 1 else 'boundary',
                 'rect': self.city_rect, 'title': self.chk_city_title.isChecked(),
                 'title_text': self.txt_city_title.text(), 'frame': self.chk_deco_frame.isChecked(),
-                'min_shape_mm': self.spin_city_min_shape.value()}
+                'min_shape_mm': self.spin_city_min_shape.value(), 'road_min_mm': self.spin_city_road_min.value()}
 
     def _enter_city_mode(self):
         self._enter_mission_mode()                     # shared paper-space setup
@@ -5497,6 +5509,7 @@ class PlotterApp(QMainWindow):
         self.lbl_city_info.setText(
             f"{info['width_km']:.1f} × {info['height_km']:.1f} km · 1 mm = {info['scale_m_per_mm']:.0f} m "
             f"· {info['n_strokes']:,} strokes · {info['ink_m']:.1f} m of ink"
+            + (f" · {info['n_stubs']:,} dead-end roads skipped" if info.get('n_stubs') else "")
             + (f" · {info['n_skipped']:,} tiny shapes skipped" if info.get('n_skipped') else "") + ".\n"
             + ("Checking for crowded areas..." if crowd is None else
                f"Crowded: {crowd:.0%} of the ink falls where lines merge into solid black - pick a bigger 'Smallest "
@@ -5525,6 +5538,7 @@ class PlotterApp(QMainWindow):
                 'extras': sorted(k for k, c in self.chk_city_extra.items() if c.isChecked()),
                 'title': self.chk_city_title.isChecked(), 'title_text': self.txt_city_title.text(),
                 'crowd': self.chk_city_crowd.isChecked(), 'min_shape': self.spin_city_min_shape.value(),
+                'road_min': self.spin_city_road_min.value(),
                 'pens': {'major': self.combo_city_pen_major.currentData(),
                          'minor': self.combo_city_pen_minor.currentData(),
                          'extras': self.combo_city_pen_extras.currentData()}}
@@ -5541,6 +5555,7 @@ class PlotterApp(QMainWindow):
         self.txt_city_title.setText(st.get('title_text', ''))
         self.chk_city_crowd.setChecked(bool(st.get('crowd')))
         self.spin_city_min_shape.setValue(float(st.get('min_shape', CR.MIN_SHAPE_MM)))
+        self.spin_city_road_min.setValue(float(st.get('road_min', CR.MIN_ROAD_MM)))
         for cb, k in ((self.combo_city_pen_major, 'major'), (self.combo_city_pen_minor, 'minor'),
                       (self.combo_city_pen_extras, 'extras')):
             i = cb.findData((st.get('pens') or {}).get(k))

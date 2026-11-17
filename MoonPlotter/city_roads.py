@@ -66,6 +66,7 @@ CITY_LAYERS = tuple(LAYER_LABELS)
 
 SIMPLIFY_MM = 0.04               # Douglas-Peucker tolerance on paper for roads (well under a pen width)
 SIMPLIFY_EXTRAS_MM = 0.1         # ... for water, coast, rivers, rail, parks and the outline (wiggly shorelines)
+MIN_ROAD_MM = 1.0                # dead-end road stubs and stray road bits shorter than this on paper are skipped
 MIN_SHAPE_MM = 2.0               # water / park / other extra shapes smaller than this on paper are skipped:
                                  # a pond 1 mm across is just a blob of ink, and hundreds of them a stipple
 JOIN_TOL_MM = 1e-3               # end points closer than this are the same junction
@@ -649,6 +650,82 @@ def _clip_and_fit(lines, clip, rect, xform, simplify_m):
     return [c for c in np.split(coords, cut) if len(c) >= 2]
 
 
+def _prune_stubs(groups, min_len, tol=1e-3):
+    """Road simplification. groups: lists of clipped road pieces in metres (e.g. [major, minor]); pieces that
+    share an OpenStreetMap node share an exact vertex. Every piece is split at junctions (vertices where 3 or
+    more road ends meet), and the stretches shorter than min_len that end in nothing are dropped: dead-end
+    stubs (cul-de-sacs, driveways, car-park spurs), stray bits, and the dashes left where a road runs along the
+    clip edge. Through-streets are never touched, so the grid keeps no gaps. Returns (groups, number dropped)."""
+    pieces = [p for g in groups for p in g]
+    if min_len <= 0 or not pieces:
+        return groups, 0
+    lens = np.array([len(p) for p in pieces])
+    xy = np.concatenate(pieces)
+    _, vid = np.unique(np.round(xy / tol).astype(np.int64), axis=0, return_inverse=True)
+    vid = np.asarray(vid).ravel()
+    starts = np.concatenate([[0], np.cumsum(lens)[:-1]])
+    contrib = np.full(len(xy), 2.0)                   # an inner vertex joins two segments, an end one
+    contrib[starts] = 1.0
+    contrib[starts + lens - 1] = 1.0
+    deg = np.bincount(vid, weights=contrib)
+    # split every piece at junctions -> edges (group, polyline, start vertex, end vertex, length)
+    edges, k = [], 0
+    for gi, g in enumerate(groups):
+        for p in g:
+            ids = vid[k:k + len(p)]
+            k += len(p)
+            cuts = np.concatenate([[0], np.flatnonzero(deg[ids[1:-1]] >= 3) + 1, [len(p) - 1]])
+            for a, b in zip(cuts[:-1], cuts[1:]):
+                e = p[a:b + 1]
+                if len(e) >= 2:
+                    edges.append((gi, e, ids[a], ids[b], float(np.sum(np.hypot(*np.diff(e, axis=0).T)))))
+    # join edges through plain bends (a vertex where exactly two edge ends meet) into branches, so a
+    # dead-end street stored as several OSM pieces is judged by its whole length
+    parent = list(range(len(edges)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    ends = defaultdict(list)
+    for i, (_, _, va, vb, _) in enumerate(edges):
+        ends[va].append(i)
+        ends[vb].append(i)
+    for v, es in ends.items():
+        if len(es) == 2 and deg[v] == 2 and es[0] != es[1]:
+            parent[find(es[0])] = find(es[1])
+    length = defaultdict(float)
+    dead = defaultdict(bool)                          # the branch has a free end (nothing else there)
+    for i, (_, _, va, vb, ln) in enumerate(edges):
+        r = find(i)
+        length[r] += ln
+        dead[r] |= deg[va] <= 1 or deg[vb] <= 1
+    out, dropped = [[] for _ in groups], set()
+    for i, (gi, e, _, _, _) in enumerate(edges):
+        r = find(i)
+        if dead[r] and length[r] < min_len:
+            dropped.add(r)
+            continue
+        out[gi].append(e)
+    return out, len(dropped)
+
+
+def _simplify_fit(lines, xform, simplify_m):
+    """lines (metres) -> simplified lines in paper mm."""
+    import shapely
+    if not lines:
+        return []
+    xy = np.concatenate(lines)
+    idx = np.repeat(np.arange(len(lines)), [len(l) for l in lines])
+    geoms = shapely.simplify(shapely.linestrings(xy, indices=idx), simplify_m, preserve_topology=False)
+    coords, ix = shapely.get_coordinates(geoms, return_index=True)
+    coords = xform(coords)
+    cut = np.flatnonzero(np.diff(ix)) + 1
+    return [c for c in np.split(coords, cut) if len(c) >= 2]
+
+
 def crowding(lines_widths, extent, window=CROWD_WINDOW_MM, limit=CROWD_LIMIT):
     """Where the ink would merge into solid black. The strokes are drawn at their true pen widths on a
     fine raster (overlapping strokes, e.g. both halves of a dual carriageway, count once), then the inked
@@ -697,6 +774,7 @@ def build_city_map(data, opts, pw, ph):
     width_major, width_minor, width_extras (mm), extras (set of EXTRAS keys), clip ('boundary'|'rectangle'),
     rect (lon0, lat0, lon1, lat1) for 'rectangle', title (bool), title_text ('Title | subtitle', blank =
     default), frame (bool), min_shape_mm (extra shapes smaller than this are skipped, default MIN_SHAPE_MM),
+    road_min_mm (dead-end road stubs and stray bits shorter than this are skipped, default MIN_ROAD_MM),
     crowding (bool, default True: False leaves the crowding check, about a second
     on a big map, to a later crowding(info['ink'], info['map_extent']) call). Returns (segments, masks, info)."""
     from decorations import vector_text
@@ -714,6 +792,7 @@ def build_city_map(data, opts, pw, ph):
     w_extras = float(opts.get('width_extras', w_minor))
     extras_on = set(opts.get('extras') or ())
     min_shape = float(opts.get('min_shape_mm', MIN_SHAPE_MM))
+    road_min = float(opts.get('road_min_mm', MIN_ROAD_MM))
     n_skipped = 0
     title_on = bool(opts.get('title', True))
 
@@ -779,9 +858,13 @@ def build_city_map(data, opts, pw, ph):
     major = [roads[i] for i in keep if rcls[i] <= major_upto]
     minor = [roads[i] for i in keep if rcls[i] > major_upto]
 
-    major_mm = _clip_and_fit(major, clip_poly, rect, xform, simp)
-    minor_mm = _clip_and_fit(minor, clip_poly, rect, xform, simp)
-    loose = min(1.0, min_shape)                       # stray road bits under 1 mm that touch nothing
+    # clip in metres, drop short dead ends (before simplifying: junctions are still shared vertices), then fit
+    keep_m = lambda c: c
+    (major_m, minor_m), n_stubs = _prune_stubs([_clip_and_fit(major, clip_poly, rect, keep_m, 0.0),
+                                               _clip_and_fit(minor, clip_poly, rect, keep_m, 0.0)],
+                                              road_min / s)
+    major_mm, minor_mm = _simplify_fit(major_m, xform, simp), _simplify_fit(minor_m, xform, simp)
+    loose = road_min                                  # slivers the title cut leaves, touching nothing
     if single:
         roads_mm = _cut_out(chain_lines(major_mm + minor_mm), cut)
         ok = _loose_bits(roads_mm, loose)
@@ -838,5 +921,5 @@ def build_city_map(data, opts, pw, ph):
             'n_strokes': sum(len(lines) for lines, _ in ink), 'ink_m': ink_m,
             'crowded_frac': frac, 'crowd_grid': full, 'crowd_extent': gext, 'ink': ink, 'map_extent': gx,
             'region_m': tuple(float(v) for v in region), 'n_major': len(major), 'n_minor': len(minor),
-            'n_skipped': n_skipped}
+            'n_skipped': n_skipped, 'n_stubs': n_stubs}
     return segs, masks, info

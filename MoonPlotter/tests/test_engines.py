@@ -647,6 +647,21 @@ def test_city_loose_road_bits():
     assert CR._loose_bits([main_road, stub, speck], 1.0) == [True, True, False]
 
 
+def test_city_prune_dead_end_stubs():
+    import city_roads as CR
+    main_road = np.array([[0.0, 0.0], [5.0, 0.0], [10.0, 0.0]])            # junction at x = 5
+    cul_a = np.array([[5.0, 0.0], [5.0, 0.6]])                             # 1.2 long dead end, in two
+    cul_b = np.array([[5.0, 0.6], [5.0, 1.2]])                             # OSM pieces: kept as a whole
+    spur = np.array([[5.0, 0.0], [5.0, -0.6]])                             # 0.6 dead end: dropped
+    block = np.array([[10.0, 0.0], [10.0, 0.5], [10.0, 0.0]])              # (a closed bit: no free end)
+    speck = np.array([[20.0, 20.0], [20.3, 20.0]])                         # stray bit: dropped
+    (major, minor), n = CR._prune_stubs([[main_road, cul_a, cul_b], [spur, speck, block]], 1.0)
+    assert n == 2
+    assert len(major) == 4 and sum(len(e) for e in major) == 8               # main split at the junction
+    assert len(minor) == 1 and np.allclose(minor[0], block)
+    assert CR._prune_stubs([[main_road], [spur]], 0.0)[1] == 0              # 0 = keep everything
+
+
 def test_city_cache_roundtrip():
     import city_roads as CR
     data = _fake_city()
