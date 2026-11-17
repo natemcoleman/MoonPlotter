@@ -66,8 +66,12 @@ together.
 
 They all use the **Pen for water, rail, parks & outline**.
 
-**Title under the map** writes the city's name with its coordinates underneath. Type your own text in
-**Title text**; `|` separates the two lines (e.g. `WASHINGTON | DISTRICT OF COLUMBIA`). The **Frame**
+**Title, bottom left** writes the city's name in the bottom-left corner, with its coordinates underneath.
+The title takes no strip of its own, so the map stays as large as the page allows. The map moves up only if
+there's spare room above it, and any road that would run under the lettering is cut away around it. The
+name is OpenStreetMap's, plus a short abbreviation you typed after a comma ("Washington, D.C." gives
+WASHINGTON DC; "Paris, France" gives PARIS). Type your own text in **Title text**; `|` separates the two
+lines (e.g. `WASHINGTON DC | DISTRICT OF COLUMBIA`). The **Frame**
 checkbox in Map furniture draws a border around the sheet.
 
 ## Too many roads for the pen

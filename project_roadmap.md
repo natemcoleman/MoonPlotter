@@ -67,6 +67,9 @@ _Last updated: 16 Nov 2026 · `main` after the City road maps commit_
 - Screenshots of the new features in `docs/`.
 
 ## Recently Completed
+- City maps: the title is now left-justified in the bottom-left corner and takes no strip of its own, so the
+  map is as large as the page allows; roads under the lettering are cut away. The default name keeps a short
+  typed abbreviation ("Washington, D.C." → WASHINGTON DC). 45/45 tests pass.
 - **Calibration dialog shows the `config.py` lines live.** Enter the first solid line or the first square that
   drops out, and the exact `PEN_DOWN_ABOVE_HOME_MM` / `PEN_LIFT_MM` / `CUTTER_Z_OFFSET_MM` lines appear, with
   Copy and Use buttons. **Read a test file…** takes the heights from an earlier test's G-code. The knife depth

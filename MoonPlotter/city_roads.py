@@ -484,20 +484,51 @@ def title_caps(pw, ph, line_mm):
     return cap, max(floor, 0.42 * cap)
 
 
-def map_box(pw, ph, title, line_mm=0.38):
-    """(x0, y0, x1, y1) paper box (y up from the bottom edge) that the map is fitted into."""
+def map_box(pw, ph, title=False, line_mm=0.38):
+    """(x0, y0, x1, y1) paper box (y up from the bottom edge) that the map is fitted into: the page inside the
+    margins. The title sits in the bottom-left corner and takes no band of its own: the map moves up only as
+    far as it has room to spare, and any road under the title is cut away around it."""
     m = margins(pw, ph)
-    y0 = m
-    if title:
-        cap, sub = title_caps(pw, ph, line_mm)
-        y0 = m + sub + 0.9 * sub + cap + 1.2 * cap
-    return m, y0, pw - m, ph - m
+    return m, m, pw - m, ph - m
+
+
+def city_name(meta):
+    """The city's name for the title: OpenStreetMap's name, plus a short abbreviation the user typed after a
+    comma ('Washington, D.C.' -> 'Washington DC', 'Portland, OR' -> 'Portland OR', 'Paris, France' -> 'Paris')."""
+    name = meta.get('name') or ''
+    parts = [p.strip() for p in (meta.get('query') or '').split(',')]
+    if parts and parts[0] and parts[0].lower() == name.lower():
+        name = parts[0]                                   # the user's own spelling
+    for p in parts[1:]:
+        a = p.replace('.', '').replace(' ', '')
+        if 1 < len(a) <= 3 and a.isalpha() and p.upper() == p:      # 'D.C.', 'NY', 'OR' - not 'France'
+            return f"{name} {a.upper()}"
+    return name
 
 
 def default_title(meta):
     lon, lat = meta['center']
-    return (f"{meta.get('name', '')} | {abs(lat):.4f}° {'N' if lat >= 0 else 'S'}   "
+    return (f"{city_name(meta)} | {abs(lat):.4f}° {'N' if lat >= 0 else 'S'}   "
             f"{abs(lon):.4f}° {'E' if lon >= 0 else 'W'}")
+
+
+def _cut_out(lines, box):
+    """lines (paper mm) with the parts inside box (x0, y0, x1, y1) removed."""
+    if box is None or not lines:
+        return lines
+    from shapely.geometry import LineString, box as sbox
+    import shapely
+    x0, y0, x1, y1 = box
+    hole = sbox(x0, y0, x1, y1)
+    out = []
+    for l in lines:
+        if l[:, 0].max() < x0 or l[:, 0].min() > x1 or l[:, 1].max() < y0 or l[:, 1].min() > y1:
+            out.append(l)
+            continue
+        for g in shapely.get_parts(LineString(l).difference(hole)):
+            if g.geom_type == 'LineString' and len(g.coords) >= 2:
+                out.append(np.asarray(g.coords))
+    return out
 
 
 def fit_rect(rect_m, pw, ph, title, line_mm=0.38):
@@ -664,13 +695,47 @@ def build_city_map(data, opts, pw, ph):
     else:
         clip_poly, region = boundary, boundary.bounds
 
-    # ---- fit the region into the map box
-    bx0, by0, bx1, by1 = map_box(pw, ph, title_on, w_minor)
+    yshift = ph / 2.0                                 # app paper frame: y from -ph/2 to ph/2
+    segs = []
+
+    def add(layer, pen, lines):
+        for l in lines:
+            segs.append({'type': 'city', 'layer': layer, 'seg': l, 'level': 0, 'pen_id': pen})
+
+    # ---- title, bottom left: the city's name, then the coordinates in smaller capitals under it
+    m = margins(pw, ph)
+    title_box = None                                  # paper mm, y up from the bottom edge
+    if title_on:
+        raw = (opts.get('title_text') or "").strip() or default_title(meta)
+        title, _, sub = (x.strip() for x in raw.partition("|"))
+        cap, cap_sub = title_caps(pw, ph, w_minor)
+        y, boxes = m, []
+        if sub:
+            polys, box = vector_text(sub.upper(), m, y, cap_sub, anchor='left')
+            add('labels', pen_minor, [p - [0, yshift] for p in polys])
+            boxes.append(box)
+            y = (box[3] if box else y + cap_sub) + 0.9 * cap_sub
+        if title:
+            polys, box = vector_text(title.upper(), m, y, cap, anchor='left')
+            add('labels', pen_major if not single else pen_minor, [p - [0, yshift] for p in polys])
+            boxes.append(box)
+        boxes = [b for b in boxes if b]
+        if boxes:
+            pad = 1.5                                 # clear paper around the lettering
+            title_box = (min(b[0] for b in boxes) - pad, min(b[1] for b in boxes) - pad,
+                         max(b[2] for b in boxes) + pad, max(b[3] for b in boxes) + pad)
+
+    # ---- fit the region into the map box (the whole page inside the margins)
+    bx0, by0, bx1, by1 = map_box(pw, ph)
     gx0, gy0, gx1, gy1 = region
     s = min((bx1 - bx0) / max(gx1 - gx0, 1e-9), (by1 - by0) / max(gy1 - gy0, 1e-9))     # mm per metre
     ox = bx0 + 0.5 * ((bx1 - bx0) - (gx1 - gx0) * s)
-    oy = by0 + 0.5 * ((by1 - by0) - (gy1 - gy0) * s)
-    yshift = ph / 2.0                                 # app paper frame: y from -ph/2 to ph/2
+    slack = (by1 - by0) - (gy1 - gy0) * s             # spare height
+    need = (title_box[3] - by0) if title_box else 0.0  # height the title needs above the bottom margin
+    oy = by0 + min(slack, max(0.5 * slack, need))     # centred, but lifted clear of the title if there's room
+    cut = None
+    if title_box:
+        cut = (title_box[0], title_box[1] - yshift, title_box[2], title_box[3] - yshift)
 
     def xform(c):
         return np.column_stack([ox + (c[:, 0] - gx0) * s, oy + (c[:, 1] - gy0) * s - yshift])
@@ -680,20 +745,15 @@ def build_city_map(data, opts, pw, ph):
     keep = [i for i in range(len(roads)) if rcls[i] <= min_class]
     major = [roads[i] for i in keep if rcls[i] <= major_upto]
     minor = [roads[i] for i in keep if rcls[i] > major_upto]
-    segs = []
-
-    def add(layer, pen, lines):
-        for l in lines:
-            segs.append({'type': 'city', 'layer': layer, 'seg': l, 'level': 0, 'pen_id': pen})
 
     major_mm = _clip_and_fit(major, clip_poly, rect, xform, simp)
     minor_mm = _clip_and_fit(minor, clip_poly, rect, xform, simp)
     if single:
-        roads_mm = chain_lines(major_mm + minor_mm)
+        roads_mm = _cut_out(chain_lines(major_mm + minor_mm), cut)
         add('city_roads', pen_minor, roads_mm)
         ink = [(roads_mm, w_minor)]
     else:
-        major_mm, minor_mm = chain_lines(major_mm), chain_lines(minor_mm)
+        major_mm, minor_mm = _cut_out(chain_lines(major_mm), cut), _cut_out(chain_lines(minor_mm), cut)
         add('city_major', pen_major, major_mm)
         add('city_minor', pen_minor, minor_mm)
         ink = [(major_mm, w_major), (minor_mm, w_minor)]
@@ -703,7 +763,7 @@ def build_city_map(data, opts, pw, ph):
         if kind not in extras_on:
             continue
         lines = [ex[i] for i in range(len(ex)) if ek[i] == EXTRA_KINDS.index(kind)]
-        mm = chain_lines(_clip_and_fit(lines, clip_poly, rect, xform, simp))
+        mm = _cut_out(chain_lines(_clip_and_fit(lines, clip_poly, rect, xform, simp)), cut)
         add(EXTRAS[kind][1], pen_extras, mm)
         ink.append((mm, w_extras))
     if 'outline' in extras_on:
@@ -713,25 +773,12 @@ def build_city_map(data, opts, pw, ph):
             if p.geom_type == 'Polygon':
                 rings += [p.exterior] + list(p.interiors)
         # only the city's own edge: clipping a line to the rectangle adds no box edges
-        mm = _clip_and_fit([np.asarray(r.coords) for r in rings], None, rect, xform, simp)
+        mm = _cut_out(_clip_and_fit([np.asarray(r.coords) for r in rings], None, rect, xform, simp), cut)
         add('city_outline', pen_extras, mm)
         ink.append((mm, w_extras))
 
-    # ---- title (city name, then the coordinates in smaller capitals) and frame
+    # ---- frame
     masks = []
-    if title_on:
-        raw = (opts.get('title_text') or "").strip() or default_title(meta)
-        title, _, sub = (x.strip() for x in raw.partition("|"))
-        cap, cap_sub = title_caps(pw, ph, w_minor)
-        m = margins(pw, ph)
-        y = m
-        if sub:
-            polys, box = vector_text(sub.upper(), pw / 2, y, cap_sub, anchor='center')
-            add('labels', pen_minor, [p - [0, yshift] for p in polys])
-            y = (box[3] if box else y + cap_sub) + 0.9 * cap_sub
-        if title:
-            polys, box = vector_text(title.upper(), pw / 2, y, cap, anchor='center')
-            add('labels', pen_major if not single else pen_minor, [p - [0, yshift] for p in polys])
     if opts.get('frame'):
         f = 2.0
         add('frame', pen_minor, [np.array([[f, f], [pw - f, f], [pw - f, ph - f], [f, ph - f], [f, f]]) - [0, yshift]])

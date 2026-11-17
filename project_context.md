@@ -65,7 +65,7 @@ All application code is in `MoonPlotter/`. Data paths are relative to that folde
 | `layer_cut.py` | **Layered cut-outs:** height bands → shapely polygons → clean-up → pen marks (next-layer outline and layer number) → packing on sheets (FFT raster, 45° rotations, nesting in holes) → knife paths |
 | `calibrate_z.py` | Pen-height and knife-depth test-ladder G-code, the result maths, reading a saved test file, the `config.py` lines |
 | `project_io.py`, `ui_widgets.py`, `theme.py` | Projects and presets, colourways; widgets; Qt style |
-| `tests/test_engines.py` | 44 engine tests: G-code safety, contours, hatch, missions, tracing, cut-outs, calibration, city maps |
+| `tests/test_engines.py` | 45 engine tests: G-code safety, contours, hatch, missions, tracing, cut-outs, calibration, city maps |
 | `AGENTS.md`, `CLAUDE.md`, `docs/` | Agent handover notes; user and developer docs; **`docs/architecture.md`** maps every feature to its file |
 
 **Data model:** everything drawable is a list of segment dicts `{'type','layer','seg' (n×2),'level','pen_id'}`.
@@ -146,7 +146,7 @@ In layered cut-out mode, `export_cut_sheets()` writes one file per sheet instead
   - **city road maps** (tested on screen with Washington, D.C. and Paris, including G-code export and
     project save/load);
   - `docs/architecture.md`, a feature → file map.
-- All 44 tests pass. Not pushed: `5a6fb6c`, `a2e67cd`, the City commit and the calibration-dialog commit.
+- All 45 tests pass. Not pushed: `5a6fb6c`, `a2e67cd`, the City commit and the calibration-dialog commit.
 - **Not yet verified on the machine:**
   - a city road map plot;
   - calibration (no `machine_settings.json` saved yet);

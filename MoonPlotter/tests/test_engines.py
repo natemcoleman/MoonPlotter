@@ -582,6 +582,28 @@ def test_city_map_layers_pens_and_clip():
     assert abs(info3['width_km'] - (r[2] - r[0]) / 1000.0) < 1e-6
 
 
+def test_city_title_bottom_left():
+    import city_roads as CR
+    assert CR.city_name({'query': 'Washington, D.C.', 'name': 'Washington'}) == "Washington DC"
+    assert CR.city_name({'query': 'Paris, France', 'name': 'Paris'}) == "Paris"
+    data = _fake_city()
+    pw, ph = 200.0, 150.0
+    segs, _, info = CR.build_city_map(data, {'min_class': 4, 'title': True, 'extras': {'outline'}}, pw, ph)
+    lab = np.concatenate([s['seg'] for s in segs if s['layer'] == 'labels'])
+    m = CR.margins(pw, ph)
+    assert abs(lab[:, 0].min() - m) < 1.0 and lab[:, 0].max() < pw / 2      # left-justified, bottom left
+    x0, x1 = lab[:, 0].min() - 1.4, lab[:, 0].max() + 1.4
+    y0, y1 = lab[:, 1].min() - 1.4, lab[:, 1].max() + 1.4
+    for s in segs:                                                           # no map line under the title
+        if s['layer'] != 'labels':
+            p = s['seg']
+            inside = (p[:, 0] > x0) & (p[:, 0] < x1) & (p[:, 1] > y0) & (p[:, 1] < y1)
+            assert not inside.any()
+    # the map is as big as with no title: the title takes no band of its own
+    _, _, info0 = CR.build_city_map(data, {'min_class': 4, 'title': False}, pw, ph)
+    assert abs(info['scale_m_per_mm'] - info0['scale_m_per_mm']) < 1e-9
+
+
 def test_city_cache_roundtrip():
     import city_roads as CR
     data = _fake_city()

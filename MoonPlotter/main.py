@@ -5187,7 +5187,7 @@ class PlotterApp(QMainWindow):
         self.lbl_city_pen_extras = sec.add(self._field("Pen for water, rail, parks & outline",
                                                        self.combo_city_pen_extras))
 
-        self.chk_city_title = QCheckBox("Title under the map (name and coordinates)")
+        self.chk_city_title = QCheckBox("Title, bottom left (name and coordinates)")
         self.chk_city_title.setChecked(True)
         sec.add(self.chk_city_title)
         self.txt_city_title = QLineEdit()
