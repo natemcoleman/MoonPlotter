@@ -195,16 +195,16 @@ complete.
 
 ## 7. Owner's pending physical tests (remind them at the end of each report)
 
-1. Run **Tools › Calibrate pen & knife heights**: the pen test, then the knife test on scrap 65 lb card.
-   Save the results. This replaces the old "test plot at 5.5 mm pen height" item.
-2. Try **two-finger scroll and pinch** zoom in the previews.
-3. On the next plot, check that the **line along the right edge** is gone. It was most likely the
-   page-edge stroke fixed in Phase 4. This was never confirmed on paper.
-4. Do a **card cut-out on scrap paper**. This also tests the layered cut-outs.
-5. **Push the commits.** Three are on `main` but not pushed: `5a6fb6c`, `a2e67cd` and the City road maps commit.
+Confirmed by the owner on the machine (16 Nov 2026): pen and knife heights calibrated (values committed in
+`config.py`: pen-down 4.55 mm, lift 1.5 mm), two-finger scroll and pinch, a Paris city map plot (made before
+the tiny-shape and dead-end filters), and the card cut-out with two knife passes.
 
-Also untested on the machine: a City road map plot (Washington, D.C. and Paris were checked on screen and
-in exported G-code only), tiled multi-page plots (alignment across the gap), lake and Solar System
+1. On the next plot, check that the **line along the right edge** is gone. It was most likely the
+   page-edge stroke fixed in Phase 4. This was never confirmed on paper.
+2. Plot a city map with the **new filters** (tiny water / park shapes, dead-end roads) and compare.
+3. Do a small **layered cut-out** (stacked cardstock).
+
+Also untested on the machine: tiled multi-page plots (alignment across the gap), lake and Solar System
 diagram exports, ski overlay combined with tiling, and SVG import of real Inkscape or Illustrator files.
 
 ---

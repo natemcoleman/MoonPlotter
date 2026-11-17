@@ -3,22 +3,14 @@
 _Last updated: 16 Nov 2026 · `main` after the City road maps commit_
 
 ## Immediate Next Steps
-1. **Calibrate the machine (owner, at the plotter).**
-   - Open **Tools › Calibrate pen & knife heights**.
-   - Pen test: save it (or **Read a test file…** for one already plotted), enter the first solid line; the
-     `config.py` lines are shown. Click **Use**.
-   - Knife test: save it, cut it on scrap 65 lb card on a mat, enter the first square that drops out.
-   - Copy the lines into `config.py`, or click **Save** (writes `machine_settings.json`, which overrides it).
-   - Expect pen-down to rise by about 2 mm from 5.5, the lift to drop to about 1.2 mm, and the knife depth
-     to be well under the current -2.0 mm.
-   - Report the numbers so they can be sanity-checked.
-2. **Physical verification pass (owner).**
-   - Plot a city map, e.g. a downtown rectangle of Washington, D.C. or Paris down to residential streets on
-     a postcard, thick pen for major roads. Check that the strokes join cleanly and the time estimate.
-   - Run a short contour plot to confirm the right-edge line is gone and the new pen height works.
-   - Do a card cut-out on scrap.
+1. **Physical verification pass (owner).**
+   - Plot a city map with the new filters (tiny water / park shapes, dead-end roads) and compare it with the
+     Paris plot made before them.
+   - Run a short contour plot to confirm the right-edge line is gone.
    - Do a small layered cut-out: Grand Targhee, 100 × 100 mm map, 150 mm sheets, 4–6 layers.
    - Note any knife issues: pieces not dropping out, corner tearing, alignment-outline offset.
+2. **Investigate the exit code 0xC0000005** seen twice when the app closed right after a G-code export
+   (needs the owner's description of what happened).
 3. **Faster start-up (agent).**
    - Move the geopandas and Natural Earth loading out of import time, so they load on first Earth use.
    - Make the Natural Earth cache path absolute (relative to the app folder).
@@ -66,6 +58,8 @@ _Last updated: 16 Nov 2026 · `main` after the City road maps commit_
 - Screenshots of the other new features in `docs/` (layered cut-outs, Solar System diagram, calibration dialog).
 
 ## Recently Completed
+- Verified on the machine: calibration (pen-down 4.55 mm, lift 1.5 mm in `config.py`), trackpad gestures, a
+  Paris city map plot, and the two-pass card cut-out.
 - City maps: **Skip dead-end roads shorter than** (default 1 mm). Roads are split at junctions and short
   stretches that end in nothing are dropped: cul-de-sacs, driveways, spurs, stray bits, clip-edge dashes.
   Through-streets are always kept. Washington DC residential: about 660–830 stubs dropped, about 13% fewer

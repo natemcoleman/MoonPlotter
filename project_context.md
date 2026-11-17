@@ -146,13 +146,16 @@ In layered cut-out mode, `export_cut_sheets()` writes one file per sheet instead
   - **city road maps** (tested on screen with Washington, D.C. and Paris, including G-code export and
     project save/load);
   - `docs/architecture.md`, a feature → file map.
-- All 49 tests pass. Not pushed: `5a6fb6c`, `a2e67cd`, the City commit and the calibration-dialog commit.
+- All 49 tests pass. Everything up to `4e40b85` is pushed.
+- **Verified on the machine (16 Nov 2026):**
+  - calibration (values in `config.py`: pen-down 4.55 mm, lift 1.5 mm);
+  - trackpad scroll and pinch;
+  - a Paris city map, made before the new filters;
+  - the card cut-out with two knife passes.
 - **Not yet verified on the machine:**
-  - a city road map plot;
-  - calibration (no `machine_settings.json` saved yet);
+  - a city map with the tiny-shape and dead-end filters;
   - the right-edge line fix;
-  - card and layered cut-outs;
+  - layered cut-outs;
   - tiled plots;
   - lake and diagram exports;
-  - SVG import of real files;
-  - trackpad gestures.
+  - SVG import of real files.
