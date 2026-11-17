@@ -220,6 +220,25 @@ def max_plot_area():
     return BED_MM[0] - GCODE_OFFSET_MM[0], BED_MM[1] - GCODE_OFFSET_MM[1]
 
 
+def repeat_passes(lines, passes=None):
+    """Knife lines, each to be cut `passes` times (default CUTOUT_PASSES). A closed line becomes one longer line
+    that goes round `passes` times, so the blade stays down and in its groove; an open line is repeated as
+    separate strokes (lift, back to its start, cut again), so the blade never reverses in the cut."""
+    passes = max(1, int(CUTOUT_PASSES if passes is None else passes))
+    out = []
+    for l in lines:
+        l = np.asarray(l, float)
+        if passes == 1 or len(l) < 2:
+            out.append(l)
+            continue
+        size = float(np.ptp(l, axis=0).max())
+        if len(l) > 2 and np.hypot(*(l[0] - l[-1])) <= 1e-6 * max(size, 1e-12):
+            out.append(np.vstack([l] + [l[1:]] * (passes - 1)))
+        else:
+            out += [l] * passes
+    return out
+
+
 def split_for_priming(lines, lengths_mm, count):
     """Returns (prime, rest): the `count` longest strokes are drawn first so the pen is flowing
     before fine detail starts."""

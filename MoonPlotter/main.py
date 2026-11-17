@@ -6206,6 +6206,11 @@ class PlotterApp(QMainWindow):
             lines, fine, one_way = self._lines_for_pen(p_id, text_boxes, split=True)
             if tile:
                 lines, fine, one_way = (self._clip_lines(x, tile['box']) for x in (lines, fine, one_way))
+            if p_id in exporter.TOOL_PEN_IDS:
+                # drag knife: every cut CUTOUT_PASSES times. vpype only re-orders these (its merging could
+                # join a line to its own repeat and reverse the blade at the line's end)
+                fine = exporter.repeat_passes(lines + fine + one_way)
+                lines, one_way = [], []
             has_dots = any(it.get('type') == 'stipple' and it['pen_id'] == p_id and self.is_visible(it)
                            for it in self.dem_segments)
             lengths = [float(np.sum(np.hypot(np.diff(np.asarray(ln)[:, 0]) * sx, np.diff(np.asarray(ln)[:, 1]) * sy)))

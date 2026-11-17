@@ -443,6 +443,22 @@ def test_image_trace_edges():
     assert sum(len(p) for p in layers[0]['polys']) > 50
 
 
+# ---------------------------------------------------------------- knife passes
+def test_knife_repeat_passes():
+    sq = np.array([[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0], [0.0, 0.0]])
+    line = np.array([[0.0, 0.0], [5.0, 5.0]])
+    out = exporter.repeat_passes([sq, line], 2)
+    assert len(out) == 3                                       # square: one stroke; open line: two
+    assert len(out[0]) == 9 and np.allclose(out[0][4], out[0][0]) and np.allclose(out[0][-1], sq[0])
+    assert np.allclose(out[1], line) and np.allclose(out[2], line)     # same direction both times
+    assert len(exporter.repeat_passes([sq, line], 1)) == 2
+    # the card cut-out goes round twice: the path is about twice as long
+    one = exporter.cutout_path(100.0, 80.0, passes=1)
+    two = exporter.cutout_path(100.0, 80.0, passes=2)
+    length = lambda p: float(np.sum(np.hypot(*np.diff(p, axis=0).T)))
+    assert abs((length(two) - length(one)) - (length(one) - 5.0)) < 1e-6          # one more lap (5 mm overlap)
+
+
 # ---------------------------------------------------------------- Z calibration
 def test_z_calibration_math():
     import calibrate_z as cz

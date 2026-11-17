@@ -50,7 +50,6 @@ _Last updated: 16 Nov 2026 · `main` after the City road maps commit_
 **High**
 - Registration or corner marks for tiled pages, plus an alignment guide.
 - An "equal area per layer" option for layered cut-outs, as an alternative to even height steps.
-- An optional `CUTOUT_PASSES` / multi-pass setting in the calibration dialog, if 65 lb card needs it.
 
 **Medium**
 - City maps: building outlines or water hatching; preset road-type/pen combinations; a circle crop.
@@ -67,6 +66,8 @@ _Last updated: 16 Nov 2026 · `main` after the City road maps commit_
 - Screenshots of the other new features in `docs/` (layered cut-outs, Solar System diagram, calibration dialog).
 
 ## Recently Completed
+- **Two knife passes** (`CUTOUT_PASSES = 2`) for every cut: card cut-out, layered cut-out pieces and Cutter-tool
+  lines (closed outlines lap without lifting; open lines are re-cut from their start). 46/46 tests pass.
 - Docs: example city plots (`docs/images/city_washington_dc.png`, `city_paris.png`) in the README gallery
   and `docs/city-maps.md`.
 - City maps: the title is now left-justified in the bottom-left corner and takes no strip of its own, so the

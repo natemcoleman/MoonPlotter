@@ -41,9 +41,10 @@ This means:
 |---|---|---|
 | `BED_MM` | `(235, 235)` | Travel of your X and Y axes |
 | `GCODE_OFFSET_MM` | `(38, 18)` | Distance from the home position to the plot origin |
-| `PEN_DOWN_ABOVE_HOME_MM` | `5.5` | Height of pen-down (Z0) above the homed Z position. **Raise it if the pen drags or hits the bed. Lower it if lines are faint or skip.** Calibrated per machine (below). |
-| `PEN_LIFT_MM` | `2.5` | Pen-up height above Z0 for travel between strokes. Calibrated per machine; the export dialog can override it. |
+| `PEN_DOWN_ABOVE_HOME_MM` | `4.55` | Height of pen-down (Z0) above the homed Z position. **Raise it if the pen drags or hits the bed. Lower it if lines are faint or skip.** Calibrated per machine (below). |
+| `PEN_LIFT_MM` | `1.5` | Pen-up height above Z0 for travel between strokes. Calibrated per machine; the export dialog can override it. |
 | `CUTTER_Z_OFFSET_MM` | `-2.0` | Drag-knife down height relative to Z0 (negative = deeper). Calibrated per machine. |
+| `CUTOUT_PASSES` | `2` | How many times the knife goes over every cut: the card cut-out, layered cut-out pieces and lines drawn with the Cutter tool. Closed outlines are cut lap after lap without lifting; open lines are cut again from their start, so the blade never reverses. Set `1` for thin paper. |
 | `Z_MAX_FEED` | `300` mm/min | Your firmware's top Z speed (stock Ender 3: 5 mm/s). Used for time estimates only. |
 | `SAFE_Z_MM` | `5.5` | Clearance for long moves, homing exits and pen changes |
 | `DEFAULT_DRAW_FEED` / `TRAVEL_FEED` | `1200` / `3000` mm/min | Pen-down and pen-up speeds. Each pen can override the draw speed. |
@@ -76,7 +77,9 @@ the bed or moving the plotter.
 2. **Knife depth.** Do this after step 1 (click **Use** there first): the depth is measured from pen-down.
    Click **Save knife test G-code…**, fit the knife and lay scrap card of the kind you will cut on a mat. It
    cuts 10 mm squares, left to right and top row first, each deeper than the last. Enter the **first square
-   that drops out**; the box shows the `CUTTER_Z_OFFSET_MM = …` line (a 0.15 mm margin is added). If the
+   that drops out**; the box shows the `CUTTER_Z_OFFSET_MM = …` line (a 0.15 mm margin is added). The test
+   cuts each square once, so this depth goes through in a single pass; real cuts go over every line
+   `CUTOUT_PASSES` times (2), which makes the cut cleaner and more certain. If the
    pen-down height changed after the knife test was made, the depth is corrected so the blade still reaches
    the same height.
 3. Either copy the lines into `config.py` and restart the app, or click **Use** and then **Save**. Save writes
