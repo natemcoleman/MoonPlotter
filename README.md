@@ -1,18 +1,20 @@
 # Topo Plotter Studio (Cartographer Edition)
 
-A desktop app that turns elevation data and colour maps of the **Earth, Moon and Mars**, spacecraft
-trajectories through the **Solar System**, and your own **images** into multi-pen G-code for a
-**pen plotter**. It was built for a Creality Ender 3 converted to hold a pen (Marlin firmware), but the
+A desktop app that turns elevation data and colour maps of the **Earth, Moon and Mars**, the roads of a
+**city**, spacecraft trajectories through the **Solar System**, and your own **images** into multi-pen G-code
+for a **pen plotter**. It was built for a Creality Ender 3 converted to hold a pen (Marlin firmware), but the
 output is plain G-code and SVG, so it can be adapted to other machines.
 
 <p align="center">
-  <img src="docs/images/moon_contours.png" width="24%" alt="Moon contour map of Mare Imbrium with title, scale bar, grid and north arrow">
-  <img src="docs/images/earth_colour_fill.png" width="24%" alt="Colour-separated hatch fill of North Africa and the Mediterranean">
-  <img src="docs/images/moon_white_on_black.png" width="24%" alt="White gel-pen contours on black paper">
-  <img src="docs/images/voyager2.png" width="24%" alt="Voyager 2 trajectory plot with planet orbits and asteroid belt">
+  <img src="docs/images/moon_contours.png" width="19%" alt="Moon contour map of Mare Imbrium with title, scale bar, grid and north arrow">
+  <img src="docs/images/earth_colour_fill.png" width="19%" alt="Colour-separated hatch fill of North Africa and the Mediterranean">
+  <img src="docs/images/moon_white_on_black.png" width="19%" alt="White gel-pen contours on black paper">
+  <img src="docs/images/city_washington_dc.png" width="19%" alt="City road map of Washington DC: major roads in a thick pen, streets in a thin pen, rivers in blue">
+  <img src="docs/images/voyager2.png" width="19%" alt="Voyager 2 trajectory plot with planet orbits and asteroid belt">
 </p>
 <p align="center"><sub>Plot previews rendered by the app: lunar contours with map furniture, a colour hatch fill
-using real pen colours, white pen on black paper, and Voyager 2's path from NASA JPL data.</sub></p>
+using real pen colours, white pen on black paper, Washington DC's roads from OpenStreetMap, and Voyager 2's
+path from NASA JPL data.</sub></p>
 
 ## What it does
 

@@ -7,6 +7,15 @@ pattern alone is enough to recognise a city.
 The data is OpenStreetMap (© OpenStreetMap contributors, ODbL). A city downloads once and is then kept in the
 `cities` folder, so it opens instantly the next time.
 
+<p align="center">
+  <img src="images/city_washington_dc.png" width="45%" alt="Washington DC: roads down to tertiary, thick pen for major roads, water and rivers in blue">
+  <img src="images/city_paris.png" width="45%" alt="Paris on a postcard: roads down to tertiary, the Seine and lakes in blue">
+</p>
+<p align="center"><sub>Previews from the app. <b>Washington DC</b> on 200 × 200 mm: clipped to the city boundary,
+roads down to tertiary, a 0.7 mm pen for motorways to secondary roads and a 0.38 mm pen for the rest, water
+and rivers in blue (1,738 strokes, about 9 m of ink, 1 mm = 126 m). <b>Paris</b> on a 152 × 102 mm postcard:
+the same road types, with water (6.5 m of ink). Both show the title in the bottom-left corner.</sub></p>
+
 ## Getting a city
 
 1. Choose **City** in **Source › Subject**.

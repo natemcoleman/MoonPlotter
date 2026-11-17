@@ -64,9 +64,11 @@ _Last updated: 16 Nov 2026 · `main` after the City road maps commit_
 - A portrait layout for the Solar System diagram.
 - One-click poster presets, for example navy paper + diagram + white pens.
 - Remember pane visibility.
-- Screenshots of the new features in `docs/`.
+- Screenshots of the other new features in `docs/` (layered cut-outs, Solar System diagram, calibration dialog).
 
 ## Recently Completed
+- Docs: example city plots (`docs/images/city_washington_dc.png`, `city_paris.png`) in the README gallery
+  and `docs/city-maps.md`.
 - City maps: the title is now left-justified in the bottom-left corner and takes no strip of its own, so the
   map is as large as the page allows; roads under the lettering are cut away. The default name keeps a short
   typed abbreviation ("Washington, D.C." → WASHINGTON DC). 45/45 tests pass.
