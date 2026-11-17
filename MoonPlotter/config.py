@@ -162,14 +162,13 @@ BED_MM = (235.0, 235.0)
 GCODE_OFFSET_MM = (38.0, 18.0)
 DEFAULT_DRAW_FEED = 1200.0      # mm/min, pen down
 TRAVEL_FEED = 3000.0            # mm/min, pen up
-# PEN_LIFT_MM = 3.5               # pen-up height above the paper between strokes (was 1.0); the export dialog can override it
-PEN_LIFT_MM = 2.5               # pen-up height above the paper between strokes (was 1.0); the export dialog can override it
+PEN_LIFT_MM = 1.5               # pen-up height above the paper between strokes (was 1.0); the export dialog can override it
 # Height of the drawing plane (pen down, Z0) above the homed Z position. The header declares the homed
 # head to be at Z = -PEN_DOWN_ABOVE_HOME_MM. Raise it if the pen drags or hits the plate; lower it if
 # lines come out faint. (Was 4.0; raised 1.5 mm after the pen caught the plate edge.)
 # This is the plane for the PENS. The drag-knife cutter has its own depth: CUTTER_Z_OFFSET_MM below.
 # (Previous values: 2.5 and 3.5 were cutter settings; 5.5 was the last pen setting.)
-PEN_DOWN_ABOVE_HOME_MM = 5.5
+PEN_DOWN_ABOVE_HOME_MM = 4.55
 # Drag-knife cutter ('cutter' pen): blade-down Z relative to the pen drawing plane (Z0). Negative = deeper.
 # -2.0 puts the blade at 3.5 mm above home, the cutter height used before this setting existed. The cutter
 # is plotted last, after its own M0 tool-change pause; pen-up height and travel moves are unchanged.
