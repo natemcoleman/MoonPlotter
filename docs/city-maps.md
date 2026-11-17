@@ -75,6 +75,14 @@ together.
 
 They all use the **Pen for water, rail, parks & outline**.
 
+**Skip water / park shapes smaller than** (2 mm by default) leaves out every extra shape smaller than that on
+paper: ponds, fountains, pocket parks and stray bits of river. At city scale they would only be specks of
+ink, and Washington DC has about a thousand of them. Long shorelines made of many short pieces are joined
+first, so they stay. Stray bits of road under 1 mm that touch no other road are dropped too, such as the
+dashes left where a road runs along the clip edge. A short block between two junctions touches its
+neighbours, so it stays. The info line under the City section says how many shapes were skipped; set the
+value to 0 to keep everything.
+
 **Title, bottom left** writes the city's name in the bottom-left corner, with its coordinates underneath.
 The title takes no strip of its own, so the map stays as large as the page allows. The map moves up only if
 there's spare room above it, and any road that would run under the lettering is cut away around it. The

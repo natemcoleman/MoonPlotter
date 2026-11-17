@@ -64,7 +64,10 @@ LAYER_LABELS = {'city_major': "Major roads", 'city_minor': "Minor roads", 'city_
                 'city_parks': "Parks", 'city_outline': "City outline"}
 CITY_LAYERS = tuple(LAYER_LABELS)
 
-SIMPLIFY_MM = 0.04               # Douglas-Peucker tolerance on paper (well under a pen width)
+SIMPLIFY_MM = 0.04               # Douglas-Peucker tolerance on paper for roads (well under a pen width)
+SIMPLIFY_EXTRAS_MM = 0.1         # ... for water, coast, rivers, rail, parks and the outline (wiggly shorelines)
+MIN_SHAPE_MM = 2.0               # water / park / other extra shapes smaller than this on paper are skipped:
+                                 # a pond 1 mm across is just a blob of ink, and hundreds of them a stipple
 JOIN_TOL_MM = 1e-3               # end points closer than this are the same junction
 CROWD_WINDOW_MM = 3.0            # neighbourhood over which crowding is judged
 CROWD_LIMIT = 0.7                # share of that neighbourhood covered by ink above which lines merge
@@ -512,6 +515,33 @@ def default_title(meta):
             f"{abs(lon):.4f}° {'E' if lon >= 0 else 'W'}")
 
 
+def _drop_small(lines, min_size):
+    """(lines whose extent - the larger side of their bounding box - is at least min_size mm, number dropped)."""
+    if min_size <= 0 or not lines:
+        return lines, 0
+    keep = [l for l in lines if float(np.ptp(l, axis=0).max()) >= min_size]
+    return keep, len(lines) - len(keep)
+
+
+def _loose_bits(lines, min_size, touch_mm=0.05):
+    """Road version of _drop_small: a boolean 'keep' per line, False only for bits smaller than min_size that
+    come within touch_mm of no other line (stray dots, and the dashes left where a road runs along the clip
+    edge). A short block between two junctions touches its neighbours, so it stays: no gaps in the grid."""
+    small = [i for i, l in enumerate(lines) if min_size > 0 and float(np.ptp(l, axis=0).max()) < min_size]
+    keep = [True] * len(lines)
+    if not small:
+        return keep
+    import shapely
+    from shapely.geometry import LineString
+    geoms = [LineString(l) for l in lines]
+    tree = shapely.STRtree(geoms)
+    for i in small:
+        near = tree.query(geoms[i], predicate='dwithin', distance=touch_mm)
+        if not any(j != i for j in near):
+            keep[i] = False
+    return keep
+
+
 def _cut_out(lines, box):
     """lines (paper mm) with the parts inside box (x0, y0, x1, y1) removed."""
     if box is None or not lines:
@@ -666,7 +696,8 @@ def build_city_map(data, opts, pw, ph):
     """Strokes for the paper. opts: min_class, major_upto, single_pen, pen_major, pen_minor, pen_extras,
     width_major, width_minor, width_extras (mm), extras (set of EXTRAS keys), clip ('boundary'|'rectangle'),
     rect (lon0, lat0, lon1, lat1) for 'rectangle', title (bool), title_text ('Title | subtitle', blank =
-    default), frame (bool), crowding (bool, default True: False leaves the crowding check, about a second
+    default), frame (bool), min_shape_mm (extra shapes smaller than this are skipped, default MIN_SHAPE_MM),
+    crowding (bool, default True: False leaves the crowding check, about a second
     on a big map, to a later crowding(info['ink'], info['map_extent']) call). Returns (segments, masks, info)."""
     from decorations import vector_text
     meta = data['meta']
@@ -682,6 +713,8 @@ def build_city_map(data, opts, pw, ph):
     w_minor = float(opts.get('width_minor', 0.38))
     w_extras = float(opts.get('width_extras', w_minor))
     extras_on = set(opts.get('extras') or ())
+    min_shape = float(opts.get('min_shape_mm', MIN_SHAPE_MM))
+    n_skipped = 0
     title_on = bool(opts.get('title', True))
 
     boundary = boundary_metres(meta)
@@ -748,12 +781,21 @@ def build_city_map(data, opts, pw, ph):
 
     major_mm = _clip_and_fit(major, clip_poly, rect, xform, simp)
     minor_mm = _clip_and_fit(minor, clip_poly, rect, xform, simp)
+    loose = min(1.0, min_shape)                       # stray road bits under 1 mm that touch nothing
     if single:
         roads_mm = _cut_out(chain_lines(major_mm + minor_mm), cut)
+        ok = _loose_bits(roads_mm, loose)
+        n_skipped += ok.count(False)
+        roads_mm = [l for l, k in zip(roads_mm, ok) if k]
         add('city_roads', pen_minor, roads_mm)
         ink = [(roads_mm, w_minor)]
     else:
         major_mm, minor_mm = _cut_out(chain_lines(major_mm), cut), _cut_out(chain_lines(minor_mm), cut)
+        ok = _loose_bits(major_mm + minor_mm, loose)      # a minor road touching a major one isn't loose
+        n_skipped += ok.count(False)
+        nmaj = len(major_mm)
+        major_mm = [l for l, k in zip(major_mm, ok[:nmaj]) if k]
+        minor_mm = [l for l, k in zip(minor_mm, ok[nmaj:]) if k]
         add('city_major', pen_major, major_mm)
         add('city_minor', pen_minor, minor_mm)
         ink = [(major_mm, w_major), (minor_mm, w_minor)]
@@ -763,7 +805,10 @@ def build_city_map(data, opts, pw, ph):
         if kind not in extras_on:
             continue
         lines = [ex[i] for i in range(len(ex)) if ek[i] == EXTRA_KINDS.index(kind)]
-        mm = _cut_out(chain_lines(_clip_and_fit(lines, clip_poly, rect, xform, simp)), cut)
+        mm = chain_lines(_clip_and_fit(lines, clip_poly, rect, xform, SIMPLIFY_EXTRAS_MM / s))
+        # after joining (a long shore made of short pieces stays) and after the title cut (no slivers left)
+        mm, n = _drop_small(_cut_out(mm, cut), min_shape)
+        n_skipped += n
         add(EXTRAS[kind][1], pen_extras, mm)
         ink.append((mm, w_extras))
     if 'outline' in extras_on:
@@ -773,7 +818,10 @@ def build_city_map(data, opts, pw, ph):
             if p.geom_type == 'Polygon':
                 rings += [p.exterior] + list(p.interiors)
         # only the city's own edge: clipping a line to the rectangle adds no box edges
-        mm = _cut_out(_clip_and_fit([np.asarray(r.coords) for r in rings], None, rect, xform, simp), cut)
+        mm = chain_lines(_clip_and_fit([np.asarray(r.coords) for r in rings], None, rect, xform,
+                                       SIMPLIFY_EXTRAS_MM / s))
+        mm, n = _drop_small(_cut_out(mm, cut), min_shape)
+        n_skipped += n
         add('city_outline', pen_extras, mm)
         ink.append((mm, w_extras))
 
@@ -789,5 +837,6 @@ def build_city_map(data, opts, pw, ph):
     info = {'scale_m_per_mm': 1.0 / s, 'width_km': (gx1 - gx0) / 1000.0, 'height_km': (gy1 - gy0) / 1000.0,
             'n_strokes': sum(len(lines) for lines, _ in ink), 'ink_m': ink_m,
             'crowded_frac': frac, 'crowd_grid': full, 'crowd_extent': gext, 'ink': ink, 'map_extent': gx,
-            'region_m': tuple(float(v) for v in region), 'n_major': len(major), 'n_minor': len(minor)}
+            'region_m': tuple(float(v) for v in region), 'n_major': len(major), 'n_minor': len(minor),
+            'n_skipped': n_skipped}
     return segs, masks, info

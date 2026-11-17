@@ -5186,6 +5186,17 @@ class PlotterApp(QMainWindow):
         self.combo_city_pen_extras = QComboBox()
         self.lbl_city_pen_extras = sec.add(self._field("Pen for water, rail, parks & outline",
                                                        self.combo_city_pen_extras))
+        self.spin_city_min_shape = QDoubleSpinBox()
+        self.spin_city_min_shape.setRange(0.0, 20.0)
+        self.spin_city_min_shape.setSingleStep(0.5)
+        self.spin_city_min_shape.setDecimals(1)
+        self.spin_city_min_shape.setSuffix(" mm")
+        self.spin_city_min_shape.setValue(CR.MIN_SHAPE_MM)
+        self.spin_city_min_shape.setToolTip("Ponds, fountains, small parks and other extra shapes smaller than this "
+                                            "on paper are left out: at map scale they would only be specks of "
+                                            "ink. 0 = keep everything.")
+        self.lbl_city_min_shape = sec.add(self._field("Skip water / park shapes smaller than",
+                                                      self.spin_city_min_shape))
 
         self.chk_city_title = QCheckBox("Title, bottom left (name and coordinates)")
         self.chk_city_title.setChecked(True)
@@ -5221,6 +5232,7 @@ class PlotterApp(QMainWindow):
                    self.combo_city_pen_extras):
             cb.currentIndexChanged.connect(lambda _: self.schedule_city_plot())
         self.txt_city_title.editingFinished.connect(self.schedule_city_plot)
+        self.spin_city_min_shape.valueChanged.connect(lambda _: self.schedule_city_plot())
         sec.setVisible(False)
         vbox.addWidget(sec)
         self._fill_city_pen_combos()
@@ -5245,6 +5257,7 @@ class PlotterApp(QMainWindow):
         self.lbl_city_pen_major.setVisible(not single)
         self.lbl_city_pen_minor.findChild(QLabel, "fieldLabel").setText("Pen" if single else "Thin pen")
         self.lbl_city_pen_extras.setVisible(any(c.isChecked() for c in self.chk_city_extra.values()))
+        self.lbl_city_min_shape.setVisible(any(c.isChecked() for c in self.chk_city_extra.values()))
         self.widget_city_title.setVisible(self.chk_city_title.isChecked())
 
     def schedule_city_plot(self):
@@ -5262,7 +5275,8 @@ class PlotterApp(QMainWindow):
                 'extras': {k for k, c in self.chk_city_extra.items() if c.isChecked()},
                 'clip': 'rectangle' if self.combo_city_clip.currentIndex() == 1 else 'boundary',
                 'rect': self.city_rect, 'title': self.chk_city_title.isChecked(),
-                'title_text': self.txt_city_title.text(), 'frame': self.chk_deco_frame.isChecked()}
+                'title_text': self.txt_city_title.text(), 'frame': self.chk_deco_frame.isChecked(),
+                'min_shape_mm': self.spin_city_min_shape.value()}
 
     def _enter_city_mode(self):
         self._enter_mission_mode()                     # shared paper-space setup
@@ -5482,7 +5496,8 @@ class PlotterApp(QMainWindow):
         crowd = info.get('crowded_frac')
         self.lbl_city_info.setText(
             f"{info['width_km']:.1f} × {info['height_km']:.1f} km · 1 mm = {info['scale_m_per_mm']:.0f} m "
-            f"· {info['n_strokes']:,} strokes · {info['ink_m']:.1f} m of ink.\n"
+            f"· {info['n_strokes']:,} strokes · {info['ink_m']:.1f} m of ink"
+            + (f" · {info['n_skipped']:,} tiny shapes skipped" if info.get('n_skipped') else "") + ".\n"
             + ("Checking for crowded areas..." if crowd is None else
                f"Crowded: {crowd:.0%} of the ink falls where lines merge into solid black - pick a bigger 'Smallest "
                "roads drawn', larger paper, or split the plot into pages." if crowd >= 0.10 else
@@ -5509,7 +5524,7 @@ class PlotterApp(QMainWindow):
                 'single': self.chk_city_single.isChecked(),
                 'extras': sorted(k for k, c in self.chk_city_extra.items() if c.isChecked()),
                 'title': self.chk_city_title.isChecked(), 'title_text': self.txt_city_title.text(),
-                'crowd': self.chk_city_crowd.isChecked(),
+                'crowd': self.chk_city_crowd.isChecked(), 'min_shape': self.spin_city_min_shape.value(),
                 'pens': {'major': self.combo_city_pen_major.currentData(),
                          'minor': self.combo_city_pen_minor.currentData(),
                          'extras': self.combo_city_pen_extras.currentData()}}
@@ -5525,6 +5540,7 @@ class PlotterApp(QMainWindow):
         self.chk_city_title.setChecked(bool(st.get('title', True)))
         self.txt_city_title.setText(st.get('title_text', ''))
         self.chk_city_crowd.setChecked(bool(st.get('crowd')))
+        self.spin_city_min_shape.setValue(float(st.get('min_shape', CR.MIN_SHAPE_MM)))
         for cb, k in ((self.combo_city_pen_major, 'major'), (self.combo_city_pen_minor, 'minor'),
                       (self.combo_city_pen_extras, 'extras')):
             i = cb.findData((st.get('pens') or {}).get(k))

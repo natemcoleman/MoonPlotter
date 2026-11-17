@@ -620,6 +620,33 @@ def test_city_title_bottom_left():
     assert abs(info['scale_m_per_mm'] - info0['scale_m_per_mm']) < 1e-9
 
 
+def test_city_tiny_water_skipped():
+    import city_roads as CR
+    data = _fake_city()
+    rng = np.random.default_rng(1)
+    ponds = []
+    for c in rng.uniform(-300, 300, (200, 2)):                  # 200 ponds ~10 m across: specks on paper
+        t = np.linspace(0, 2 * np.pi, 9)
+        ponds.append(np.column_stack([c[0] + 5 * np.cos(t), c[1] + 5 * np.sin(t)]))
+    t = np.linspace(0, 2 * np.pi, 40)
+    ponds.append(np.column_stack([250 * np.cos(t), 250 * np.sin(t)]))        # one real lake
+    data['extras'], data['extra_kind'] = ponds, np.zeros(len(ponds), int)
+    opts = {'min_class': 4, 'title': False, 'extras': {'water'}, 'crowding': False}
+    segs, _, info = CR.build_city_map(data, opts, 150.0, 150.0)
+    water = [s for s in segs if s['layer'] == 'city_water']
+    assert len(water) == 1 and info['n_skipped'] >= 150                      # the lake stays, the specks go
+    segs0, _, info0 = CR.build_city_map(data, dict(opts, min_shape_mm=0.0), 150.0, 150.0)
+    assert len([s for s in segs0 if s['layer'] == 'city_water']) > 150 and info0['n_skipped'] == 0
+
+
+def test_city_loose_road_bits():
+    import city_roads as CR
+    main_road = np.array([[0.0, 0.0], [10.0, 0.0]])
+    stub = np.array([[5.0, 0.0], [5.0, 0.5]])           # 0.5 mm side street meeting it mid-way: keep
+    speck = np.array([[20.0, 20.0], [20.4, 20.0]])      # 0.4 mm on its own: drop
+    assert CR._loose_bits([main_road, stub, speck], 1.0) == [True, True, False]
+
+
 def test_city_cache_roundtrip():
     import city_roads as CR
     data = _fake_city()

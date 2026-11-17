@@ -66,6 +66,9 @@ _Last updated: 16 Nov 2026 · `main` after the City road maps commit_
 - Screenshots of the other new features in `docs/` (layered cut-outs, Solar System diagram, calibration dialog).
 
 ## Recently Completed
+- City maps: tiny shapes are skipped. Water / park / extra shapes under **2 mm** on paper (setting in the City
+  section) and loose road bits under 1 mm that touch no other road are left out; extras are simplified at
+  0.1 mm. Washington DC: about 1,050–1,160 specks skipped (about 1,240 extra strokes → 94–191). 48/48 tests pass.
 - **Two knife passes** (`CUTOUT_PASSES = 2`) for every cut: card cut-out, layered cut-out pieces and Cutter-tool
   lines (closed outlines lap without lifting; open lines are re-cut from their start). 46/46 tests pass.
 - Docs: example city plots (`docs/images/city_washington_dc.png`, `city_paris.png`) in the README gallery
