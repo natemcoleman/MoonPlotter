@@ -180,13 +180,13 @@ CUTTER_BLADE_OFFSET_MM = 0.25
 # At each corner the knife runs past the corner, swings round a small loop OUTSIDE the card and comes back
 # in along the next edge, so the blade is already turned when it reaches the corner (sharp corners, and
 # both edges are cut right through the corner). Kept at least 3x the blade offset.
-CUTTER_CORNER_LOOP_MM = 1.0
+CUTTER_CORNER_LOOP_MM = 2.0
 # The cut runs this far past its starting point so the outline closes cleanly.
 CUTOUT_OVERLAP_MM = 5.0
 # How many times the knife goes over every cut: the card cut-out, layered cut-out pieces and any line drawn
 # with the Cutter tool. 2 cuts 65 lb cardstock cleanly through without pressing the blade deeper. Closed
 # outlines are cut lap after lap without lifting; open lines are cut again from their start.
-CUTOUT_PASSES = 2
+CUTOUT_PASSES = 3
 # Clearance used for long moves: leaving home for the start point, parking and pen changes.
 SAFE_Z_MM = 5.5
 # Fastest Z move the printer's firmware allows, mm/min. Stock Ender 3 Marlin caps Z at 5 mm/s (300);
